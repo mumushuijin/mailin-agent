@@ -1,0 +1,11 @@
+{
+  "preference": [],
+  "environment": [
+    {"id": "env.lang", "text": "默认使用简体中文与用户交流"}
+  ],
+  "tools": [],
+  "convention": [],
+  "misc": [
+    {"id": "misc.agent_name", "text": "助手名麦林"}
+  ]
+}

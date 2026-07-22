@@ -1,0 +1,139 @@
+{
+  "timestamp": "2026-06-21T13:34:12.346757+00:00",
+  "summary": {
+    "total_cases": 7,
+    "positive_cases": 6,
+    "negative_cases": 1,
+    "hit_at_k": 1.0,
+    "negative_empty_retrieval": true
+  },
+  "ragas": {
+    "non_llm_context_precision_with_reference": 0.9999999999,
+    "non_llm_context_recall": 1.0
+  },
+  "cases": [
+    {
+      "id": "ret-001",
+      "question": "麦麦",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-002",
+      "question": "ZmjjKK 康康",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-003",
+      "question": "影视演员 张婧仪",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-004",
+      "question": "Paper Rex 无畏契约",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-005",
+      "question": "选手动态 伦敦大师赛",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-006",
+      "question": "FastAPI LangGraph",
+      "hit_at_k": true,
+      "retrieved_count": 1,
+      "negative": false
+    },
+    {
+      "id": "ret-007",
+      "question": "北京天气",
+      "hit_at_k": true,
+      "retrieved_count": 0,
+      "negative": true
+    }
+  ],
+  "ragas_per_case": [
+    {
+      "user_input": "麦麦",
+      "retrieved_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference": "用户希望助手统一称呼为「麦麦」，这是一个跨会话的长期偏好。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    },
+    {
+      "user_input": "ZmjjKK 康康",
+      "retrieved_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference": "ZmjjKK（康康/张珺杰）是 EDG 无畏契约分部的决斗者选手。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    },
+    {
+      "user_input": "影视演员 张婧仪",
+      "retrieved_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference": "张婧仪的代表作包括《风犬少年的天空》《他从火光中走来》等。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    },
+    {
+      "user_input": "Paper Rex 无畏契约",
+      "retrieved_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference": "用户关注无畏契约，对 Paper Rex（PRX）战队有了解。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    },
+    {
+      "user_input": "选手动态 伦敦大师赛",
+      "retrieved_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference_contexts": [
+        "# 2026-06-21\n\n## [02:10] agent\n\n## 会话摘要（2026年7月）\n\n用户关注方向：\n1. **无畏契约** — 对 Paper Rex（PRX）战队有了解，关注 ZmjjKK（康康/张珺杰，EDG 无畏契约分部决斗者选手）\n2. **选手动态** — 曾询问康康在伦敦大师赛发布会是否哭了，经搜索未找到明确报道\n3. **影视演员** — 查询了张婧仪的基本信息（1999年7月10日出生，北京电影学院毕业，东申未来签约，代表作《风犬少年的天空》《他从火光中走来》等）\n\n## [19:54] agent\n\n用户要求：以后助手统一称呼为「麦麦」，无论在哪次聊天中。这是一个跨会话的长期偏好。"
+      ],
+      "reference": "经搜索未找到康康在伦敦大师赛发布会哭泣的明确报道。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    },
+    {
+      "user_input": "FastAPI LangGraph",
+      "retrieved_contexts": [
+        "# 2025-11-15\n\n## [10:00] agent\n\n用户询问了 Python asyncio 的基本用法，以及 FastAPI 与 LangGraph 的集成方式。讨论了项目目录结构和 workspace 初始化流程。\n\n## [15:30] agent\n\n用户偏好深色主题界面，默认使用简体中文。曾讨论 Electron + Vue 桌面客户端的打包方案。"
+      ],
+      "reference_contexts": [
+        "# 2025-11-15\n\n## [10:00] agent\n\n用户询问了 Python asyncio 的基本用法，以及 FastAPI 与 LangGraph 的集成方式。讨论了项目目录结构和 workspace 初始化流程。\n\n## [15:30] agent\n\n用户偏好深色主题界面，默认使用简体中文。曾讨论 Electron + Vue 桌面客户端的打包方案。"
+      ],
+      "reference": "用户曾讨论 FastAPI 与 LangGraph 的集成方式。",
+      "non_llm_context_precision_with_reference": 0.9999999999,
+      "non_llm_context_recall": 1.0
+    }
+  ]
+}

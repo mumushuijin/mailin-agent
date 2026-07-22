@@ -1,0 +1,124 @@
+/* 麦林基础样式 - 麦田金 + 森林绿主题 */
+
+:root {
+  /* 主题色 - 麦穗金 */
+  --color-primary: #c4a035;
+  --color-primary-hover: #d4b545;
+  --color-primary-active: #9a7b2a;
+  --color-primary-light: rgba(196, 160, 53, 0.12);
+  --color-primary-glow: rgba(196, 160, 53, 0.22);
+  --color-primary-border: rgba(196, 160, 53, 0.28);
+
+  /* 辅助色 - 森林绿 */
+  --color-accent: #4a7c59;
+  --color-accent-light: rgba(74, 124, 89, 0.12);
+
+  /* 背景色 */
+  --color-background: #f7f4ed;
+  --color-background-warm: #faf8f2;
+  --color-surface: #ffffff;
+  --color-sidebar: #faf8f2;
+
+  /* 文字色 */
+  --color-text: #2c3e2d;
+  --color-text-secondary: #6b7b6c;
+
+  /* 边框色 */
+  --color-border: #e8e4d9;
+
+  /* 选中/高亮 */
+  --color-selected-bg: rgba(196, 160, 53, 0.1);
+  --color-selected-border: var(--color-primary);
+
+  /* 危险操作 */
+  --color-danger: #c45c4a;
+  --color-danger-hover: #d46e5c;
+  --color-danger-bg: rgba(196, 92, 74, 0.1);
+
+  /* 阴影 */
+  --shadow-soft: 0 2px 12px rgba(44, 62, 45, 0.06);
+  --shadow-sidebar: 2px 0 16px rgba(44, 62, 45, 0.04);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  color: var(--color-text);
+  background: var(--color-background);
+  line-height: 1.6;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    'PingFang SC',
+    'Microsoft YaHei',
+    'Helvetica Neue',
+    Arial,
+    sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 覆盖 Ant Design 主题色 */
+.ant-btn-primary {
+  background-color: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+}
+
+.ant-btn-primary:hover {
+  background-color: var(--color-primary-hover) !important;
+  border-color: var(--color-primary-hover) !important;
+}
+
+.ant-menu-item-selected {
+  background-color: var(--color-primary-light) !important;
+  color: var(--color-primary) !important;
+}
+
+.ant-menu-item-selected::after {
+  border-color: var(--color-primary) !important;
+}
+
+.ant-tag-blue {
+  background-color: var(--color-primary-light) !important;
+  border-color: var(--color-primary) !important;
+  color: var(--color-primary) !important;
+}
+
+.ant-input:focus,
+.ant-input-focused {
+  border-color: var(--color-primary) !important;
+  box-shadow: 0 0 0 2px var(--color-primary-glow) !important;
+}
+
+.ant-input-number:focus,
+.ant-input-number-focused {
+  border-color: var(--color-primary) !important;
+  box-shadow: 0 0 0 2px var(--color-primary-glow) !important;
+}
+
+.ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: var(--color-primary) !important;
+}
+
+.ant-tabs-ink-bar {
+  background: var(--color-primary) !important;
+}
+
+.ant-switch-checked {
+  background-color: var(--color-accent) !important;
+}

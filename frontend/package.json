@@ -1,0 +1,88 @@
+{
+  "name": "mailin",
+  "productName": "麦林 Mailin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently --names \"vite,electron\" -c \"cyan,magenta\" \"cross-env BROWSER=none vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev:electron": "cross-env NODE_ENV=development electron .",
+    "dev:web": "vite",
+    "build": "run-p type-check \"build-only {@}\" --",
+    "build:electron": "cross-env ELECTRON=true VITE_ELECTRON=true run-p type-check \"build-only:electron {@}\" --",
+    "preview": "vite preview",
+    "build-only": "vite build",
+    "build-only:electron": "vite build",
+    "type-check": "vue-tsc --build",
+    "electron:dev": "npm run dev",
+    "electron:build": "npm run build:electron && electron-builder",
+    "electron:preview": "cross-env NODE_ENV=production electron .",
+    "postinstall": "node scripts/ensure-electron.cjs",
+    "fix:electron": "node scripts/ensure-electron.cjs"
+  },
+  "dependencies": {
+    "@ant-design/icons-vue": "^7.0.1",
+    "ant-design-vue": "^4.2.6",
+    "axios": "^1.13.5",
+    "dompurify": "^3.3.1",
+    "marked": "^17.0.3",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.28",
+    "vue-router": "^5.0.2"
+  },
+  "devDependencies": {
+    "@tsconfig/node24": "^24.0.4",
+    "@types/dompurify": "^3.0.5",
+    "@types/node": "^24.10.13",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "@vue/tsconfig": "^0.8.1",
+    "concurrently": "^9.2.1",
+    "cross-env": "^7.0.3",
+    "electron": "^35.1.5",
+    "electron-builder": "^26.0.12",
+    "npm-run-all2": "^8.0.4",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.1",
+    "vite-plugin-vue-devtools": "^8.0.6",
+    "vue-tsc": "^3.2.4",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.mailin.app",
+    "productName": "麦林 Mailin",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "public/mailin.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "麦林 Mailin"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "public/mailin.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "public/mailin.png"
+    }
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "graphs": {
+    "mailin_agent": "./app/agent/graph.py:get_graph"
+  },
+  "env": ".env",
+  "dependencies": ["."]
+}

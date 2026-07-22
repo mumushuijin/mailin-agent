@@ -1,0 +1,6 @@
+id: mcp
+name: MCP 外部工具
+version: "0.1.0"
+description: 连接 CONFIG.json 中 mcp_servers 定义的外部 MCP Server，工具经 tool_search 披露后调用。
+config_key: mcp
+default_enabled: true

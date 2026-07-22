@@ -1,0 +1,62 @@
+[project]
+name = "mailin-backend"
+version = "0.1.0"
+description = "麦林 Mailin 本地 AI Agent 后端（FastAPI + LangGraph）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "langsmith>=0.2",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "httpx>=0.28.0",
+    "rank-bm25>=0.2",
+    "langgraph-cli[inmem]>=0.4.30",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    "tenacity>=8.2",
+    "pybreaker>=1.2",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+eval = [
+    "ragas==0.4.3",
+    "datasets>=3.0",
+    "langchain-community==0.3.27",
+    "rapidfuzz>=3.0",
+]
+mcp = [
+    "mcp>=1.0",
+]
+
+[project.scripts]
+mailin = "cli.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "cli", "eval"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

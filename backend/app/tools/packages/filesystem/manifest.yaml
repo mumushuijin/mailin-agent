@@ -1,0 +1,6 @@
+id: filesystem
+name: 文件系统
+version: "1.1.0"
+description: 工作区内文件的读写、搜索、目录管理与移动删除
+config_key: filesystem
+default_enabled: true

@@ -1,0 +1,10 @@
+{
+  "identity": [
+    {"id": "user.default", "text": "（待补充：称呼、角色、常用场景）"}
+  ],
+  "style": [
+    {"id": "style.tone", "text": "偏好清晰、有条理的技术说明"}
+  ],
+  "habit": [],
+  "misc": []
+}

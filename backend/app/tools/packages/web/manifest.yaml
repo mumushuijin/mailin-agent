@@ -1,0 +1,6 @@
+id: web
+name: 网络搜索
+version: "1.1.0"
+description: 检索实时网络信息，返回结构化摘要与来源链接（Tavily / DuckDuckGo）
+config_key: web_search
+default_enabled: false

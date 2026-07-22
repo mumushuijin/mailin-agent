@@ -1,0 +1,6 @@
+id: memory
+name: 记忆管理
+version: "1.0.0"
+description: 每日工作记忆与长期记忆的读写检索
+config_key: memory
+default_enabled: true

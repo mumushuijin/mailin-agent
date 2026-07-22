@@ -1,0 +1,6 @@
+id: shell
+name: Shell 命令
+version: "1.0.0"
+description: 在工作区内执行 shell 命令（构建、git、包管理等）
+config_key: shell
+default_enabled: true
