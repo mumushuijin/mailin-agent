@@ -13,7 +13,7 @@
 [![Python](https://img.shields.io/badge/Python-%E2%89%A53.11-3776AB.svg?logo=python&logoColor=white)](#)
 [![Vue](https://img.shields.io/badge/Vue-3.5-42b883.svg?logo=vuedotjs&logoColor=white)](#)
 [![Electron](https://img.shields.io/badge/Electron-35-47848F.svg?logo=electron&logoColor=white)](#)
-[![License](https://img.shields.io/badge/license-未定-lightgrey.svg)](#)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](#)
 
 </div>
 
