@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,7 @@ async def test_chat_service_sets_title_on_first_accepted_message(spaces, monkeyp
     chat = ChatService()
     chat.settings = spaces["settings"]
     chat.session_store = SessionStore(spaces["home"])
+    chat._schedule_background = lambda _name, _factory: None  # type: ignore[method-assign]
     sid = chat.session_store.create(str(spaces["project"]))
 
     await chat.send_sync("请优化侧栏\n细节", sid)
@@ -282,12 +284,27 @@ async def test_chat_service_refines_auto_title_after_done(spaces, monkeypatch):
     chat.settings = spaces["settings"]
     chat.session_store = SessionStore(spaces["home"])
     sid = chat.session_store.create(str(spaces["project"]))
+    started = asyncio.Event()
+    release = asyncio.Event()
+    scheduled: list[asyncio.Task] = []
 
     async def fake_title(_user, _assistant):
+        started.set()
+        await release.wait()
         return "侧栏短标题"
 
+    def schedule_background(_name, factory):
+        scheduled.append(asyncio.create_task(factory()))
+
     chat._llm_short_title = fake_title  # type: ignore[method-assign]
+    chat._schedule_background = schedule_background  # type: ignore[method-assign]
     await chat.send_sync("请帮我优化左侧栏交互", sid)
+    loaded = chat.session_store.get(sid)
+    assert loaded["title"] == "优化左侧栏交互"
+    assert loaded["title_source"] == TITLE_SOURCE_AUTO
+    await asyncio.wait_for(started.wait(), timeout=1)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*scheduled), timeout=1)
     loaded = chat.session_store.get(sid)
     assert loaded["title"] == "侧栏短标题"
     assert loaded["title_source"] == TITLE_SOURCE_AUTO

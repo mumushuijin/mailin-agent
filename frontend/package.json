@@ -18,6 +18,7 @@
     "electron:dev": "npm run dev",
     "electron:build": "npm run build:electron && electron-builder",
     "electron:preview": "cross-env NODE_ENV=production electron .",
+    "perf:fixtures": "node scripts/perf-fixtures.cjs",
     "postinstall": "node scripts/ensure-electron.cjs",
     "fix:electron": "node scripts/ensure-electron.cjs"
   },

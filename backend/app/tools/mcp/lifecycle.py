@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import threading
+import time
 
 from app.tools.mcp.bridge import get_mcp_cards, set_mcp_cards
 from app.tools.mcp.config import load_mcp_server_configs
@@ -31,6 +33,30 @@ _discover_running = False
 
 _MAX_CONNECT_ATTEMPTS = 3
 _DISCOVERY_READY_CAP_SEC = 10.0
+MCP_STATUS_CACHE_TTL_SECONDS = 5.0
+_mcp_status_cache: list[McpServerStatus] | None = None
+_mcp_status_cache_at = 0.0
+
+
+def _invalidate_mcp_status_cache_locked() -> None:
+    global _mcp_status_cache, _mcp_status_cache_at
+    _mcp_status_cache = None
+    _mcp_status_cache_at = 0.0
+
+
+def clear_mcp_status_cache() -> None:
+    with _lock:
+        _invalidate_mcp_status_cache_locked()
+
+
+def _clear_tools_cache_quietly() -> None:
+    clear_mcp_status_cache()
+    try:
+        from app.tools.registry import clear_tools_cache
+
+        clear_tools_cache()
+    except Exception:
+        pass
 
 
 def get_mcp_server(name: str) -> MCPServerTask | None:
@@ -65,6 +91,7 @@ def _record_connect_failure(name: str, err: str) -> int:
             _server_errors[name] = f"{err}（已重试 {count} 次，暂停自动连接）"
         else:
             _server_errors[name] = err
+        _invalidate_mcp_status_cache_locked()
         return count
 
 
@@ -72,11 +99,13 @@ def _record_connect_success(name: str) -> None:
     with _lock:
         _connect_failures.pop(name, None)
         _server_errors.pop(name, None)
+        _invalidate_mcp_status_cache_locked()
 
 
 def _reset_connect_failures() -> None:
     with _lock:
         _connect_failures.clear()
+        _invalidate_mcp_status_cache_locked()
 
 
 def _servers_pending_connect(configs: dict) -> list[str]:
@@ -156,11 +185,13 @@ def discover_mcp_servers() -> list[str]:
     if not _MCP_SDK_AVAILABLE:
         logger.warning("未安装 mcp 包，跳过 MCP 发现。请执行: uv pip install -e '.[mcp]'")
         set_mcp_cards([])
+        _clear_tools_cache_quietly()
         return []
 
     configs = load_mcp_server_configs()
     if not configs:
         set_mcp_cards([])
+        _clear_tools_cache_quietly()
         return []
 
     with _discover_lock:
@@ -256,13 +287,7 @@ def _discover_mcp_servers_locked(configs: dict) -> list[str]:
                     registered_names.extend(c.name for c in result)
 
         set_mcp_cards(all_cards)
-        if all_cards:
-            try:
-                from app.tools.registry import clear_tools_cache
-
-                clear_tools_cache()
-            except Exception:
-                pass
+        _clear_tools_cache_quietly()
         return registered_names
 
     pending = len(_servers_pending_connect(configs))
@@ -324,16 +349,17 @@ def shutdown_mcp_servers() -> None:
 
     set_mcp_cards([])
     stop_mcp_loop()
-    try:
-        from app.tools.registry import clear_tools_cache
-
-        clear_tools_cache()
-    except Exception:
-        pass
+    _clear_tools_cache_quietly()
 
 
 def get_mcp_status() -> list[McpServerStatus]:
     """返回各 Server 连接状态（非阻塞；已放弃的 Server 不再重试）。"""
+    global _mcp_status_cache, _mcp_status_cache_at
+    now = time.monotonic()
+    with _lock:
+        if _mcp_status_cache is not None and now - _mcp_status_cache_at <= MCP_STATUS_CACHE_TTL_SECONDS:
+            return copy.deepcopy(_mcp_status_cache)
+
     ensure_mcp_connected(blocking=False)
     configs = load_mcp_server_configs()
     cards = get_mcp_cards()
@@ -372,6 +398,9 @@ def get_mcp_status() -> list[McpServerStatus]:
                 supports_parallel_tool_calls=cfg.supports_parallel_tool_calls,
             )
         )
+    with _lock:
+        _mcp_status_cache = copy.deepcopy(statuses)
+        _mcp_status_cache_at = time.monotonic()
     return statuses
 
 

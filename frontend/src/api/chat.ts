@@ -65,7 +65,9 @@ export interface StreamEvent {
     | 'chunk'
     | 'tool_start'
     | 'tool_finish'
+    | 'tool_progress'
     | 'step_finish'
+    | 'stage'
     | 'done'
     | 'error'
     | 'context_usage'
@@ -81,10 +83,18 @@ export interface StreamEvent {
   args?: Record<string, unknown>
   result?: string
   error?: string
+  status?: string
+  stage?: string
+  elapsed_ms?: number
+  duration_ms?: number
+  metrics?: Record<string, unknown>
+  message?: string
   session_id?: string | null
   step?: number
   max_steps?: number
   run_id?: string
+  partial?: boolean
+  cancelled?: boolean
   reason?: string
   tool_call_id?: string
   kind?: string
@@ -177,34 +187,80 @@ export const chatApi = {
             if (data && currentEvent) {
               try {
                 const parsed = JSON.parse(data)
+                const runId = parsed.run_id as string | undefined
 
                 if (currentEvent === 'session') {
                   finalSessionId = parsed.session_id
-                  onChunk({ type: 'session', session_id: parsed.session_id })
+                  onChunk({ type: 'session', session_id: parsed.session_id, run_id: runId })
                 } else if (currentEvent === 'step_start') {
-                  onChunk({ type: 'step_start', step: parsed.step, max_steps: parsed.max_steps })
+                  onChunk({ type: 'step_start', step: parsed.step, max_steps: parsed.max_steps, run_id: runId })
                 } else if (currentEvent === 'chunk') {
                   fullContent += parsed.content || ''
-                  onChunk({ type: 'chunk', content: parsed.content })
+                  onChunk({ type: 'chunk', content: parsed.content, run_id: runId })
                 } else if (currentEvent === 'tool_start') {
-                  onChunk({ type: 'tool_start', tool: parsed.tool, args: parsed.args })
+                  onChunk({ type: 'tool_start', tool: parsed.tool, args: parsed.args, tool_call_id: parsed.tool_call_id, run_id: runId })
                 } else if (currentEvent === 'tool_finish') {
-                  onChunk({ type: 'tool_finish', tool: parsed.tool, result: parsed.result })
+                  onChunk({ type: 'tool_finish', tool: parsed.tool, result: parsed.result, tool_call_id: parsed.tool_call_id, run_id: runId })
+                } else if (currentEvent === 'tool_progress') {
+                  onChunk({
+                    type: 'tool_progress',
+                    tool: parsed.tool,
+                    status: parsed.status,
+                    result: parsed.message || parsed.result,
+                    message: parsed.message || parsed.chunk,
+                    run_id: runId,
+                  })
                 } else if (currentEvent === 'step_finish') {
-                  onChunk({ type: 'step_finish', step: parsed.step })
+                  onChunk({ type: 'step_finish', step: parsed.step, run_id: runId })
+                } else if (currentEvent === 'stage') {
+                  onChunk({
+                    type: 'stage',
+                    stage: parsed.stage,
+                    status: parsed.status,
+                    elapsed_ms: parsed.elapsed_ms,
+                    duration_ms: parsed.duration_ms,
+                    error: parsed.error,
+                    run_id: runId,
+                  })
                 } else if (currentEvent === 'context_usage') {
-                  onChunk({ type: 'context_usage', context_usage: parsed })
+                  onChunk({ type: 'context_usage', context_usage: parsed, run_id: runId })
                 } else if (currentEvent === 'api_usage') {
-                  onChunk({ type: 'api_usage', api_usage: parsed })
+                  onChunk({ type: 'api_usage', api_usage: parsed, run_id: runId })
                 } else if (currentEvent === 'session_token_stats') {
-                  onChunk({ type: 'session_token_stats', session_token_stats: parsed })
+                  onChunk({ type: 'session_token_stats', session_token_stats: parsed, run_id: runId })
                 } else if (currentEvent === 'compression') {
-                  onChunk({ type: 'compression', compression: parsed })
+                  onChunk({ type: 'compression', compression: parsed, run_id: runId })
+                } else if (currentEvent === 'interrupt') {
+                  onChunk({
+                    type: 'interrupt',
+                    kind: parsed.kind || 'approval',
+                    tool: parsed.tool,
+                    args: parsed.args,
+                    reason: parsed.reason,
+                    tool_call_id: parsed.tool_call_id,
+                    prompt: parsed.prompt,
+                    options: Array.isArray(parsed.options) ? parsed.options : [],
+                    allow_multiple: Boolean(parsed.allow_multiple),
+                    run_id: runId,
+                  })
+                } else if (currentEvent === 'todo') {
+                  onChunk({ type: 'todo', todos: Array.isArray(parsed.todos) ? parsed.todos : [], run_id: runId })
+                } else if (currentEvent === 'background') {
+                  onChunk({ type: 'background', background: parsed, run_id: runId })
+                } else if (currentEvent === 'config_updated') {
+                  onChunk({ type: 'config_updated', config_name: parsed.name, run_id: runId })
                 } else if (currentEvent === 'done') {
                   finalSessionId = parsed.session_id
-                  onChunk({ type: 'done', content: parsed.content, session_id: parsed.session_id })
+                  onChunk({
+                    type: 'done',
+                    content: parsed.content,
+                    session_id: parsed.session_id,
+                    partial: Boolean(parsed.partial),
+                    cancelled: Boolean(parsed.cancelled),
+                    run_id: runId,
+                  })
                 } else if (currentEvent === 'error') {
-                  onChunk({ type: 'error', error: parsed.error })
+                  onChunk({ type: 'error', error: parsed.error, cancelled: Boolean(parsed.cancelled), run_id: runId })
                 }
               } catch {
                 // 忽略解析错误

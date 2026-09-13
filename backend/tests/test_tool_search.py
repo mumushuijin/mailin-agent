@@ -15,6 +15,7 @@ from app.tools.tool_search import (
     dispatch_tool_search,
     execute_single_tool_call,
     load_tool_search_config,
+    tool_search_cache_stats,
 )
 
 
@@ -91,6 +92,30 @@ def test_dispatch_tool_search_finds_memory_tools():
     match_names = {m["name"] for m in payload["matches"]}
     assert "memory_list" in match_names
     assert payload["total_available"] > 0
+
+
+def test_dispatch_tool_search_reuses_catalog_for_unchanged_config():
+    registry = ToolRegistry(config=_base_config())
+    cards = registry.resolve_cards()
+    config = ToolSearchConfig.from_config(_base_config())
+
+    dispatch_tool_search({"query": "列出记忆文件"}, cards=cards, config=config)
+    dispatch_tool_search({"query": "写入记忆"}, cards=cards, config=config)
+
+    stats = tool_search_cache_stats()
+    assert stats["catalog_entries"] == 1
+    assert stats["catalog_builds"] == 1
+
+
+def test_registry_resolve_cards_reuses_ttl_cache():
+    registry = ToolRegistry(config=_base_config())
+
+    first = registry.resolve_cards()
+    second = registry.resolve_cards()
+    forced = registry.resolve_cards(force_refresh=True)
+
+    assert [c.name for c in first] == [c.name for c in second] == [c.name for c in forced]
+    assert registry.resolve_cards_builds == 2
 
 
 def test_dispatch_tool_describe_returns_card():

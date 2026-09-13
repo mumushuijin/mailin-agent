@@ -19,7 +19,10 @@ class AgentEvent:
 
 
 def to_sse(event: AgentEvent) -> str:
-    return f"event: {event.type}\ndata: {json.dumps(event.data, ensure_ascii=False)}\n\n"
+    data = dict(event.data)
+    if event.run_id:
+        data["run_id"] = event.run_id
+    return f"event: {event.type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def to_ws(event: AgentEvent) -> dict:

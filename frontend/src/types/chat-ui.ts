@@ -10,6 +10,9 @@ export interface ToolSegment {
   tool: string
   args: Record<string, unknown>
   result?: string
+  toolResultRef?: string | null
+  toolResultTruncated?: boolean
+  fullResultLoading?: boolean
   status: 'running' | 'done' | 'error'
 }
 

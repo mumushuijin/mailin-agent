@@ -1,5 +1,9 @@
 import asyncio
+import json
+import logging
+import re
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -17,23 +21,48 @@ from app.agent.streaming.sse_mapper import extract_final_content, stream_graph_e
 from app.context.engine import resolve_context_usage
 from app.context.ledger import repair_orphan_tool_calls
 from app.context.memory.maintenance import prepare_session_memory
+from app.context.tool_cache import save_tool_result, summarize_tool_result
+from app.core.latency import (
+    LATENCY_STAGE_ACCEPTED,
+    LATENCY_STAGE_CONTEXT_PREPARE,
+    LATENCY_STAGE_HISTORY_LOAD,
+    LATENCY_STAGE_MODEL_STREAM,
+    LATENCY_STAGE_POSTPROCESS,
+    RunLatency,
+)
 from app.maintenance.runner import get_maintenance_runner
 from app.core.llm import get_chat_model, load_agent_config
 from app.core.settings import get_settings
 from app.resilience import GRAPH_REQUEST_TIMEOUT_SECONDS
 from app.schemas.chat import ChatResponse
-from app.schemas.session import ChatMessage, SessionHistory, ToolCall, ToolCallFunction
+from app.schemas.session import (
+    ChatMessage,
+    Session,
+    SessionHistory,
+    SessionHistoryPage,
+    ToolCall,
+    ToolCallFunction,
+    ToolResultPayload,
+)
 from app.core.exceptions import AppError
-from app.storage.project import require_bound_session
-from app.storage.workspace import SessionStore
+from app.storage.history_projection import HistoryProjectionStore
+from app.storage.project import require_bound_session, session_project_path
+from app.storage.workspace import SessionStore, project_tool_results_dir
 from app.tools.registry import load_full_config
 from app.tools.tool_search import resolve_tool_display, should_show_tool_in_ui
+
+log = logging.getLogger(__name__)
+
+DEFAULT_HISTORY_LIMIT = 30
+MAX_HISTORY_LIMIT = 200
+PREPARE_MEMORY_TIMEOUT_SECONDS = 8.0
 
 
 class ChatService:
     def __init__(self):
         self.settings = get_settings()
         self.session_store = SessionStore(self.settings.workspace_path)
+        self.history_projection = HistoryProjectionStore(self.settings.workspace_path)
 
     def _max_steps(self) -> int:
         config = load_full_config(self.settings.workspace_path)
@@ -42,6 +71,202 @@ class ChatService:
     def _require_bound_session(self, session_id: str | None) -> str:
         sid, _project = require_bound_session(session_id)
         return sid
+
+    def _schedule_background(self, name: str, factory) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _runner() -> None:
+            try:
+                await factory()
+            except Exception:
+                log.warning("%s failed", name, exc_info=True)
+
+        loop.create_task(_runner())
+
+    async def _prepare_memory_bounded(self, message: str, latency: RunLatency) -> str:
+        try:
+            await asyncio.wait_for(
+                prepare_session_memory(message),
+                timeout=PREPARE_MEMORY_TIMEOUT_SECONDS,
+            )
+            return "done"
+        except TimeoutError:
+            log.warning(
+                "memory preparation timed out",
+                extra=latency.summary(status="degraded", failed_stage=LATENCY_STAGE_CONTEXT_PREPARE),
+            )
+            return "degraded"
+        except Exception:
+            log.warning("memory preparation failed", exc_info=True)
+            return "failed"
+
+    async def _get_graph_bounded(self):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(get_graph),
+                timeout=min(10.0, GRAPH_REQUEST_TIMEOUT_SECONDS),
+            )
+        except TimeoutError as exc:
+            raise RuntimeError("Agent 图准备超时，请稍后重试") from exc
+
+    def _history_from_values(
+        self,
+        session_id: str,
+        values: dict,
+        *,
+        compact_tools: bool,
+    ) -> SessionHistory:
+        messages = repair_orphan_tool_calls(values.get("messages", []))
+        session_token_stats = values.get("session_token_stats") or {}
+        api_usage = values.get("api_usage") or {}
+        context_usage = resolve_context_usage({**values, "messages": messages}, session_id)
+        return SessionHistory(
+            session_id=session_id,
+            messages=self.messages_to_openai(
+                messages,
+                session_id=session_id,
+                compact_tools=compact_tools,
+            ),
+            context_usage=context_usage,
+            api_usage=api_usage or None,
+            session_token_stats=session_token_stats or None,
+            todos=list(values.get("todos") or []) or None,
+        )
+
+    async def _history_from_checkpoint(
+        self,
+        session_id: str,
+        *,
+        compact_tools: bool,
+    ) -> SessionHistory:
+        self.session_store.get(session_id)
+        graph = await self._get_graph_bounded()
+        config = make_thread_config(session_id)
+        state = await graph.aget_state(config)
+        values = dict(state.values) if state and state.values else {}
+        return self._history_from_values(session_id, values, compact_tools=compact_tools)
+
+    async def _refresh_history_projection(
+        self,
+        session_id: str,
+        *,
+        graph=None,
+        config: dict | None = None,
+    ) -> None:
+        try:
+            graph = graph or await self._get_graph_bounded()
+            config = config or make_thread_config(session_id)
+            state = await graph.aget_state(config)
+            values = dict(state.values) if state and state.values else {}
+            history = self._history_from_values(session_id, values, compact_tools=True)
+            self.history_projection.write(
+                session_id,
+                history.messages,
+                context_usage=history.context_usage,
+                api_usage=history.api_usage,
+                session_token_stats=history.session_token_stats,
+                todos=history.todos,
+            )
+        except Exception:
+            log.warning("history projection refresh failed", exc_info=True)
+
+    async def get_history_page(
+        self,
+        session_id: str,
+        *,
+        limit: int = DEFAULT_HISTORY_LIMIT,
+        before: str | None = None,
+    ) -> SessionHistoryPage:
+        latency = RunLatency(run_id=None, session_id=session_id)
+        latency.start(LATENCY_STAGE_HISTORY_LOAD)
+        meta = self.session_store.get(session_id)
+        limit = max(1, min(MAX_HISTORY_LIMIT, int(limit or DEFAULT_HISTORY_LIMIT)))
+
+        payload = self.history_projection.read(session_id)
+        if payload is None:
+            history = await self._history_from_checkpoint(session_id, compact_tools=True)
+            self.history_projection.write(
+                session_id,
+                history.messages,
+                context_usage=history.context_usage,
+                api_usage=history.api_usage,
+                session_token_stats=history.session_token_stats,
+                todos=history.todos,
+            )
+            payload = self.history_projection.read(session_id) or {
+                "messages": [m.model_dump(mode="json") for m in history.messages],
+                "context_usage": history.context_usage,
+                "api_usage": history.api_usage,
+                "session_token_stats": history.session_token_stats,
+                "todos": history.todos,
+            }
+
+        page_messages, has_more, next_cursor = self.history_projection.page(
+            payload,
+            limit=limit,
+            before=before,
+        )
+        latency.finish(LATENCY_STAGE_HISTORY_LOAD)
+        log.info(
+            "history.load.completed",
+            extra=latency.summary(
+                status="success",
+                message_count=len(page_messages),
+                has_more=has_more,
+            ),
+        )
+        return SessionHistoryPage(
+            session_id=session_id,
+            session=Session(**meta),
+            messages=page_messages,
+            context_usage=payload.get("context_usage"),
+            api_usage=payload.get("api_usage"),
+            session_token_stats=payload.get("session_token_stats"),
+            todos=payload.get("todos"),
+            limit=limit,
+            before=before,
+            has_more=has_more,
+            next_cursor=next_cursor,
+            projection_updated_at=payload.get("updated_at"),
+        )
+
+    async def get_tool_result(self, session_id: str, tool_call_id: str) -> ToolResultPayload:
+        self.session_store.get(session_id)
+        project = session_project_path(session_id)
+        if project is None:
+            return ToolResultPayload(
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                available=False,
+                error="会话未绑定项目工作区",
+            )
+        safe_id = re.sub(r"[^\w\-]", "_", tool_call_id or "unknown")
+        path = project_tool_results_dir(Path(project), session_id) / f"{safe_id}.json"
+        if not path.exists():
+            return ToolResultPayload(
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                content=None,
+                available=False,
+                error="工具结果不可用或尚未落盘",
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise ValueError("工具结果格式无效")
+            return ToolResultPayload(session_id=session_id, tool_call_id=tool_call_id, content=content)
+        except Exception as exc:
+            return ToolResultPayload(
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                content=None,
+                available=False,
+                error=str(exc),
+            )
 
     async def _llm_short_title(self, user_message: str, assistant_content: str) -> str | None:
         if not self.settings.has_llm:
@@ -93,30 +318,40 @@ class ChatService:
     ) -> ChatResponse:
         from app.core.settings import get_settings
 
-        _ = run_id  # 日志上下文由 API 层 log_scope 绑定
-
+        latency = RunLatency(run_id=run_id, session_id=session_id)
         sid = self._require_bound_session(session_id)
+        latency.bind_session(sid)
 
         if not get_settings().has_llm:
             raise RuntimeError("未配置 LLM API Key")
         self.session_store.maybe_set_title_from_message(sid, message)
-        await prepare_session_memory(message)
-        graph = await asyncio.to_thread(get_graph)
+        latency.start(LATENCY_STAGE_CONTEXT_PREPARE)
+        await self._prepare_memory_bounded(message, latency)
+        graph = await self._get_graph_bounded()
         config = make_thread_config(sid)
         max_steps = self._max_steps()
         state = make_initial_state(message, max_steps)
+        latency.finish(LATENCY_STAGE_CONTEXT_PREPARE)
 
         try:
+            latency.start(LATENCY_STAGE_MODEL_STREAM)
             result = await asyncio.wait_for(
                 graph.ainvoke(state, config),
                 timeout=GRAPH_REQUEST_TIMEOUT_SECONDS,
             )
+            latency.finish(LATENCY_STAGE_MODEL_STREAM)
         except TimeoutError as exc:
+            latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed")
             raise RuntimeError(
                 f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s），请稍后重试"
             ) from exc
         content = extract_final_content(result.get("messages", []))
-        await self._refine_auto_title_after_turn(sid, message, content)
+        self.session_store.touch(sid)
+        await self._refresh_history_projection(sid, graph=graph, config=config)
+        self._schedule_background(
+            "auto-title refinement",
+            lambda: self._refine_auto_title_after_turn(sid, message, content),
+        )
         dispatch_post_llm_call(
             session_id=sid,
             user_message=message,
@@ -124,8 +359,11 @@ class ChatService:
         )
         dispatch_observe(ON_SESSION_END, session_id=sid, completed=True, interrupted=False)
         if result.get("memory_nudge_pending"):
-            await get_maintenance_runner().run_memory_nudge_for_session(sid)
-        self.session_store.touch(sid)
+            self._schedule_background(
+                "memory nudge",
+                lambda: get_maintenance_runner().run_memory_nudge_for_session(sid),
+            )
+        log.info("chat.run.completed", extra=latency.summary(status="success"))
         return ChatResponse(content=content, session_id=sid)
 
     async def iter_chat_events(
@@ -136,29 +374,48 @@ class ChatService:
         run_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """聊天主流程：产出统一 AgentEvent 流（SSE / WS 共用）。"""
+        latency = RunLatency(run_id=run_id, session_id=session_id)
         try:
             sid = self._require_bound_session(session_id)
         except AppError as exc:
             yield AgentEvent("error", {"error": exc.message}, run_id)
             return
+        latency.bind_session(sid)
 
         if not self.settings.has_llm:
             yield AgentEvent("error", {"error": "未配置 LLM API Key，请在 backend/.env 设置 OPENAI_API_KEY"}, run_id)
             return
         yield AgentEvent("session", {"session_id": sid}, run_id)
+        yield AgentEvent("stage", latency.instant(LATENCY_STAGE_ACCEPTED), run_id)
         self.session_store.maybe_set_title_from_message(sid, message)
-        await prepare_session_memory(message)
 
-        graph = await asyncio.to_thread(get_graph)
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_CONTEXT_PREPARE), run_id)
+        memory_status = await self._prepare_memory_bounded(message, latency)
+        try:
+            graph = await self._get_graph_bounded()
+        except Exception as exc:
+            yield AgentEvent(
+                "stage",
+                latency.finish(LATENCY_STAGE_CONTEXT_PREPARE, "failed", error=str(exc)),
+                run_id,
+            )
+            yield AgentEvent("error", {"error": str(exc)}, run_id)
+            log.info("chat.run.completed", extra=latency.summary(status="failed", failed_stage=LATENCY_STAGE_CONTEXT_PREPARE))
+            return
         config = make_thread_config(sid)
         max_steps = self._max_steps()
         state = make_initial_state(message, max_steps)
+        yield AgentEvent(
+            "stage",
+            latency.finish(LATENCY_STAGE_CONTEXT_PREPARE, memory_status),
+            run_id,
+        )
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), run_id)
 
         nudge_pending = False
         final_content = ""
         completed = False
         async for event in stream_graph_events(graph, state, config, max_steps, run_id=run_id):
-            yield event
             if event.type == "done":
                 self.session_store.touch(sid)
                 final_content = event.data.get("content", "") or ""
@@ -166,9 +423,28 @@ class ChatService:
                 snapshot = await graph.aget_state(config)
                 values = dict(snapshot.values) if snapshot and snapshot.values else {}
                 nudge_pending = bool(values.get("memory_nudge_pending"))
+                yield AgentEvent(
+                    "stage",
+                    latency.finish(LATENCY_STAGE_MODEL_STREAM, "done" if completed else "partial"),
+                    run_id,
+                )
+            elif event.type == "error":
+                yield AgentEvent(
+                    "stage",
+                    latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"),
+                    run_id,
+                )
+            yield event
 
         if completed:
-            asyncio.create_task(self._refine_auto_title_after_turn(sid, message, final_content))
+            self._schedule_background(
+                "auto-title refinement",
+                lambda: self._refine_auto_title_after_turn(sid, message, final_content),
+            )
+            self._schedule_background(
+                "history projection refresh",
+                lambda: self._refresh_history_projection(sid, graph=graph, config=config),
+            )
             dispatch_post_llm_call(
                 session_id=sid,
                 user_message=message,
@@ -182,7 +458,16 @@ class ChatService:
         )
 
         if nudge_pending:
-            await get_maintenance_runner().run_memory_nudge_for_session(sid)
+            yield AgentEvent(
+                "stage",
+                latency.instant(LATENCY_STAGE_POSTPROCESS, status="background"),
+                run_id,
+            )
+            self._schedule_background(
+                "memory nudge",
+                lambda: get_maintenance_runner().run_memory_nudge_for_session(sid),
+            )
+        log.info("chat.run.completed", extra=latency.summary(status="success" if completed else "partial"))
 
     async def send_stream(
         self,
@@ -201,7 +486,7 @@ class ChatService:
 
         if not sid:
             return
-        graph = await asyncio.to_thread(get_graph)
+        graph = await self._get_graph_bounded()
         if await has_pending_interrupt(graph, make_thread_config(sid)):
             yield to_sse(
                 AgentEvent(
@@ -223,9 +508,11 @@ class ChatService:
         """恢复 interrupt 后继续产出事件流。"""
         from langgraph.types import Command
 
-        graph = await asyncio.to_thread(get_graph)
+        graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
         max_steps = self._max_steps()
+        latency = RunLatency(run_id=run_id, session_id=session_id)
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), run_id)
 
         async for event in stream_graph_events(
             graph,
@@ -235,15 +522,22 @@ class ChatService:
             run_id=run_id,
             input_override=Command(resume=decision),
         ):
-            yield event
             if event.type == "done":
                 self.session_store.touch(session_id)
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM), run_id)
+                self._schedule_background(
+                    "history projection refresh",
+                    lambda: self._refresh_history_projection(session_id, graph=graph, config=config),
+                )
+            elif event.type == "error":
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"), run_id)
+            yield event
 
     async def repair_cancelled_checkpoint(self, session_id: str) -> None:
         """取消时修复未完成的 tool_calls。"""
         from app.context.ledger import cancel_tool_calls_message, has_pending_tool_calls
 
-        graph = await asyncio.to_thread(get_graph)
+        graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
         snapshot = await graph.aget_state(config)
         if not snapshot or not snapshot.values:
@@ -262,9 +556,41 @@ class ChatService:
             return int(ts)
         return None
 
-    def messages_to_openai(self, messages: list) -> list[ChatMessage]:
-        import json
+    def _compact_tool_content(
+        self,
+        msg: ToolMessage,
+        *,
+        session_id: str | None = None,
+    ) -> tuple[str, str | None, str | None, bool]:
+        content = str(msg.content) if msg.content is not None else ""
+        kwargs = getattr(msg, "additional_kwargs", None) or {}
+        cache_path = kwargs.get("tool_cache_path")
+        cache_summary = kwargs.get("tool_cache_summary")
+        if cache_path and cache_summary:
+            return str(cache_summary), msg.tool_call_id, str(cache_summary), True
+        preview = summarize_tool_result(content, max_chars=800)
+        truncated = len(preview) < len(content)
+        if truncated and session_id and msg.tool_call_id:
+            project = session_project_path(session_id)
+            if project is not None:
+                try:
+                    save_tool_result(session_id, msg.tool_call_id, content, Path(project))
+                    return preview, msg.tool_call_id, preview, True
+                except Exception:
+                    log.warning(
+                        "tool result projection cache failed",
+                        extra={"session_id": session_id, "tool_call_id": msg.tool_call_id},
+                        exc_info=True,
+                    )
+        return (preview if truncated else content), None, (preview if truncated else None), truncated
 
+    def messages_to_openai(
+        self,
+        messages: list,
+        *,
+        session_id: str | None = None,
+        compact_tools: bool = False,
+    ) -> list[ChatMessage]:
         tool_display_names: dict[str, str] = {}
         for msg in messages:
             if isinstance(msg, ToolMessage) and msg.tool_call_id and msg.name:
@@ -326,32 +652,27 @@ class ChatService:
                 display_name = msg.name or "tool"
                 if not should_show_tool_in_ui(display_name):
                     continue
+                content = str(msg.content) if msg.content is not None else ""
+                tool_ref = None
+                tool_preview = None
+                tool_truncated = False
+                if compact_tools:
+                    content, tool_ref, tool_preview, tool_truncated = self._compact_tool_content(
+                        msg,
+                        session_id=session_id,
+                    )
                 result.append(
                     ChatMessage(
                         role="tool",
-                        content=str(msg.content),
+                        content=content,
                         tool_call_id=msg.tool_call_id,
                         timestamp=self._message_timestamp(msg),
+                        tool_result_ref=tool_ref,
+                        tool_result_preview=tool_preview,
+                        tool_result_truncated=tool_truncated,
                     )
                 )
         return result
 
     async def get_history(self, session_id: str) -> SessionHistory:
-        self.session_store.get(session_id)
-        graph = await asyncio.to_thread(get_graph)
-        config = make_thread_config(session_id)
-        state = await graph.aget_state(config)
-        values = dict(state.values) if state and state.values else {}
-        messages = repair_orphan_tool_calls(values.get("messages", []))
-        session_token_stats = values.get("session_token_stats") or {}
-        api_usage = values.get("api_usage") or {}
-        context_usage = resolve_context_usage({**values, "messages": messages}, session_id)
-
-        return SessionHistory(
-            session_id=session_id,
-            messages=self.messages_to_openai(messages),
-            context_usage=context_usage,
-            api_usage=api_usage or None,
-            session_token_stats=session_token_stats or None,
-            todos=list(values.get("todos") or []) or None,
-        )
+        return await self._history_from_checkpoint(session_id, compact_tools=False)

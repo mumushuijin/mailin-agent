@@ -7,6 +7,7 @@ from langgraph.errors import GraphInterrupt
 from app.agent.content_sanitize import strip_dsml_markup
 from app.agent.streaming.events import AgentEvent
 from app.context.engine import resolve_context_usage
+from app.core.latency import LATENCY_STAGE_TOOL_BATCH, LATENCY_STAGE_USAGE_SNAPSHOT
 from app.resilience import GRAPH_REQUEST_TIMEOUT_SECONDS
 from app.tools.runtime import drain_tool_progress
 from app.tools.tool_search import resolve_tool_display, should_show_tool_in_ui
@@ -86,6 +87,15 @@ async def stream_graph_events(
                     if messages:
                         last = messages[-1]
                         if isinstance(last, AIMessage) and last.tool_calls:
+                            yield _evt(
+                                "stage",
+                                {
+                                    "stage": LATENCY_STAGE_TOOL_BATCH,
+                                    "status": "started",
+                                    "tool_call_count": len(last.tool_calls),
+                                },
+                                run_id,
+                            )
                             for tc in last.tool_calls:
                                 raw_name = tc.get("name", "")
                                 raw_args = tc.get("args") or {}
@@ -100,14 +110,21 @@ async def stream_graph_events(
                                 if should_show_tool_in_ui(display_name):
                                     yield _evt(
                                         "tool_start",
-                                        {"tool": display_name, "args": display_args},
+                                        {
+                                            "tool": display_name,
+                                            "args": display_args,
+                                            "tool_call_id": tc.get("id"),
+                                        },
                                         run_id,
                                     )
 
                 elif kind == "on_chain_end" and name == "tools":
                     session_id = config.get("configurable", {}).get("thread_id")
                     for progress in drain_tool_progress(session_id):
-                        yield _evt("tool_progress", progress, run_id)
+                        payload = dict(progress)
+                        if payload.get("chunk") and not payload.get("message"):
+                            payload["message"] = payload["chunk"]
+                        yield _evt("tool_progress", payload, run_id)
                     output = data.get("output") or {}
                     todos = output.get("todos")
                     if todos is not None:
@@ -121,13 +138,30 @@ async def stream_graph_events(
                                     {
                                         "tool": display_name,
                                         "result": str(msg.content) if msg.content is not None else "",
+                                        "tool_call_id": msg.tool_call_id,
                                     },
                                     run_id,
                                 )
+                    yield _evt(
+                        "stage",
+                        {
+                            "stage": LATENCY_STAGE_TOOL_BATCH,
+                            "status": "done",
+                        },
+                        run_id,
+                    )
 
                 elif kind == "on_chain_end" and name == "agent" and emitted_step_start:
                     output = data.get("output") or {}
                     session_id = config.get("configurable", {}).get("thread_id")
+                    yield _evt(
+                        "stage",
+                        {
+                            "stage": LATENCY_STAGE_USAGE_SNAPSHOT,
+                            "status": "started",
+                        },
+                        run_id,
+                    )
                     snapshot = await graph.aget_state(config)
                     values = dict(snapshot.values) if snapshot and snapshot.values else {}
                     context_usage = (
@@ -153,6 +187,14 @@ async def stream_graph_events(
                     session_token_stats = output.get("session_token_stats")
                     if session_token_stats:
                         yield _evt("session_token_stats", session_token_stats, run_id)
+                    yield _evt(
+                        "stage",
+                        {
+                            "stage": LATENCY_STAGE_USAGE_SNAPSHOT,
+                            "status": "done",
+                        },
+                        run_id,
+                    )
                     yield _evt("step_finish", {"step": current_step}, run_id)
                     emitted_step_start = False
 

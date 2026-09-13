@@ -1,6 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
-from app.schemas.session import Session, SessionCreate, SessionHistory, SessionRebind, SessionRename
+from app.schemas.session import (
+    Session,
+    SessionCreate,
+    SessionHistory,
+    SessionHistoryPage,
+    SessionRebind,
+    SessionRename,
+    ToolResultPayload,
+)
 from app.services.chat_service import ChatService
 from app.services.session_service import SessionService
 
@@ -42,6 +50,22 @@ async def delete_session(session_id: str):
     return {"status": "ok"}
 
 
-@router.get("/{session_id}/history", response_model=SessionHistory)
-async def get_session_history(session_id: str):
-    return await chat_service.get_history(session_id)
+@router.get("/{session_id}/history", response_model=SessionHistory | SessionHistoryPage)
+async def get_session_history(
+    session_id: str,
+    limit: int | None = Query(default=None, ge=1, le=200),
+    before: str | None = Query(default=None),
+    full: bool = Query(default=False),
+):
+    if full or (limit is None and before is None):
+        return await chat_service.get_history(session_id)
+    return await chat_service.get_history_page(
+        session_id,
+        limit=limit or 30,
+        before=before,
+    )
+
+
+@router.get("/{session_id}/tool-result/{tool_call_id}", response_model=ToolResultPayload)
+async def get_tool_result(session_id: str, tool_call_id: str):
+    return await chat_service.get_tool_result(session_id, tool_call_id)

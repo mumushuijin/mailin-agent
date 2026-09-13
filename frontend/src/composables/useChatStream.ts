@@ -11,6 +11,7 @@ export interface ChatStreamState {
   contextUsage: Ref<ContextUsage | null>
   apiUsage: Ref<ApiUsage | null>
   contextCompressing: Ref<boolean>
+  activeStage: Ref<string | null>
   pendingApproval: Ref<PendingApproval | null>
   pendingAskUser: Ref<PendingAskUser | null>
   sessionTodos: Ref<SessionTodoItem[]>
@@ -52,7 +53,15 @@ export function applyChatStreamEvent(
       ctx.currentSessionId.value = event.session_id
       ctx.saveCurrentSession(event.session_id)
     }
+  } else if (event.type === 'stage') {
+    const status = event.status || 'started'
+    if (status === 'started' || status === 'background' || status === 'degraded') {
+      ctx.activeStage.value = event.stage || null
+    } else if (ctx.activeStage.value === event.stage) {
+      ctx.activeStage.value = null
+    }
   } else if (event.type === 'step_start') {
+    ctx.activeStage.value = 'model_stream'
     for (const seg of currentSegments) {
       if (seg.type === 'tool' && seg.status === 'running') {
         seg.status = 'done'
@@ -77,6 +86,7 @@ export function applyChatStreamEvent(
     }
     ctx.scrollToBottom()
   } else if (event.type === 'tool_start') {
+    ctx.activeStage.value = 'tool_batch'
     currentSegments.push({
       type: 'tool',
       id: Date.now(),
@@ -105,6 +115,8 @@ export function applyChatStreamEvent(
     }
     ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
     ctx.scrollToBottom()
+  } else if (event.type === 'tool_progress') {
+    ctx.activeStage.value = 'tool_batch'
   } else if (event.type === 'context_usage' && event.context_usage) {
     ctx.contextUsage.value = event.context_usage
     ctx.contextCompressing.value = Boolean(event.context_usage.compressing)
@@ -112,9 +124,11 @@ export function applyChatStreamEvent(
     ctx.apiUsage.value = event.api_usage
   } else if (event.type === 'compression') {
     ctx.contextCompressing.value = event.compression?.status !== 'done'
+    ctx.activeStage.value = ctx.contextCompressing.value ? 'context_prepare' : null
   } else if (event.type === 'todo' && event.todos) {
     ctx.sessionTodos.value = event.todos
   } else if (event.type === 'interrupt') {
+    ctx.activeStage.value = 'waiting_user'
     if (event.kind === 'ask_user') {
       ctx.pendingApproval.value = null
       ctx.pendingAskUser.value = {
@@ -140,6 +154,7 @@ export function applyChatStreamEvent(
         ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
       }
       ctx.contextCompressing.value = false
+      ctx.activeStage.value = null
       ctx.pendingApproval.value = null
       ctx.pendingAskUser.value = null
     } else {
@@ -176,6 +191,7 @@ export function applyChatStreamEvent(
       ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
     }
     ctx.contextCompressing.value = false
+    ctx.activeStage.value = null
     if (event.session_id) {
       ctx.currentSessionId.value = event.session_id
     }
@@ -190,4 +206,59 @@ export function applyChatStreamEvent(
   }
 
   return { assistantMsgIndex, currentTextSegmentId }
+}
+
+const BATCHABLE_EVENT_TYPES = new Set<StreamEvent['type']>([
+  'chunk',
+  'tool_progress',
+  'context_usage',
+  'api_usage',
+  'session_token_stats',
+  'stage',
+])
+
+export function createChatStreamEventBatcher(
+  ctx: ChatStreamState,
+): {
+  handle: (event: StreamEvent) => void
+  flush: () => void
+} {
+  const queue: StreamEvent[] = []
+  const session = {
+    assistantMsgIndex: -1,
+    currentSegments: [] as MessageSegment[],
+    currentTextSegmentId: -1,
+  }
+  let scheduled = false
+
+  const flush = () => {
+    scheduled = false
+    while (queue.length) {
+      const event = queue.shift()!
+      const next = applyChatStreamEvent(event, ctx, session)
+      session.assistantMsgIndex = next.assistantMsgIndex
+      session.currentTextSegmentId = next.currentTextSegmentId
+    }
+  }
+
+  const schedule = () => {
+    if (scheduled) return
+    scheduled = true
+    if (typeof window !== 'undefined' && window.requestAnimationFrame) {
+      window.requestAnimationFrame(flush)
+    } else {
+      globalThis.setTimeout(flush, 50)
+    }
+  }
+
+  const handle = (event: StreamEvent) => {
+    queue.push(event)
+    if (BATCHABLE_EVENT_TYPES.has(event.type)) {
+      schedule()
+      return
+    }
+    flush()
+  }
+
+  return { handle, flush }
 }

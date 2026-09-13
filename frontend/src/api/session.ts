@@ -28,6 +28,9 @@ export interface ChatMessage {
   tool_calls?: ToolCall[]
   tool_call_id?: string
   timestamp?: number
+  tool_result_ref?: string | null
+  tool_result_preview?: string | null
+  tool_result_truncated?: boolean
 }
 
 export interface SessionHistory {
@@ -37,6 +40,23 @@ export interface SessionHistory {
   api_usage?: ApiUsage | null
   session_token_stats?: SessionTokenStats | null
   todos?: Array<{ id: string; content: string; status: string }> | null
+}
+
+export interface SessionHistoryPage extends SessionHistory {
+  session: Session
+  limit: number
+  before?: string | null
+  has_more: boolean
+  next_cursor?: string | null
+  projection_updated_at?: number | null
+}
+
+export interface ToolResultPayload {
+  session_id: string
+  tool_call_id: string
+  content?: string | null
+  available: boolean
+  error?: string | null
 }
 
 export const sessionApi = {
@@ -64,5 +84,16 @@ export const sessionApi = {
   },
   getHistory: async (id: string) => {
     return api.get<SessionHistory>(`/session/${id}/history`)
+  },
+  getHistoryPage: async (id: string, params?: { limit?: number; before?: string | null }) => {
+    return api.get<SessionHistoryPage>(`/session/${id}/history`, {
+      params: {
+        limit: params?.limit ?? 30,
+        before: params?.before ?? undefined,
+      },
+    })
+  },
+  getToolResult: async (id: string, toolCallId: string) => {
+    return api.get<ToolResultPayload>(`/session/${id}/tool-result/${encodeURIComponent(toolCallId)}`)
   },
 }

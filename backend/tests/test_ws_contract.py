@@ -47,3 +47,25 @@ def test_agent_event_to_ws():
     sse = to_sse(event)
     assert "event: chunk" in sse
     assert "hello" in sse
+    assert '"run_id": "r1"' in sse
+
+
+def test_stream_event_payload_accepts_lifecycle_and_terminal_fields():
+    from app.schemas.chat import StreamEventPayload
+
+    payload = StreamEventPayload(
+        type="stage",
+        run_id="run-1",
+        session_id="sess-1",
+        stage="context_prepare",
+        status="started",
+        elapsed_ms=12.3,
+        tool_call_id="call-1",
+        todos=[{"id": "t1", "content": "todo", "status": "pending"}],
+        partial=True,
+        cancelled=True,
+    )
+
+    assert payload.run_id == "run-1"
+    assert payload.stage == "context_prepare"
+    assert payload.todos and payload.todos[0]["id"] == "t1"

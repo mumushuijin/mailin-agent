@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -98,6 +99,9 @@ def _resolve_hot_tools(hot_raw: Any) -> tuple[str, ...]:
     return hot_tools
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+CATALOG_CACHE_TTL_SECONDS = 30.0
+_catalog_cache: dict[tuple, tuple[float, list["CatalogEntry"]]] = {}
+_catalog_build_counts: dict[tuple, int] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +246,43 @@ def build_catalog(cards: list[ToolCard]) -> list[CatalogEntry]:
         CatalogEntry(card=card, _tokens=_tokenize(_entry_search_text(card)))
         for card in cards
     ]
+
+
+def _catalog_key(cards: list[ToolCard], config: ToolSearchConfig) -> tuple:
+    return (
+        tuple(sorted(config.hot_tools)),
+        config.search_default_limit,
+        config.max_search_limit,
+        config.mcp_as_hot,
+        tuple(
+            (card.name, card.package, card.version, card.summary, card.description)
+            for card in cards
+        ),
+    )
+
+
+def clear_tool_search_runtime_cache() -> None:
+    _catalog_cache.clear()
+    _catalog_build_counts.clear()
+
+
+def tool_search_cache_stats() -> dict[str, int]:
+    return {
+        "catalog_entries": len(_catalog_cache),
+        "catalog_builds": sum(_catalog_build_counts.values()),
+    }
+
+
+def _cached_catalog(cards: list[ToolCard], config: ToolSearchConfig) -> list[CatalogEntry]:
+    key = _catalog_key(cards, config)
+    now = time.monotonic()
+    cached = _catalog_cache.get(key)
+    if cached and now - cached[0] <= CATALOG_CACHE_TTL_SECONDS:
+        return cached[1]
+    catalog = build_catalog(cards)
+    _catalog_cache[key] = (now, catalog)
+    _catalog_build_counts[key] = _catalog_build_counts.get(key, 0) + 1
+    return catalog
 
 
 def search_catalog(
@@ -568,7 +609,7 @@ def dispatch_tool_search(
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
     _, deferred = classify_cards(cards, config)
-    catalog = build_catalog(deferred)
+    catalog = _cached_catalog(deferred, config)
     hits = search_catalog(catalog, query, limit=limit)
     return json.dumps(
         {

@@ -44,6 +44,9 @@ class ChatMessage(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     timestamp: int | None = None
+    tool_result_ref: str | None = None
+    tool_result_preview: str | None = None
+    tool_result_truncated: bool = False
 
 
 class SessionHistory(BaseModel):
@@ -53,3 +56,20 @@ class SessionHistory(BaseModel):
     api_usage: dict | None = None
     session_token_stats: dict | None = None
     todos: list[dict] | None = None
+
+
+class SessionHistoryPage(SessionHistory):
+    session: Session
+    limit: int
+    before: str | None = None
+    has_more: bool = False
+    next_cursor: str | None = None
+    projection_updated_at: int | None = None
+
+
+class ToolResultPayload(BaseModel):
+    session_id: str
+    tool_call_id: str
+    content: str | None = None
+    available: bool = True
+    error: str | None = None

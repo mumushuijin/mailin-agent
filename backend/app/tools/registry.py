@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from app.tools.packages import BUILTIN_PACKAGES
 from app.tools.mcp.package import PACKAGE as MCP_PACKAGE
 
 ALL_PACKAGES: list[ToolPackage] = [*BUILTIN_PACKAGES, MCP_PACKAGE]
+REGISTRY_CACHE_TTL_SECONDS = 30.0
 
 
 def _tool_switch_enabled(value, *, default: bool = True) -> bool:
@@ -42,6 +44,9 @@ class ToolRegistry:
     def __init__(self, config: dict | None = None, packages: list[ToolPackage] | None = None):
         self.config = config if config is not None else load_full_config()
         self.packages = packages if packages is not None else ALL_PACKAGES
+        self._cards_cache: list[ToolCard] | None = None
+        self._cards_cache_at = 0.0
+        self.resolve_cards_builds = 0
 
     def is_package_enabled(self, package: ToolPackage) -> bool:
         tools_cfg = self.config.get("tools", {})
@@ -54,8 +59,16 @@ class ToolRegistry:
             return package.info.default_enabled
         return _tool_switch_enabled(value)
 
-    def resolve_cards(self) -> list[ToolCard]:
+    def resolve_cards(self, *, force_refresh: bool = False) -> list[ToolCard]:
         from app.tools.mcp.lifecycle import ensure_mcp_connected
+
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._cards_cache is not None
+            and now - self._cards_cache_at <= REGISTRY_CACHE_TTL_SECONDS
+        ):
+            return list(self._cards_cache)
 
         # 不阻塞主线程；MCP 未连接时仍返回内置工具，连接在后台或工具调用时重试
         ensure_mcp_connected(blocking=False)
@@ -63,7 +76,10 @@ class ToolRegistry:
         for package in self.packages:
             if self.is_package_enabled(package):
                 cards.extend(package.build_cards(self.config))
-        return enrich_card_parameters(cards)
+        self._cards_cache = enrich_card_parameters(cards)
+        self._cards_cache_at = now
+        self.resolve_cards_builds += 1
+        return list(self._cards_cache)
 
     def get_langchain_tools(self) -> list[BaseTool]:
         return assemble_bind_tools(self.resolve_cards()).tools
@@ -118,3 +134,9 @@ def get_tools() -> list[BaseTool]:
 def clear_tools_cache() -> None:
     get_registry.cache_clear()
     get_tools.cache_clear()
+    try:
+        from app.tools.tool_search import clear_tool_search_runtime_cache
+
+        clear_tool_search_runtime_cache()
+    except Exception:
+        pass

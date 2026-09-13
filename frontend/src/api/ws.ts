@@ -15,6 +15,8 @@ type BackgroundHandler = (data: {
   detail?: Record<string, unknown>
 }) => void
 type ConfigUpdatedHandler = (data: { name: string }) => void
+export type WsConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
+type ConnectionHandler = (state: WsConnectionState) => void
 
 function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>; run_id?: string }): StreamEvent | null {
   const data = msg.data || {}
@@ -28,11 +30,42 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
     case 'chunk':
       return { type: 'chunk', content: data.content as string, ...base }
     case 'tool_start':
-      return { type: 'tool_start', tool: data.tool as string, args: data.args as Record<string, unknown>, ...base }
+      return {
+        type: 'tool_start',
+        tool: data.tool as string,
+        args: data.args as Record<string, unknown>,
+        tool_call_id: data.tool_call_id as string,
+        ...base,
+      }
     case 'tool_finish':
-      return { type: 'tool_finish', tool: data.tool as string, result: data.result as string, ...base }
+      return {
+        type: 'tool_finish',
+        tool: data.tool as string,
+        result: data.result as string,
+        tool_call_id: data.tool_call_id as string,
+        ...base,
+      }
+    case 'tool_progress':
+      return {
+        type: 'tool_progress',
+        tool: data.tool as string,
+        status: data.status as string,
+        result: (data.message || data.result) as string,
+        message: (data.message || data.chunk) as string,
+        ...base,
+      }
     case 'step_finish':
       return { type: 'step_finish', step: data.step as number, ...base }
+    case 'stage':
+      return {
+        type: 'stage',
+        stage: data.stage as string,
+        status: data.status as string,
+        elapsed_ms: data.elapsed_ms as number,
+        duration_ms: data.duration_ms as number,
+        error: data.error as string,
+        ...base,
+      }
     case 'context_usage':
       return { type: 'context_usage', context_usage: data as unknown as StreamEvent['context_usage'], ...base }
     case 'api_usage':
@@ -42,9 +75,16 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
     case 'compression':
       return { type: 'compression', compression: data as StreamEvent['compression'], ...base }
     case 'done':
-      return { type: 'done', content: data.content as string, session_id: data.session_id as string, ...base }
+      return {
+        type: 'done',
+        content: data.content as string,
+        session_id: data.session_id as string,
+        partial: Boolean(data.partial),
+        cancelled: Boolean(data.cancelled),
+        ...base,
+      }
     case 'error':
-      return { type: 'error', error: data.error as string, ...base }
+      return { type: 'error', error: data.error as string, cancelled: Boolean(data.cancelled), ...base }
     case 'interrupt':
       return {
         type: 'interrupt',
@@ -95,6 +135,8 @@ class ChatWebSocket {
   private runCallbacks = new Map<string, StreamCallback>()
   private backgroundHandlers = new Set<BackgroundHandler>()
   private configHandlers = new Set<ConfigUpdatedHandler>()
+  private connectionHandlers = new Set<ConnectionHandler>()
+  private state: WsConnectionState = 'idle'
 
   get isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN
@@ -110,16 +152,30 @@ class ChatWebSocket {
     return () => this.configHandlers.delete(handler)
   }
 
+  onConnectionState(handler: ConnectionHandler): () => void {
+    this.connectionHandlers.add(handler)
+    handler(this.state)
+    return () => this.connectionHandlers.delete(handler)
+  }
+
+  private setState(state: WsConnectionState) {
+    if (this.state === state) return
+    this.state = state
+    for (const h of this.connectionHandlers) h(state)
+  }
+
   async connect(): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return
     if (this.connectPromise) return this.connectPromise
 
     this.intentionalClose = false
+    this.setState(this.reconnectAttempt > 0 ? 'reconnecting' : 'connecting')
     this.connectPromise = new Promise<void>((resolve, reject) => {
       try {
         this.ws = new WebSocket(WS_URL)
       } catch (e) {
         this.connectPromise = null
+        this.setState('disconnected')
         reject(e)
         return
       }
@@ -128,12 +184,14 @@ class ChatWebSocket {
         this.reconnectAttempt = 0
         this.startHeartbeat()
         this.connectPromise = null
+        this.setState('connected')
         resolve()
       }
 
       this.ws.onerror = () => {
         if (this.connectPromise) {
           this.connectPromise = null
+          this.setState('disconnected')
           reject(new Error('WebSocket 连接失败'))
         }
       }
@@ -142,7 +200,10 @@ class ChatWebSocket {
         this.stopHeartbeat()
         this.connectPromise = null
         if (!this.intentionalClose) {
+          this.setState('reconnecting')
           this.scheduleReconnect()
+        } else {
+          this.setState('disconnected')
         }
       }
 
@@ -280,6 +341,7 @@ class ChatWebSocket {
     this.stopHeartbeat()
     this.ws?.close()
     this.ws = null
+    this.setState('disconnected')
   }
 }
 

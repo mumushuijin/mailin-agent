@@ -3,7 +3,7 @@ import { ref, watch, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { Input, Button, message, Tag } from 'ant-design-vue'
 import { SendOutlined, PlusOutlined, LoadingOutlined, FolderOpenOutlined } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
-import { sessionApi } from '@/api/session'
+import { sessionApi, type ChatMessage as ApiChatMessage, type Session } from '@/api/session'
 import { chatApi, type ApiUsage, type ContextUsage } from '@/api/chat'
 import { chatWs } from '@/api/ws'
 import { configApi } from '@/api/config'
@@ -13,10 +13,10 @@ import MailinLogo from '@/components/MailinLogo.vue'
 import ToolApprovalModal from '@/components/ToolApprovalModal.vue'
 import AskUserModal from '@/components/AskUserModal.vue'
 import ContextUsageRing from '@/components/ContextUsageRing.vue'
-import { applyChatStreamEvent } from '@/composables/useChatStream'
+import { createChatStreamEventBatcher } from '@/composables/useChatStream'
 import { getLastWorkspacePath, openDirectory, pickDirectory, saveLastWorkspacePath } from '@/composables/useWorkspaceFolder'
 import { getLastSessionId, saveLastSessionId, useProjectNavigator } from '@/composables/useProjectNavigator'
-import type { ChatUiMessage, MessageSegment, PendingApproval, PendingAskUser, SessionTodoItem } from '@/types/chat-ui'
+import type { ChatUiMessage, MessageSegment, PendingApproval, PendingAskUser, SessionTodoItem, ToolSegment } from '@/types/chat-ui'
 
 const { refreshSessions, setCurrentSession, currentProjectPath } = useProjectNavigator()
 
@@ -43,6 +43,11 @@ const expandedTools = ref<Set<number>>(new Set())
 const contextUsage = ref<ContextUsage | null>(null)
 const apiUsage = ref<ApiUsage | null>(null)
 const contextCompressing = ref(false)
+const activeStage = ref<string | null>(null)
+const activeRunId = ref<string | null>(null)
+const historyNextCursor = ref<string | null>(null)
+const hasMoreHistory = ref(false)
+const wsConnectionState = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('idle')
 
 // 工具审批（WebSocket interrupt）
 const pendingApproval = ref<PendingApproval | null>(null)
@@ -53,6 +58,7 @@ const folderDraft = ref(getLastWorkspacePath())
 const bindingFolder = ref(false)
 
 let unsubConfig: (() => void) | null = null
+let unsubConnection: (() => void) | null = null
 
 // 窗口化渲染：初始只渲染最近 RENDER_WINDOW 条消息，向上滚动时分批补载，
 // 避免一次性把全部历史塞进 DOM 导致打开会话卡顿。
@@ -69,7 +75,7 @@ const visibleMessages = computed(() => {
 })
 
 // 是否还有更早的消息未渲染
-const hasMoreToRender = computed(() => messages.value.length > renderLimit.value)
+const hasMoreToRender = computed(() => messages.value.length > renderLimit.value || hasMoreHistory.value)
 
 // 消息分组（Slack 风格）
 const messageGroups = computed<MessageGroup[]>(() => {
@@ -158,7 +164,19 @@ const shouldShowGroupThinking = (group: MessageGroup, groupIndex: number) => {
 }
 
 const thinkingLabel = computed(() => {
+  if (historyLoading.value) return '加载历史中…'
+  if (wsConnectionState.value === 'connecting') return '连接中…'
+  if (wsConnectionState.value === 'reconnecting') return '重连中…'
   if (contextCompressing.value) return '整理上下文中…'
+  if (activeStage.value === 'history_load') return '加载历史中…'
+  if (activeStage.value === 'connecting') return '连接中…'
+  if (activeStage.value === 'accepted') return '已接收，准备中…'
+  if (activeStage.value === 'context_prepare') return '准备上下文中…'
+  if (activeStage.value === 'model_stream') return '思考中…'
+  if (activeStage.value === 'tool_batch') return '运行工具中…'
+  if (activeStage.value === 'usage_snapshot') return '更新用量中…'
+  if (activeStage.value === 'waiting_user') return '等待确认中…'
+  if (activeStage.value === 'postprocess') return '收尾处理中…'
   const groups = messageGroups.value
   const lastGroup = groups[groups.length - 1]
   if (lastGroup && hasGroupToolWithoutText(lastGroup)) {
@@ -203,60 +221,105 @@ const resolveMessageTimestamp = (
 
 let historyLoadSeq = 0
 
-// 加载会话历史（按照 OpenAI 标准格式解析）
-const loadSessionHistory = async (sessionId: string) => {
-  const seq = ++historyLoadSeq
-  historyLoading.value = true
-  messages.value = []
-  contextUsage.value = null
-  apiUsage.value = null
-  contextCompressing.value = false
-  renderLimit.value = RENDER_WINDOW
+interface ToolResultDisplay {
+  content?: string
+  ref?: string | null
+  preview?: string | null
+  truncated?: boolean
+}
+
+const safeJsonArgs = (raw: string): Record<string, unknown> => {
   try {
-    const [historyRes, sessionRes] = await Promise.all([
-      sessionApi.getHistory(sessionId),
-      sessionApi.get(sessionId),
-    ])
-    const rawMessages = historyRes.messages
-    sessionTodos.value = (historyRes.todos || []) as SessionTodoItem[]
-    const sessionCreatedAt = sessionRes.created_at
-    const sessionUpdatedAt = sessionRes.updated_at
-    boundWorkspacePath.value = sessionRes.workspace_path || null
-    if (sessionRes.workspace_path) {
-      folderDraft.value = sessionRes.workspace_path
-      saveLastWorkspacePath(sessionRes.workspace_path)
+    const parsed = JSON.parse(raw || '{}')
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
+
+const applySessionMetadata = (sessionRes: Session) => {
+  boundWorkspacePath.value = sessionRes.workspace_path || null
+  if (sessionRes.workspace_path) {
+    folderDraft.value = sessionRes.workspace_path
+    saveLastWorkspacePath(sessionRes.workspace_path)
+  }
+  setCurrentSession(sessionRes)
+}
+
+const buildDisplayMessages = (
+  rawMessages: ApiChatMessage[],
+  sessionCreatedAt: number,
+  sessionUpdatedAt: number,
+): Message[] => {
+  const now = Date.now()
+  const toolResults: Map<string, ToolResultDisplay> = new Map()
+
+  for (const msg of rawMessages) {
+    if (msg.role === 'tool' && msg.tool_call_id) {
+      toolResults.set(msg.tool_call_id, {
+        content: msg.content,
+        ref: msg.tool_result_ref,
+        preview: msg.tool_result_preview,
+        truncated: Boolean(msg.tool_result_truncated),
+      })
     }
-    if (seq !== historyLoadSeq) return
-    setCurrentSession(sessionRes)
+  }
 
-    // 用于存储工具调用结果（tool_call_id -> result）
-    const toolResults: Map<string, string> = new Map()
+  const displayMessages: Message[] = []
+  let pendingAssistant: Message | null = null
 
-    // 第一遍：收集所有 tool 消息的结果
-    for (const msg of rawMessages) {
-      if (msg.role === 'tool' && msg.tool_call_id && msg.content) {
-        toolResults.set(msg.tool_call_id, msg.content)
+  for (let i = 0; i < rawMessages.length; i++) {
+    const msg = rawMessages[i]!
+
+    if (msg.role === 'user') {
+      if (pendingAssistant) {
+        displayMessages.push(pendingAssistant)
+        pendingAssistant = null
       }
-    }
+      displayMessages.push({
+        id: now + i,
+        role: 'user',
+        content: msg.content || '',
+        timestamp: resolveMessageTimestamp(
+          msg.timestamp,
+          i,
+          rawMessages.length,
+          sessionCreatedAt,
+          sessionUpdatedAt,
+        ),
+      })
+    } else if (msg.role === 'assistant') {
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        const segments: MessageSegment[] = []
 
-    // 第二遍：构建显示消息
-    const displayMessages: Message[] = []
-    let pendingAssistant: Message | null = null
+        msg.tool_calls.forEach((tc, tcIndex) => {
+          const result = toolResults.get(tc.id)
+          segments.push({
+            type: 'tool',
+            id: now + i * 1000 + tcIndex,
+            tool: tc.function.name,
+            args: safeJsonArgs(tc.function.arguments),
+            result: result?.content,
+            toolResultRef: result?.ref,
+            toolResultTruncated: result?.truncated,
+            status: result?.content && toolResultLooksLikeError(result.content) ? 'error' : 'done',
+          })
+        })
 
-    for (let i = 0; i < rawMessages.length; i++) {
-      const msg = rawMessages[i]!
-
-      if (msg.role === 'user') {
-        // 如果有待处理的 assistant 消息，先添加
-        if (pendingAssistant) {
-          displayMessages.push(pendingAssistant)
-          pendingAssistant = null
+        const nextMsg = rawMessages[i + 1]
+        if (nextMsg && nextMsg.role === 'assistant' && !nextMsg.tool_calls && nextMsg.content) {
+          segments.push({
+            type: 'text',
+            id: now + i * 1000 + 100,
+            content: nextMsg.content
+          })
+          i++
         }
-        // 添加 user 消息
-        displayMessages.push({
-          id: Date.now() + i,
-          role: 'user',
-          content: msg.content || '',
+
+        pendingAssistant = {
+          id: now + i,
+          role: 'assistant',
+          content: '',
           timestamp: resolveMessageTimestamp(
             msg.timestamp,
             i,
@@ -264,42 +327,21 @@ const loadSessionHistory = async (sessionId: string) => {
             sessionCreatedAt,
             sessionUpdatedAt,
           ),
-        })
-      }
-      else if (msg.role === 'assistant') {
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          // 包含工具调用的 assistant 消息
-          const segments: MessageSegment[] = []
-
-          // 添加工具调用段
-          msg.tool_calls.forEach((tc, tcIndex) => {
-            const result = toolResults.get(tc.id)
-            segments.push({
-              type: 'tool',
-              id: Date.now() + i * 1000 + tcIndex,
-              tool: tc.function.name,
-              args: JSON.parse(tc.function.arguments || '{}'),
-              result: result,
-              status: result && toolResultLooksLikeError(result) ? 'error' : 'done'
-            })
+          segments
+        }
+      } else if (msg.content) {
+        if (pendingAssistant) {
+          if (!pendingAssistant.segments) pendingAssistant.segments = []
+          pendingAssistant.segments.push({
+            type: 'text',
+            id: now + i,
+            content: msg.content
           })
-
-          // 检查下一个消息是否是最终的 assistant 回答（没有 tool_calls）
-          const nextMsg = rawMessages[i + 1]
-          if (nextMsg && nextMsg.role === 'assistant' && !nextMsg.tool_calls && nextMsg.content) {
-            // 有最终回答，添加文本段
-            segments.push({
-              type: 'text',
-              id: Date.now() + i * 1000 + 100,
-              content: nextMsg.content
-            })
-            i++ // 跳过下一个消息
-          }
-
-          pendingAssistant = {
-            id: Date.now() + i,
+        } else {
+          displayMessages.push({
+            id: now + i,
             role: 'assistant',
-            content: '',
+            content: msg.content,
             timestamp: resolveMessageTimestamp(
               msg.timestamp,
               i,
@@ -307,47 +349,41 @@ const loadSessionHistory = async (sessionId: string) => {
               sessionCreatedAt,
               sessionUpdatedAt,
             ),
-            segments
-          }
-        } else if (msg.content) {
-          // 普通的 assistant 文本消息
-          if (pendingAssistant) {
-            // 追加到待处理的 assistant 消息
-            if (!pendingAssistant.segments) {
-              pendingAssistant.segments = []
-            }
-            pendingAssistant.segments.push({
-              type: 'text',
-              id: Date.now() + i,
-              content: msg.content
-            })
-          } else {
-            // 新的 assistant 消息
-            displayMessages.push({
-              id: Date.now() + i,
-              role: 'assistant',
-              content: msg.content,
-              timestamp: resolveMessageTimestamp(
-                msg.timestamp,
-                i,
-                rawMessages.length,
-                sessionCreatedAt,
-                sessionUpdatedAt,
-              ),
-            })
-          }
+          })
         }
       }
-      // tool 消息在第一遍已经处理，跳过
     }
+  }
 
-    // 添加最后的待处理消息
-    if (pendingAssistant) {
-      displayMessages.push(pendingAssistant)
-    }
+  if (pendingAssistant) displayMessages.push(pendingAssistant)
+  return displayMessages
+}
 
+// 加载最近一页会话历史（按照 OpenAI 标准格式解析）
+const loadSessionHistory = async (sessionId: string) => {
+  const seq = ++historyLoadSeq
+  historyLoading.value = true
+  messages.value = []
+  contextUsage.value = null
+  apiUsage.value = null
+  contextCompressing.value = false
+  activeStage.value = 'history_load'
+  activeRunId.value = null
+  historyNextCursor.value = null
+  hasMoreHistory.value = false
+  renderLimit.value = RENDER_WINDOW
+  try {
+    const historyRes = await sessionApi.getHistoryPage(sessionId, { limit: RENDER_WINDOW })
+    const sessionRes = historyRes.session
+    const rawMessages = historyRes.messages
+    sessionTodos.value = (historyRes.todos || []) as SessionTodoItem[]
+    const sessionCreatedAt = sessionRes.created_at
+    const sessionUpdatedAt = sessionRes.updated_at
     if (seq !== historyLoadSeq) return
-    messages.value = displayMessages
+    applySessionMetadata(sessionRes)
+    messages.value = buildDisplayMessages(rawMessages, sessionCreatedAt, sessionUpdatedAt)
+    historyNextCursor.value = historyRes.next_cursor || null
+    hasMoreHistory.value = historyRes.has_more
     if (historyRes.context_usage) {
       contextUsage.value = historyRes.context_usage
     }
@@ -363,6 +399,7 @@ const loadSessionHistory = async (sessionId: string) => {
   } finally {
     if (seq === historyLoadSeq) {
       historyLoading.value = false
+      activeStage.value = null
     }
   }
 }
@@ -388,7 +425,7 @@ const initSession = async () => {
     saveCurrentSession(urlSession)
     await loadSessionHistory(urlSession)
     initializing.value = false
-    await scrollToBottom(true)
+    await scrollToBottom(true, true)
   } else {
     // URL 中没有 session 参数，尝试从 localStorage 读取
     const lastSession = getLastSession()
@@ -400,7 +437,7 @@ const initSession = async () => {
       // 使用 replace 更新 URL（不触发导航）
       window.history.replaceState({}, '', `/?session=${lastSession}`)
       initializing.value = false
-      await scrollToBottom(true)
+      await scrollToBottom(true, true)
     } else {
       boundWorkspacePath.value = null
       setCurrentSession(null)
@@ -434,6 +471,8 @@ watch(
       loading.value = false
       pendingApproval.value = null
       pendingAskUser.value = null
+      activeStage.value = null
+      activeRunId.value = null
     }
     currentSessionId.value = sessionId
     saveCurrentSession(sessionId)
@@ -441,7 +480,7 @@ watch(
     messages.value = []
     historyLoading.value = true
     await loadSessionHistory(sessionId)
-    await scrollToBottom(true)
+    await scrollToBottom(true, true)
   }
 )
 
@@ -470,6 +509,9 @@ watch(
 
 // 组件挂载时初始化会话
 onMounted(async () => {
+  unsubConnection = chatWs.onConnectionState((state) => {
+    wsConnectionState.value = state
+  })
   chatWs.connect().catch(() => {})
   unsubConfig = chatWs.onConfigUpdated(() => {
     configApi.getAgentInfo().then(agentInfo => {
@@ -481,16 +523,25 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unsubConfig?.()
+  unsubConnection?.()
 })
 
 watch(currentSessionId, (sid) => {
   if (sid) chatWs.subscribeSession(sid)
 }, { immediate: true })
 
-// 滚动到底部（打开历史时用 instant，确保先看到最新消息）
-const scrollToBottom = async (instant = false) => {
+const isNearBottom = (threshold = 120): boolean => {
+  const el = messagesContainer.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold
+}
+
+// 滚动到底部（打开历史/发送时可强制，流式输出默认尊重用户阅读位置）
+const scrollToBottom = async (instant = false, force = false) => {
+  const shouldScroll = force || isNearBottom()
   await nextTick()
   await nextTick()
+  if (!shouldScroll) return
 
   const doScroll = () => {
     const el = messagesContainer.value
@@ -502,24 +553,46 @@ const scrollToBottom = async (instant = false) => {
   }
 
   doScroll()
-  requestAnimationFrame(() => {
+  const raf = typeof window !== 'undefined' && window.requestAnimationFrame
+    ? window.requestAnimationFrame
+    : (cb: FrameRequestCallback) => globalThis.setTimeout(cb, 16)
+  raf(() => {
     doScroll()
-    requestAnimationFrame(doScroll)
+    raf(doScroll)
   })
 }
 
-// 加载更早的消息（扩大渲染窗口），并维持当前滚动位置
+// 加载更早的消息（优先请求后端上一页），并维持当前滚动位置
 const loadMoreMessages = async () => {
   const el = messagesContainer.value
   if (!el || loadingMore.value || !hasMoreToRender.value) return
   loadingMore.value = true
   const prevHeight = el.scrollHeight
   const prevTop = el.scrollTop
-  renderLimit.value = Math.min(messages.value.length, renderLimit.value + RENDER_BATCH)
-  await nextTick()
-  // 补偿顶部新增内容的高度，避免视口跳动
-  el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
-  loadingMore.value = false
+  try {
+    if (hasMoreHistory.value && historyNextCursor.value && currentSessionId.value) {
+      const page = await sessionApi.getHistoryPage(currentSessionId.value, {
+        limit: RENDER_BATCH,
+        before: historyNextCursor.value,
+      })
+      const older = buildDisplayMessages(
+        page.messages,
+        page.session.created_at,
+        page.session.updated_at,
+      )
+      messages.value = [...older, ...messages.value]
+      renderLimit.value = Math.min(messages.value.length, renderLimit.value + older.length)
+      historyNextCursor.value = page.next_cursor || null
+      hasMoreHistory.value = page.has_more
+    } else {
+      renderLimit.value = Math.min(messages.value.length, renderLimit.value + RENDER_BATCH)
+    }
+    await nextTick()
+    // 补偿顶部新增内容的高度，避免视口跳动
+    el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
+  } finally {
+    loadingMore.value = false
+  }
 }
 
 // 滚动到顶部附近时自动补载更早的消息
@@ -531,12 +604,53 @@ const handleScroll = () => {
   }
 }
 
+const findToolSegment = (toolId: number): { msgIndex: number; segment: ToolSegment; segments: MessageSegment[] } | null => {
+  for (let msgIndex = 0; msgIndex < messages.value.length; msgIndex++) {
+    const segments = messages.value[msgIndex]?.segments
+    if (!segments) continue
+    const segment = segments.find((item): item is ToolSegment => item.type === 'tool' && item.id === toolId)
+    if (segment) return { msgIndex, segment, segments }
+  }
+  return null
+}
+
+const loadFullToolResult = async (toolId: number) => {
+  const found = findToolSegment(toolId)
+  if (!found || !currentSessionId.value) return
+  const { msgIndex, segment, segments } = found
+  if (!segment.toolResultTruncated || !segment.toolResultRef || segment.fullResultLoading) return
+
+  segment.fullResultLoading = true
+  updateMessageSegments(msgIndex, segments)
+  try {
+    const payload = await sessionApi.getToolResult(currentSessionId.value, segment.toolResultRef)
+    if (payload.available && payload.content != null) {
+      segment.result = payload.content
+      segment.toolResultTruncated = false
+      segment.status = toolResultLooksLikeError(payload.content) ? 'error' : 'done'
+    } else {
+      segment.result = payload.error || '工具结果不可用'
+      segment.status = 'error'
+    }
+  } catch (error) {
+    segment.result = error instanceof Error ? error.message : '工具结果加载失败'
+    segment.status = 'error'
+  } finally {
+    segment.fullResultLoading = false
+    updateMessageSegments(msgIndex, segments)
+  }
+}
+
 // 切换工具折叠状态
 const toggleToolCollapse = (toolId: number) => {
   const next = new Set(expandedTools.value)
-  if (next.has(toolId)) next.delete(toolId)
-  else next.add(toolId)
+  const willExpand = !next.has(toolId)
+  if (willExpand) next.add(toolId)
+  else next.delete(toolId)
   expandedTools.value = next
+  if (willExpand) {
+    loadFullToolResult(toolId)
+  }
 }
 
 // 检查工具是否展开（默认折叠，只有点击后才展开）
@@ -604,6 +718,7 @@ const finalizeLastAssistantTools = (cancelled = false) => {
     }
   }
   contextCompressing.value = false
+  activeStage.value = null
 }
 
 // 停止生成
@@ -617,6 +732,8 @@ const stopGeneration = () => {
   loading.value = false
   pendingApproval.value = null
   pendingAskUser.value = null
+  activeStage.value = null
+  activeRunId.value = null
 }
 
 const handleApproval = (decision: 'allow' | 'deny') => {
@@ -664,14 +781,13 @@ const sendMessage = async () => {
   inputMessage.value = ''
   loading.value = true
   contextCompressing.value = false
+  activeStage.value = chatWs.isConnected ? 'thinking' : 'connecting'
+  activeRunId.value = null
 
   abortController.value = new AbortController()
 
-  let assistantMsgIndex = -1
-  const currentSegments: MessageSegment[] = []
-  let currentTextSegmentId = -1
-
-  await scrollToBottom()
+  const startedSessionId = currentSessionId.value
+  await scrollToBottom(false, true)
 
   const streamCtx = {
     messages,
@@ -679,6 +795,7 @@ const sendMessage = async () => {
     contextUsage,
     apiUsage,
     contextCompressing,
+    activeStage,
     pendingApproval,
     pendingAskUser,
     sessionTodos,
@@ -688,24 +805,25 @@ const sendMessage = async () => {
     finalizeRunningToolSegments,
     scrollToBottom: () => { scrollToBottom() },
   }
+  const batcher = createChatStreamEventBatcher(streamCtx)
 
   try {
     await chatApi.sendMessageWs(
       userMessage,
       currentSessionId.value || undefined,
       (event) => {
-        const next = applyChatStreamEvent(event, streamCtx, {
-          assistantMsgIndex,
-          currentSegments,
-          currentTextSegmentId,
-        })
-        assistantMsgIndex = next.assistantMsgIndex
-        currentTextSegmentId = next.currentTextSegmentId
+        if (startedSessionId && currentSessionId.value && currentSessionId.value !== startedSessionId) return
+        if (event.run_id) {
+          if (activeRunId.value && activeRunId.value !== event.run_id) return
+          activeRunId.value = event.run_id
+        }
+        batcher.handle(event)
       },
       abortController.value.signal
     )
 
-    await scrollToBottom()
+    batcher.flush()
+    await scrollToBottom(false, true)
   } catch (error: unknown) {
     if (error instanceof Error && error.name === 'AbortError') {
       console.log('用户取消了请求')
@@ -715,8 +833,11 @@ const sendMessage = async () => {
       messages.value.pop()
     }
   } finally {
+    batcher.flush()
     loading.value = false
     abortController.value = null
+    activeStage.value = null
+    activeRunId.value = null
     refreshSessions().catch(() => {})
   }
 }
@@ -811,7 +932,7 @@ const openWorkspaceFolder = async () => {
       <!-- 初始化加载状态 -->
       <div v-if="initializing || historyLoading" class="empty-state">
         <MailinLogo :size="100" logo-class="empty-icon loading" />
-        <p class="empty-hint">加载中...</p>
+        <p class="empty-hint">{{ thinkingLabel }}</p>
       </div>
       <template v-else-if="messages.length > 0">
         <!-- 加载更早消息入口 -->
@@ -862,6 +983,9 @@ const openWorkspaceFolder = async () => {
                       <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
                         <LoadingOutlined /> 执行中
                       </Tag>
+                      <Tag v-else-if="segment.fullResultLoading" color="processing" class="tool-tag">
+                        <LoadingOutlined /> 载入中
+                      </Tag>
                       <Tag v-else-if="segment.status === 'error' || toolResultLooksLikeError(segment.result)" color="error" class="tool-tag">失败</Tag>
                       <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
                       <span
@@ -884,7 +1008,7 @@ const openWorkspaceFolder = async () => {
                       </div>
                       <!-- 结果 -->
                       <div v-if="segment.result" class="tool-result-wrapper">
-                        <div class="tool-detail-label">结果</div>
+                        <div class="tool-detail-label">{{ segment.toolResultTruncated ? '结果预览' : '结果' }}</div>
                         <pre class="tool-detail-content">{{ formatToolResult(segment.result) }}</pre>
                       </div>
                     </div>
