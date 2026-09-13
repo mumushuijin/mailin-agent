@@ -1,8 +1,0 @@
-# RAGAS 检索评测专用依赖（安装到 eval/.ragas-venv）
-ragas==0.4.3
-datasets>=3.0
-langchain-openai>=0.3,<0.4
-langchain-community==0.3.27
-python-dotenv>=1.0
-pydantic-settings>=2.0
-rapidfuzz>=3.0

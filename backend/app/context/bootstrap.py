@@ -5,8 +5,10 @@ from pathlib import Path
 from app.context.budget import estimate_tokens, load_context_config
 from app.core.settings import get_settings
 from app.storage.workspace import ConfigStore
+from app.tools.runtime import get_project_workspace
 
-BOOTSTRAP_FILES = ("IDENTITY", "USER", "SOUL", "MEMORY", "AGENTS", "HEARTBEAT", "BOOTSTRAP")
+PROFILE_FILES = ("SOUL", "USER", "MEMORY", "HEARTBEAT")
+REMOVED_BOOTSTRAP_FILES = ("IDENTITY", "BOOTSTRAP")
 TRUNCATED_MARKER = "\n\n[TRUNCATED]"
 
 
@@ -16,9 +18,21 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[: max_chars - len(TRUNCATED_MARKER)] + TRUNCATED_MARKER
 
 
-def load_bootstrap(workspace: Path | None = None) -> tuple[str, int]:
-    """从磁盘加载 Bootstrap 文件，应用单文件与总量截断。返回 (content, token_count)。"""
+def _append_section(sections: list[str], content: str, single_max: int, total_max: int) -> int:
+    content = _truncate_text(content, single_max)
+    remaining = total_max - sum(len(s) for s in sections)
+    if remaining <= 0:
+        return 0
+    if len(content) > remaining:
+        content = _truncate_text(content, remaining)
+    sections.append(content)
+    return len(content)
+
+
+def load_bootstrap(workspace: Path | None = None, project_workspace: Path | None = None) -> tuple[str, int]:
+    """从 Agent 自有空间加载人格文件，再追加项目根 AGENTS.md。"""
     workspace = workspace or get_settings().workspace_path
+    project = project_workspace or get_project_workspace()
     defaults = get_settings().workspace_defaults_path
     store = ConfigStore(workspace, defaults)
     config = load_context_config(workspace)
@@ -27,25 +41,27 @@ def load_bootstrap(workspace: Path | None = None) -> tuple[str, int]:
     total_max = bootstrap_cfg.get("total_max_chars", 150_000)
 
     sections: list[str] = []
-    total_chars = 0
 
-    for name in BOOTSTRAP_FILES:
+    for name in PROFILE_FILES:
         try:
             content = store.read(name).strip()
         except Exception:
             continue
         if not content:
             continue
-        content = _truncate_text(content, single_max)
-        remaining = total_max - total_chars
-        if remaining <= 0:
+        _append_section(sections, content, single_max, total_max)
+        if sum(len(s) for s in sections) >= total_max:
             break
-        if len(content) > remaining:
-            content = _truncate_text(content, remaining)
-        sections.append(content)
-        total_chars += len(content)
-        if total_chars >= total_max:
-            break
+
+    if project is not None:
+        agents_path = Path(project) / "AGENTS.md"
+        try:
+            if agents_path.is_file():
+                agents = agents_path.read_text(encoding="utf-8").strip()
+                if agents:
+                    _append_section(sections, agents, single_max, total_max)
+        except OSError:
+            pass
 
     if not sections:
         default = (

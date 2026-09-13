@@ -26,21 +26,29 @@
       "extra_env": {}
     },
     "memory": true,
+    "session": true,
+    "skills": true,
     "calculator": true,
     "datetime": true,
     "web_search": false,
+    "session": true,
     "mcp": true,
     "tool_search": {
       "enabled": true,
       "hot_tools": [
         "read_file",
+        "write_file",
+        "replace_in_file",
+        "glob_search",
+        "search_files",
         "list_directory",
         "run_shell",
-        "memory_grep",
-        "memory_add",
-        "memory_consolidate",
-        "python_calculator",
-        "get_current_time"
+        "process",
+        "skill_list",
+        "skill_match",
+        "skill_read",
+        "todo",
+        "ask_user"
       ],
       "search_default_limit": 5,
       "max_search_limit": 20,
@@ -48,6 +56,16 @@
     }
   },
   "middleware": {},
+  "skills": {
+    "global_roots": [
+      "skills"
+    ],
+    "project_enabled": true,
+    "catalog_max_items": 80,
+    "catalog_max_chars": 12000,
+    "cache_ttl_seconds": 5,
+    "disabled": []
+  },
   "telemetry": {
     "langsmith_enabled": false,
     "sample_rate": 0.01

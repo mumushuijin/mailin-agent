@@ -1,8 +1,17 @@
+from pathlib import Path
+
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.context.budget import estimate_tokens
 from app.context.compressor import apply_layer_a_tail_tool_summary, apply_layer_b_old_tool_oneline
 from app.context.ledger import split_tail_window
+from app.tools.runtime import set_tool_project
+
+
+@pytest.fixture(autouse=True)
+def _bind_project(tmp_path: Path):
+    set_tool_project(tmp_path)
 
 
 def test_split_tail_window_respects_token_budget():

@@ -48,10 +48,20 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
     case 'interrupt':
       return {
         type: 'interrupt',
+        kind: (data.kind as string) || 'approval',
         tool: data.tool as string,
         args: data.args as Record<string, unknown>,
         reason: data.reason as string,
         tool_call_id: data.tool_call_id as string,
+        prompt: data.prompt as string | undefined,
+        options: Array.isArray(data.options) ? (data.options as string[]) : [],
+        allow_multiple: Boolean(data.allow_multiple),
+        ...base,
+      }
+    case 'todo':
+      return {
+        type: 'todo',
+        todos: Array.isArray(data.todos) ? (data.todos as StreamEvent['todos']) : [],
         ...base,
       }
     case 'background':
@@ -259,6 +269,10 @@ class ChatWebSocket {
 
   approve(runId: string, decision: 'allow' | 'deny') {
     this.send({ op: 'approve', run_id: runId, decision })
+  }
+
+  answerAskUser(runId: string, answer: string | string[]) {
+    this.send({ op: 'approve', run_id: runId, kind: 'ask_user', answer })
   }
 
   disconnect() {

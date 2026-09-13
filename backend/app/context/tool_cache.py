@@ -9,20 +9,24 @@ from langchain_core.messages import BaseMessage, ToolMessage
 from app.context.budget import estimate_tokens, load_context_config, message_content_text
 from app.context.ledger import is_current_user_turn
 from app.core.settings import get_settings
+from app.storage.workspace import project_tool_results_dir
+from app.tools.runtime import get_project_workspace
 
 CACHED_PREFIX = "[工具结果已落盘]"
 SKIP_CACHE_KWARG = "skip_tool_cache"
 
 
 def is_tool_results_path(file_path: str) -> bool:
-    """路径是否位于 tool_results 缓存目录下。"""
+    """路径是否位于项目 sidecar 的 tool_results 目录下。"""
     normalized = file_path.replace("\\", "/").strip().lstrip("/")
-    return normalized.startswith("tool_results/")
+    return ".mailin/tool_results/" in f"/{normalized}" or normalized.startswith("tool_results/")
 
 
 def tool_results_dir(session_id: str, workspace: Path | None = None) -> Path:
-    workspace = workspace or get_settings().workspace_path
-    path = workspace / "tool_results" / session_id
+    project = workspace or get_project_workspace()
+    if project is None:
+        raise ValueError("未绑定项目工作区")
+    path = project_tool_results_dir(Path(project), session_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

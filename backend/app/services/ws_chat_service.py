@@ -50,11 +50,14 @@ class WsChatService:
 
         if op == "approve":
             run_id = payload.get("run_id")
-            decision = payload.get("decision", "deny")
             if run_id and run_id in self._approval_futures:
                 future = self._approval_futures.pop(run_id)
                 if not future.done():
-                    future.set_result("allow" if decision == "allow" else "deny")
+                    if payload.get("kind") == "ask_user":
+                        future.set_result({"kind": "ask_user", "answer": payload.get("answer")})
+                    else:
+                        decision = payload.get("decision", "deny")
+                        future.set_result("allow" if decision == "allow" else "deny")
             return
 
         await self.manager.send_event(

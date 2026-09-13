@@ -176,3 +176,22 @@ async def test_execute_async_circuit_open_fast_fail():
     assert out2.ok is False
     assert "熔断" in (out2.error or "")
     assert out2.circuit_state == CircuitState.OPEN
+
+
+def test_execute_sync_timeout_thread_keeps_contextvars():
+    from contextvars import ContextVar
+
+    flag: ContextVar[str] = ContextVar("resilience_ctx_flag", default="missing")
+    flag.set("bound")
+
+    def _read() -> str:
+        return flag.get()
+
+    policy = ResiliencePolicy(
+        dependency_id="test.ctx",
+        timeout_seconds=2.0,
+        max_retries=0,
+    )
+    outcome = execute_sync("test.ctx", _read, policy=policy)
+    assert outcome.ok is True
+    assert outcome.value == "bound"

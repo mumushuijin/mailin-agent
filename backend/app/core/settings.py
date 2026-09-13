@@ -64,7 +64,6 @@ def init_workspace(settings: Settings | None = None) -> None:
         BOOTSTRAP_NAMES,
         CONFIG_FILE,
         _config_filename,
-        artifacts_dir,
         bootstraps_dir,
         migrate_workspace_layout,
     )
@@ -76,10 +75,8 @@ def init_workspace(settings: Settings | None = None) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "memory").mkdir(parents=True, exist_ok=True)
     (workspace / "sessions").mkdir(parents=True, exist_ok=True)
-    (workspace / "tool_results").mkdir(parents=True, exist_ok=True)
     (workspace / "skills").mkdir(parents=True, exist_ok=True)
     bootstraps_dir(workspace).mkdir(parents=True, exist_ok=True)
-    artifacts_dir(workspace).mkdir(parents=True, exist_ok=True)
 
     config_target = workspace / CONFIG_FILE
     if not config_target.exists():
@@ -114,14 +111,5 @@ def init_workspace(settings: Settings | None = None) -> None:
     from app.context.memory.store import ensure_hot_layer_initialized
 
     ensure_hot_layer_initialized(workspace)
-
-    readme = artifacts_dir(workspace) / "README.md"
-    if not readme.exists():
-        readme.write_text(
-            "# Artifacts\n\n"
-            "此目录存放 Agent 生成的产物文件（HTML 页面、报告、导出数据等）。\n"
-            "示例：`artifacts/weather.html`\n",
-            encoding="utf-8",
-        )
 
     migrate_workspace_layout(workspace, defaults)

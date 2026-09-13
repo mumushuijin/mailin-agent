@@ -109,6 +109,9 @@ async def stream_graph_events(
                     for progress in drain_tool_progress(session_id):
                         yield _evt("tool_progress", progress, run_id)
                     output = data.get("output") or {}
+                    todos = output.get("todos")
+                    if todos is not None:
+                        yield _evt("todo", {"todos": todos}, run_id)
                     for msg in output.get("messages") or []:
                         if isinstance(msg, ToolMessage):
                             display_name = msg.name or "tool"
@@ -159,6 +162,9 @@ async def stream_graph_events(
         messages = values.get("messages", [])
         if values:
             yield _evt("context_usage", resolve_context_usage(values, session_id), run_id)
+        todos = values.get("todos")
+        if todos:
+            yield _evt("todo", {"todos": todos}, run_id)
         api_usage = values.get("api_usage")
         if api_usage:
             yield _evt("api_usage", api_usage, run_id)

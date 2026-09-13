@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, ipcMain } = require('electron')
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron')
 const path = require('path')
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
@@ -24,6 +24,23 @@ function setupWindowControls() {
 
   ipcMain.handle('window:isMaximized', (event) => {
     return BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false
+  })
+
+  ipcMain.handle('dialog:selectDirectory', async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const result = await dialog.showOpenDialog(win ?? undefined, {
+      properties: ['openDirectory'],
+    })
+    if (result.canceled || !result.filePaths[0]) return null
+    return result.filePaths[0]
+  })
+
+  ipcMain.handle('shell:openPath', async (_event, folderPath) => {
+    if (typeof folderPath !== 'string' || !folderPath.trim()) {
+      return { ok: false, error: 'empty path' }
+    }
+    const error = await shell.openPath(folderPath.trim())
+    return { ok: !error, error: error || null }
   })
 }
 

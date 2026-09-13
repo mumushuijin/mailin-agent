@@ -19,3 +19,4 @@ class AgentState(TypedDict, total=False):
     last_invoke_ledger_len: int
     # 运行时字段（每轮组装，不写 checkpoint 亦可）
     working_messages: list
+    todos: list

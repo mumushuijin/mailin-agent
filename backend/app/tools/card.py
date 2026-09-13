@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 RiskLevel = Literal["safe", "moderate", "dangerous"]
 ToolSource = Literal["builtin", "user", "plugin"]
+Concurrency = Literal["safe", "barrier"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class ToolCard:
     risk_level: RiskLevel = "safe"
     requires_confirmation: bool = False
     sandbox_policy: str = "none"
+    concurrency: Concurrency = "barrier"
     display: ToolDisplayConfig | None = None
     enabled: bool = True
     source: ToolSource = "builtin"
@@ -47,6 +49,7 @@ class ToolCard:
             "risk_level": self.risk_level,
             "requires_confirmation": self.requires_confirmation,
             "sandbox_policy": self.sandbox_policy,
+            "concurrency": self.concurrency,
             "display": {
                 "name": self.display.name,
                 "icon": self.display.icon,
@@ -72,6 +75,7 @@ def make_card(
     risk_level: RiskLevel = "safe",
     requires_confirmation: bool = False,
     sandbox_policy: str = "none",
+    concurrency: Concurrency = "barrier",
     version: str = "1.0.0",
     source: ToolSource = "builtin",
     hidden: bool = False,
@@ -87,7 +91,20 @@ def make_card(
         risk_level=risk_level,
         requires_confirmation=requires_confirmation,
         sandbox_policy=sandbox_policy,
+        concurrency=concurrency,
         handler=handler,
         display=ToolDisplayConfig(name=display_name, icon=display_icon, hidden=hidden),
         source=source,
     )
+
+
+def resolve_concurrency(card: ToolCard | None, args: dict[str, Any] | None = None) -> Concurrency:
+    """barrier 默认；process/todo 的 list/get 视为并发安全。"""
+    if card is None:
+        return "barrier"
+    action = ""
+    if isinstance(args, dict):
+        action = str(args.get("action") or "").strip().lower()
+    if card.name in {"process", "todo"} and action in {"list", "get"}:
+        return "safe"
+    return card.concurrency

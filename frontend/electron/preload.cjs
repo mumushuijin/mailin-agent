@@ -14,4 +14,10 @@ contextBridge.exposeInMainWorld('mailin', {
       return () => ipcRenderer.removeListener('window:maximized-changed', handler)
     },
   },
+  dialog: {
+    selectDirectory: () => ipcRenderer.invoke('dialog:selectDirectory'),
+  },
+  shell: {
+    openPath: (folderPath) => ipcRenderer.invoke('shell:openPath', folderPath),
+  },
 })

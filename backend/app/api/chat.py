@@ -5,7 +5,6 @@ import uuid
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
-from starlette.responses import JSONResponse
 
 from app.core.logging import get_logger, log_scope
 from app.schemas.chat import ChatRequest, ChatResponse
@@ -40,15 +39,8 @@ def _http_run_scope(session_id: str | None):
             )
 
 
-@router.post("/send")
+@router.post("/send", response_model=ChatResponse)
 async def send_message(body: ChatRequest):
-    with _http_run_scope(body.session_id) as run_id:
-        result = await chat_service.send_sync(body.message, body.session_id, run_id=run_id)
-        return JSONResponse(content=result.model_dump())
-
-
-@router.post("/send/sync", response_model=ChatResponse)
-async def send_message_sync(body: ChatRequest):
     with _http_run_scope(body.session_id) as run_id:
         return await chat_service.send_sync(body.message, body.session_id, run_id=run_id)
 

@@ -48,6 +48,9 @@ const api = {
   post: <T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> => {
     return instance.post(url, data, config)
   },
+  patch: <T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> => {
+    return instance.patch(url, data, config)
+  },
   put: <T>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T> => {
     return instance.put(url, data, config)
   },

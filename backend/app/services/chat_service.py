@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
@@ -17,11 +18,13 @@ from app.context.engine import resolve_context_usage
 from app.context.ledger import repair_orphan_tool_calls
 from app.context.memory.maintenance import prepare_session_memory
 from app.maintenance.runner import get_maintenance_runner
-from app.core.llm import load_agent_config
+from app.core.llm import get_chat_model, load_agent_config
 from app.core.settings import get_settings
 from app.resilience import GRAPH_REQUEST_TIMEOUT_SECONDS
 from app.schemas.chat import ChatResponse
 from app.schemas.session import ChatMessage, SessionHistory, ToolCall, ToolCallFunction
+from app.core.exceptions import AppError
+from app.storage.project import require_bound_session
 from app.storage.workspace import SessionStore
 from app.tools.registry import load_full_config
 from app.tools.tool_search import resolve_tool_display, should_show_tool_in_ui
@@ -36,16 +39,50 @@ class ChatService:
         config = load_full_config(self.settings.workspace_path)
         return config.get("agent", {}).get("max_steps", 24)
 
-    def _ensure_session(self, session_id: str | None) -> str:
-        if session_id:
-            try:
-                self.session_store.get(session_id)
-                return session_id
-            except Exception:
-                pass
-        new_id = self.session_store.create()
-        dispatch_observe(ON_SESSION_START, session_id=new_id)
-        return new_id
+    def _require_bound_session(self, session_id: str | None) -> str:
+        sid, _project = require_bound_session(session_id)
+        return sid
+
+    async def _llm_short_title(self, user_message: str, assistant_content: str) -> str | None:
+        if not self.settings.has_llm:
+            return None
+        prompt = (
+            "把这次对话总结成不超过16个汉字的短标题。"
+            "只输出标题本身，不要引号、句号或解释。\n"
+            f"用户：{(user_message or '')[:200]}\n"
+            f"助手：{(assistant_content or '')[:200]}"
+        )
+        try:
+            model = get_chat_model()
+            result = await asyncio.wait_for(
+                model.ainvoke([HumanMessage(content=prompt)]),
+                timeout=8,
+            )
+            raw = result.content if hasattr(result, "content") else str(result)
+            if isinstance(raw, list):
+                raw = "".join(str(part) for part in raw)
+            text = str(raw or "").strip().splitlines()[0].strip().strip("「」\"'")
+            return text or None
+        except Exception:
+            return None
+
+    async def _refine_auto_title_after_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_content: str,
+    ) -> None:
+        try:
+            meta = self.session_store.get(session_id)
+            if meta.get("title_source") != "auto":
+                return
+            if not (assistant_content or "").strip():
+                return
+            summary = await self._llm_short_title(user_message, assistant_content)
+            if summary:
+                self.session_store.apply_auto_title(session_id, summary)
+        except Exception:
+            return
 
     async def send_sync(
         self,
@@ -58,10 +95,11 @@ class ChatService:
 
         _ = run_id  # 日志上下文由 API 层 log_scope 绑定
 
+        sid = self._require_bound_session(session_id)
+
         if not get_settings().has_llm:
             raise RuntimeError("未配置 LLM API Key")
-
-        sid = self._ensure_session(session_id)
+        self.session_store.maybe_set_title_from_message(sid, message)
         await prepare_session_memory(message)
         graph = await asyncio.to_thread(get_graph)
         config = make_thread_config(sid)
@@ -78,6 +116,7 @@ class ChatService:
                 f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s），请稍后重试"
             ) from exc
         content = extract_final_content(result.get("messages", []))
+        await self._refine_auto_title_after_turn(sid, message, content)
         dispatch_post_llm_call(
             session_id=sid,
             user_message=message,
@@ -97,12 +136,17 @@ class ChatService:
         run_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """聊天主流程：产出统一 AgentEvent 流（SSE / WS 共用）。"""
+        try:
+            sid = self._require_bound_session(session_id)
+        except AppError as exc:
+            yield AgentEvent("error", {"error": exc.message}, run_id)
+            return
+
         if not self.settings.has_llm:
             yield AgentEvent("error", {"error": "未配置 LLM API Key，请在 backend/.env 设置 OPENAI_API_KEY"}, run_id)
             return
-
-        sid = self._ensure_session(session_id)
         yield AgentEvent("session", {"session_id": sid}, run_id)
+        self.session_store.maybe_set_title_from_message(sid, message)
         await prepare_session_memory(message)
 
         graph = await asyncio.to_thread(get_graph)
@@ -124,6 +168,7 @@ class ChatService:
                 nudge_pending = bool(values.get("memory_nudge_pending"))
 
         if completed:
+            asyncio.create_task(self._refine_auto_title_after_turn(sid, message, final_content))
             dispatch_post_llm_call(
                 session_id=sid,
                 user_message=message,
@@ -146,13 +191,32 @@ class ChatService:
         *,
         run_id: str | None = None,
     ) -> AsyncIterator[str]:
+        from app.agent.streaming.interrupts import has_pending_interrupt
+
+        sid: str | None = session_id
         async for event in self.iter_chat_events(message, session_id, run_id=run_id):
+            if event.type == "session" and event.data.get("session_id"):
+                sid = event.data["session_id"]
             yield to_sse(event)
+
+        if not sid:
+            return
+        graph = await asyncio.to_thread(get_graph)
+        if await has_pending_interrupt(graph, make_thread_config(sid)):
+            yield to_sse(
+                AgentEvent(
+                    "error",
+                    {
+                        "error": "此操作需要在 WebSocket 连接下确认或回答，请重连后重试",
+                    },
+                    run_id,
+                )
+            )
 
     async def resume_chat_events(
         self,
         session_id: str,
-        decision: str,
+        decision: Any,
         *,
         run_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
@@ -289,4 +353,5 @@ class ChatService:
             context_usage=context_usage,
             api_usage=api_usage or None,
             session_token_stats=session_token_stats or None,
+            todos=list(values.get("todos") or []) or None,
         )

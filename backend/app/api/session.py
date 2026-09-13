@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.schemas.session import Session, SessionHistory
+from app.schemas.session import Session, SessionCreate, SessionHistory, SessionRebind, SessionRename
 from app.services.chat_service import ChatService
 from app.services.session_service import SessionService
 
@@ -16,9 +16,19 @@ async def list_sessions() -> dict:
 
 
 @router.post("/create")
-async def create_session() -> dict:
-    session_id = session_service.create()
+async def create_session(body: SessionCreate) -> dict:
+    session_id = session_service.create(body.workspace_path)
     return {"session_id": session_id}
+
+
+@router.post("/{session_id}/workspace", response_model=Session)
+async def rebind_session(session_id: str, body: SessionRebind):
+    return session_service.rebind(session_id, body.workspace_path)
+
+
+@router.patch("/{session_id}/title", response_model=Session)
+async def rename_session(session_id: str, body: SessionRename):
+    return session_service.rename(session_id, body.title)
 
 
 @router.get("/{session_id}", response_model=Session)

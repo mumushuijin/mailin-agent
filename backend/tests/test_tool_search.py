@@ -145,7 +145,41 @@ def test_load_tool_search_config_defaults():
     cfg = load_tool_search_config({"tools": {}})
     assert cfg.enabled is True
     assert "read_file" in cfg.hot_tools
+    assert "glob_search" in cfg.hot_tools
+    assert "todo" in cfg.hot_tools
+    assert "python_calculator" not in cfg.hot_tools
     assert cfg.mcp_as_hot is False
+
+
+def test_legacy_hot_tools_are_upgraded():
+    cfg = load_tool_search_config(
+        {
+            "tools": {
+                "tool_search": {
+                    "hot_tools": [
+                        "read_file",
+                        "list_directory",
+                        "run_shell",
+                        "memory_grep",
+                        "memory_add",
+                        "memory_consolidate",
+                        "python_calculator",
+                        "get_current_time",
+                    ]
+                }
+            }
+        }
+    )
+    assert "glob_search" in cfg.hot_tools
+    assert "todo" in cfg.hot_tools
+    assert "python_calculator" not in cfg.hot_tools
+
+
+def test_custom_hot_tools_preserved():
+    cfg = load_tool_search_config(
+        {"tools": {"tool_search": {"hot_tools": ["read_file", "web_search"]}}}
+    )
+    assert cfg.hot_tools == ("read_file", "web_search")
 
 
 def test_mcp_tools_deferred_and_searchable():

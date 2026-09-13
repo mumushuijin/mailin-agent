@@ -59,4 +59,5 @@ def make_initial_state(message: str, max_steps: int) -> dict:
         "api_usage": {},
         "session_token_stats": {},
         "last_invoke_ledger_len": 0,
+        "todos": [],
     }

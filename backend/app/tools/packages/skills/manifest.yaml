@@ -1,0 +1,6 @@
+id: skills
+name: 技能
+version: "1.0.0"
+description: 列出、匹配并按需读取全局与项目 skill
+config_key: skills
+default_enabled: true

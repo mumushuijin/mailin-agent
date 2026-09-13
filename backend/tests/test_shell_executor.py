@@ -6,27 +6,25 @@ from pathlib import Path
 import pytest
 
 from app.tools.packages.shell.executor import execute_shell, format_shell_result, resolve_workdir
-from app.tools.runtime import set_tool_session
+from app.tools.runtime import set_tool_project, set_tool_session
 
 
 @pytest.fixture
 def workspace(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(
-        "app.tools.packages.shell.executor.get_settings",
-        lambda: type("S", (), {"workspace_path": tmp_path})(),
-    )
-    monkeypatch.setattr(
-        "app.core.settings.get_settings",
-        lambda: type("S", (), {"workspace_path": tmp_path})(),
-    )
-    return tmp_path
+    home = tmp_path / "agent_home"
+    defaults = tmp_path / "defaults"
+    project = tmp_path / "project"
+    home.mkdir()
+    defaults.mkdir()
+    project.mkdir()
+    settings = type("S", (), {"workspace_path": home, "workspace_defaults_path": defaults})()
+    monkeypatch.setattr("app.tools.packages.shell.executor.get_settings", lambda: settings)
+    monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
+    set_tool_project(project)
+    return project
 
 
-def test_resolve_workdir_rejects_escape(workspace: Path, monkeypatch):
-    monkeypatch.setattr(
-        "app.tools.packages.shell.executor.get_settings",
-        lambda: type("S", (), {"workspace_path": workspace})(),
-    )
+def test_resolve_workdir_rejects_escape(workspace: Path):
     path, err = resolve_workdir("../../etc")
     assert path is None
     assert err is not None

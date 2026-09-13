@@ -16,6 +16,8 @@ from app.context.tool_cache import (
 
 @pytest.fixture
 def workspace(tmp_path: Path, monkeypatch):
+    from app.tools.runtime import set_tool_project
+
     monkeypatch.setattr(
         "app.context.tool_cache.get_settings",
         lambda: type("S", (), {"workspace_path": tmp_path})(),
@@ -24,6 +26,7 @@ def workspace(tmp_path: Path, monkeypatch):
         "app.context.budget.get_settings",
         lambda: type("S", (), {"workspace_path": tmp_path})(),
     )
+    set_tool_project(tmp_path)
     return tmp_path
 
 
@@ -34,6 +37,7 @@ def _big_content(chars: int = 20_000) -> str:
 def test_is_tool_results_path():
     assert is_tool_results_path("tool_results/sess/call_1.json")
     assert is_tool_results_path("/tool_results/sess/call_1.json")
+    assert is_tool_results_path(".mailin/tool_results/sess/call_1.json")
     assert not is_tool_results_path("notes/readme.md")
 
 
@@ -120,4 +124,4 @@ def test_working_content_uses_cache_reference_when_cached(workspace: Path):
     cached = cache_tool_message_if_large(tool, "sess-1", workspace)
     working = working_content_for_tool_message(cached, messages)
     assert working.startswith(CACHED_PREFIX)
-    assert "tool_results/sess-1" in working
+    assert "tool_results/sess-1" in working.replace("\\", "/")

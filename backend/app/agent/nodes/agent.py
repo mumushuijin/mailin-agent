@@ -29,7 +29,7 @@ from app.resilience import (
     llm_grace_policy,
 )
 from app.tools.registry import get_tools
-from app.tools.runtime import set_tool_session
+from app.storage.project import bind_session_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +278,7 @@ def _agent_error_payload(
 
 def call_agent(state: AgentState, config: RunnableConfig) -> dict:
     session_id = config.get("configurable", {}).get("thread_id")
-    set_tool_session(session_id)
+    bind_session_runtime(session_id)
     model = get_chat_model()
     tools = get_tools()
     ledger = state.get("messages") or []

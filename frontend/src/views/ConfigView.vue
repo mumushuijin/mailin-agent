@@ -22,13 +22,10 @@ const resetOptions = ref({
 
 const configDescriptions: Record<string, string> = {
   CONFIG: '全局配置',
-  IDENTITY: '身份定义',
   USER: '用户信息',
   SOUL: '人格模板',
   MEMORY: '长期记忆',
-  AGENTS: '工作空间规则',
   HEARTBEAT: '心跳任务',
-  BOOTSTRAP: '初始化引导',
 }
 
 // 获取配置文件的后缀
@@ -201,13 +198,10 @@ onMounted(() => {
         <p style="color: var(--color-danger); font-weight: 500;">⚠️ 警告：此操作不可撤销！</p>
         <p>初始化将把所有配置文件恢复为默认模板，包括：</p>
         <ul>
-          <li>AGENTS.md - 工作空间规则</li>
-          <li>IDENTITY.md - 身份信息</li>
+          <li>SOUL.md - 人格与身份</li>
           <li>USER.md - 用户信息</li>
-          <li>SOUL.md - 人格模板</li>
           <li>MEMORY.md - 长期记忆</li>
           <li>HEARTBEAT.md - 心跳任务</li>
-          <li>BOOTSTRAP.md - 初始化引导</li>
         </ul>
 
         <div class="reset-options">

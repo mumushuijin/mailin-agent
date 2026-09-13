@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import shutil
 from pathlib import Path
 
 from app.context.budget import estimate_tokens
 from app.context.tool_cache import is_tool_results_path
 from app.core.settings import get_settings
-from app.storage.workspace import _resolve_safe_path, normalize_workspace_path
+from app.storage.workspace import assert_not_agent_space, _resolve_safe_path, normalize_workspace_path
+from app.tools.runtime import get_project_workspace
 
 _MAX_LIST_ENTRIES = 200
 _MAX_SEARCH_RESULTS = 30
@@ -21,12 +23,17 @@ _TOOL_RESULTS_READ_MAX_TOKENS = 3_000
 
 
 def _workspace_root() -> Path:
-    return get_settings().workspace_path
+    root = get_project_workspace()
+    if root is None:
+        raise ValueError("未绑定项目工作区")
+    return root
 
 
 def _safe_path(relative: str, *, for_write: bool = False) -> Path:
     rel = normalize_workspace_path(relative, for_write=for_write)
-    return _resolve_safe_path(_workspace_root(), rel)
+    path = _resolve_safe_path(_workspace_root(), rel)
+    assert_not_agent_space(path)
+    return path
 
 
 def _rel_path(path: Path) -> str:
@@ -82,6 +89,13 @@ def _window_by_lines(
     return window, total, start + 1, end_line, truncated
 
 
+def _prefix_line_numbers(text: str, start_line: int) -> str:
+    if text == "":
+        return ""
+    lines = text.split("\n")
+    return "\n".join(f"{start_line + i}|{line}" for i, line in enumerate(lines))
+
+
 def _format_read_window(
     file_path: str,
     window: str,
@@ -91,9 +105,10 @@ def _format_read_window(
     truncated: bool,
     is_offload: bool,
 ) -> str:
+    numbered = _prefix_line_numbers(window, start_line)
     has_more = end_line < total
     if not has_more and start_line <= 1 and not truncated:
-        return window
+        return numbered
     notes: list[str] = [f"共 {total} 行，本次显示第 {start_line}–{end_line} 行"]
     if truncated:
         notes[0] += "（达到单次 token 上限被截断）"
@@ -101,7 +116,7 @@ def _format_read_window(
         notes.append(f'继续下一段：read_file(file_path="{file_path}", offset={end_line + 1})')
     if is_offload:
         notes.append("这是落盘的工具结果，请按需分页/检索，不要试图一次读完全文")
-    return window + "\n\n---\n[分页] " + "；".join(notes)
+    return numbered + "\n\n---\n[分页] " + "；".join(notes)
 
 
 def read_file(file_path: str, offset: int = 1, limit: int | None = None) -> str:
@@ -149,7 +164,7 @@ def read_file(file_path: str, offset: int = 1, limit: int | None = None) -> str:
         max_tokens = _DEFAULT_READ_MAX_TOKENS
         # 普通小文件且未显式分页：保持整文件返回的旧行为
         if not explicit_window and estimate_tokens(body) <= max_tokens:
-            return body
+            return _prefix_line_numbers(body, 1)
 
     window, total, start_line, end_line, truncated = _window_by_lines(
         body, offset, limit, max_tokens
@@ -164,7 +179,7 @@ def read_file(file_path: str, offset: int = 1, limit: int | None = None) -> str:
 def write_file(file_path: str, content: str) -> str:
     """向工作区内写入文件（覆盖）。
 
-    路径必须为相对路径。HTML/JS/CSS 等产物文件的裸文件名会自动写入 `artifacts/` 目录。
+    路径必须为相对路径。HTML/JS/CSS 等产物文件的裸文件名会自动写入 `.mailin/artifacts/`。
     会自动创建父目录。仅允许写入工作区沙箱内。
     """
     try:
@@ -234,13 +249,19 @@ def search_files(
     file_pattern: str = "*",
     max_results: int = 20,
 ) -> str:
-    """在工作区文件中搜索包含 query 的文本（大小写不敏感）。
+    """在工作区文件中搜索匹配 query 的文本（正则，默认忽略大小写）。
 
+    query 按 Python 正则编译；非法正则立即失败且不扫描文件。
     支持 file_pattern 过滤文件名（如 *.md、*.py）。仅搜索 UTF-8 文本文件。
     """
     query = query.strip()
     if not query:
         return "搜索关键词不能为空。"
+
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+    except re.error as exc:
+        return f"无效的正则表达式: {exc}"
 
     try:
         base = _safe_path(directory_path)
@@ -253,7 +274,6 @@ def search_files(
 
     max_results = min(max(max_results, 1), _MAX_SEARCH_RESULTS)
     hits: list[str] = []
-    query_lower = query.lower()
 
     for path in sorted(base.rglob("*")):
         if not path.is_file():
@@ -264,25 +284,25 @@ def search_files(
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        if query_lower not in text.lower():
-            continue
 
         rel = _rel_path(path)
         line_hits: list[str] = []
         for idx, line in enumerate(text.splitlines(), 1):
-            if query_lower in line.lower():
+            if pattern.search(line):
                 preview = line.strip()
                 if len(preview) > 120:
                     preview = preview[:120] + "..."
                 line_hits.append(f"  L{idx}: {preview}")
             if len(line_hits) >= 3:
                 break
+        if not line_hits:
+            continue
         hits.append(f"{rel}\n" + "\n".join(line_hits))
         if len(hits) >= max_results:
             break
 
     if not hits:
-        return f"未找到包含「{query}」的文件（目录: {directory_path}，过滤: {file_pattern}）"
+        return f"未找到匹配「{query}」的文件（目录: {directory_path}，过滤: {file_pattern}）"
     suffix = f"\n\n（共 {len(hits)} 个匹配文件" + (
         f"，上限 {max_results}）" if len(hits) >= max_results else "）"
     )

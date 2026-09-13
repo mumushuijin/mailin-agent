@@ -1,3 +1,4 @@
+from app.agent.hooks import ON_SESSION_START, dispatch_observe
 from app.core.settings import get_settings
 from app.schemas.session import Session
 from app.storage.checkpoint import delete_thread, reset_checkpointer
@@ -11,11 +12,19 @@ class SessionService:
     def list_sessions(self) -> list[Session]:
         return [Session(**s) for s in self.store.list()]
 
-    def create(self) -> str:
-        return self.store.create()
+    def create(self, workspace_path: str) -> str:
+        session_id = self.store.create(workspace_path)
+        dispatch_observe(ON_SESSION_START, session_id=session_id)
+        return session_id
 
     def get(self, session_id: str) -> Session:
         return Session(**self.store.get(session_id))
+
+    def rebind(self, session_id: str, workspace_path: str) -> Session:
+        return Session(**self.store.rebind(session_id, workspace_path))
+
+    def rename(self, session_id: str, title: str) -> Session:
+        return Session(**self.store.rename(session_id, title))
 
     async def delete(self, session_id: str) -> None:
         self.store.delete(session_id)

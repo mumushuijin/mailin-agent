@@ -79,10 +79,13 @@ def test_registry_includes_datetime_when_enabled():
         config={
             "tools": {
                 "filesystem": False,
+                "shell": False,
                 "memory": False,
                 "calculator": False,
                 "web_search": False,
                 "datetime": True,
+                "session": False,
+                "skills": False,
             }
         }
     )
@@ -97,6 +100,7 @@ def test_registry_excludes_datetime_when_disabled():
         config={
             "tools": {
                 "filesystem": False,
+                "shell": False,
                 "memory": False,
                 "calculator": False,
                 "web_search": False,

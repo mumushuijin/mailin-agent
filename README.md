@@ -119,8 +119,7 @@ mailin125/
 │   │   ├── resilience/         # 超时 / 重试 / 熔断
 │   │   ├── core/               # 设置、LLM、日志、遥测
 │   │   └── schemas/            # Pydantic 请求/响应模型
-│   ├── cli/                    # `mailin serve` / `mailin eval` CLI
-│   ├── eval/                   # 评估子系统
+│   ├── cli/                    # `mailin serve` CLI
 │   ├── tests/                  # pytest 测试套件
 │   ├── workspace/              # 运行时工作区（首次启动从 defaults 复制）
 │   └── workspace_defaults/     # 工作区默认模板
@@ -211,16 +210,20 @@ cd frontend && npm run dev:web
 
 ---
 
-## 🧪 测试与评估
+## 🧪 测试
 
 ```bash
 cd backend
 
 # 单元测试
 uv run pytest
+```
 
-# 评估套件（依赖 uv sync --extra eval）
-uv run mailin eval --suite smoke
+独立调试 Agent 图：
+
+```bash
+cd backend
+uv run langgraph dev
 ```
 
 ---
@@ -232,7 +235,6 @@ uv run mailin eval --suite smoke
 | 用户认证 | ❌ 无（本地单机场景） |
 | 多用户 | ❌ 不支持 |
 | 云同步 | ❌ 不支持，数据纯本地 |
-| 评估系统 | 🚧 MVP 阶段，retrieval 套件待完善 |
 | 多 Agent 协作 | 🚧 引导文件已预留（`AGENTS.md`），运行时未实现 |
 | API / 配置稳定性 | 🚧 开发中，可能存在不兼容变更 |
 

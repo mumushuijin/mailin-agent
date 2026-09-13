@@ -1,0 +1,6 @@
+id: session
+name: 会话编排
+version: "1.0.0"
+description: 会话内待办与向用户提问
+config_key: session
+default_enabled: true

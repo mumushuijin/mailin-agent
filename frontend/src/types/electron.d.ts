@@ -12,6 +12,12 @@ declare global {
         isMaximized: () => Promise<boolean>
         onMaximizedChanged: (callback: (maximized: boolean) => void) => () => void
       }
+      dialog?: {
+        selectDirectory: () => Promise<string | null>
+      }
+      shell?: {
+        openPath: (folderPath: string) => Promise<{ ok: boolean; error?: string | null }>
+      }
     }
   }
 }

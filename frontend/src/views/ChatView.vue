@@ -1,47 +1,28 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onMounted, onUnmounted } from 'vue'
-import { Input, Button, message, Tag, Tooltip, Modal } from 'ant-design-vue'
-import { SendOutlined, PlusOutlined, StopOutlined, LoadingOutlined } from '@ant-design/icons-vue'
+import { Input, Button, message, Tag } from 'ant-design-vue'
+import { SendOutlined, PlusOutlined, LoadingOutlined, FolderOpenOutlined } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { sessionApi } from '@/api/session'
 import { chatApi, type ApiUsage, type ContextUsage } from '@/api/chat'
 import { chatWs } from '@/api/ws'
 import { configApi } from '@/api/config'
 import { renderMarkdown, formatMessageTime } from '@/utils/markdown'
-import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDisplay'
+import { getToolConfig, formatToolArgs, formatToolResult, toolResultLooksLikeError, toolErrorPreview } from '@/utils/toolDisplay'
 import MailinLogo from '@/components/MailinLogo.vue'
+import ToolApprovalModal from '@/components/ToolApprovalModal.vue'
+import AskUserModal from '@/components/AskUserModal.vue'
+import ContextUsageRing from '@/components/ContextUsageRing.vue'
+import { applyChatStreamEvent } from '@/composables/useChatStream'
+import { getLastWorkspacePath, openDirectory, pickDirectory, saveLastWorkspacePath } from '@/composables/useWorkspaceFolder'
+import { getLastSessionId, saveLastSessionId, useProjectNavigator } from '@/composables/useProjectNavigator'
+import type { ChatUiMessage, MessageSegment, PendingApproval, PendingAskUser, SessionTodoItem } from '@/types/chat-ui'
 
-// localStorage key for saving current session
-const SESSION_STORAGE_KEY = 'mailin.lastSessionId'
+const { refreshSessions, setCurrentSession, currentProjectPath } = useProjectNavigator()
 
-// 助手名字（从后端获取）
 const assistantName = ref('麦林')
 
-// 消息段类型
-interface TextSegment {
-  type: 'text'
-  id: number
-  content: string
-}
-
-interface ToolSegment {
-  type: 'tool'
-  id: number
-  tool: string
-  args: Record<string, unknown>
-  result?: string
-  status: 'running' | 'done' | 'error'
-}
-
-type MessageSegment = TextSegment | ToolSegment
-
-interface Message {
-  id: number
-  role: 'user' | 'assistant'
-  content: string  // 用于从历史加载的消息
-  timestamp: Date
-  segments?: MessageSegment[]  // 用于流式消息的分段
-}
+type Message = ChatUiMessage
 
 interface MessageGroup {
   role: 'user' | 'assistant'
@@ -57,19 +38,19 @@ const currentSessionId = ref<string | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const abortController = ref<AbortController | null>(null)
 const initializing = ref(true)
-const collapsedTools = ref<Set<number>>(new Set())
+const historyLoading = ref(false)
 const expandedTools = ref<Set<number>>(new Set())
 const contextUsage = ref<ContextUsage | null>(null)
 const apiUsage = ref<ApiUsage | null>(null)
 const contextCompressing = ref(false)
 
 // 工具审批（WebSocket interrupt）
-const pendingApproval = ref<{
-  runId: string
-  tool: string
-  args: Record<string, unknown>
-  reason: string
-} | null>(null)
+const pendingApproval = ref<PendingApproval | null>(null)
+const pendingAskUser = ref<PendingAskUser | null>(null)
+const sessionTodos = ref<SessionTodoItem[]>([])
+const boundWorkspacePath = ref<string | null>(null)
+const folderDraft = ref(getLastWorkspacePath())
+const bindingFolder = ref(false)
 
 let unsubConfig: (() => void) | null = null
 
@@ -89,68 +70,6 @@ const visibleMessages = computed(() => {
 
 // 是否还有更早的消息未渲染
 const hasMoreToRender = computed(() => messages.value.length > renderLimit.value)
-
-const contextUsagePercent = computed(() => {
-  if (!contextUsage.value) return 0
-  return Math.min(100, Math.round(contextUsage.value.ratio * 100))
-})
-
-const contextUsageLevel = computed(() => {
-  const ratio = contextUsage.value?.ratio ?? 0
-  if (ratio > 0.8) return 'danger'
-  if (ratio > 0.6) return 'warning'
-  return 'normal'
-})
-
-const contextUsageLines = computed(() => {
-  if (!contextUsage.value) return ['上下文窗口占用']
-  const u = contextUsage.value
-  const max = u.max_tokens.toLocaleString()
-  const total = u.total_tokens.toLocaleString()
-  const hasApi = (apiUsage.value?.prompt_tokens ?? 0) > 0
-  const lines = [`上下文窗口 ${contextUsagePercent.value}%`]
-
-  if (hasApi) {
-    lines.push(`有效 ${total} / ${max}（API+增量）`)
-    const api = apiUsage.value!
-    const prompt = (api.agent?.prompt_tokens ?? api.prompt_tokens).toLocaleString()
-    const completion = api.completion_tokens.toLocaleString()
-    lines.push(`API ${prompt} + ${completion} out`)
-    if (u.estimated_tokens != null) {
-      lines.push(`粗估 ${u.estimated_tokens.toLocaleString()}`)
-    }
-  } else {
-    lines.push(`粗估 ${total} / ${max}`)
-  }
-
-  const api = apiUsage.value
-  if (api?.prompt_cache_hit_tokens && api.prompt_cache_hit_tokens > 0) {
-    lines.push(`缓存 ${api.prompt_cache_hit_tokens.toLocaleString()}`)
-  }
-
-  if (contextCompressing.value) lines.push('正在整理上下文…')
-  else if (u.warning) lines.push(u.warning)
-  return lines
-})
-
-const contextUsageTooltip = computed(() => contextUsageLines.value.join('\n'))
-
-const RING_SIZE = 40
-const RING_RADIUS = 16
-const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS
-
-const contextRingOffset = computed(() => {
-  const ratio = Math.min(1, contextUsage.value?.ratio ?? 0)
-  return RING_CIRCUMFERENCE * (1 - ratio)
-})
-
-const contextRingColor = computed(() => {
-  if (contextCompressing.value) return 'var(--color-primary)'
-  const level = contextUsageLevel.value
-  if (level === 'danger') return 'var(--color-primary)'
-  if (level === 'warning') return '#faad14'
-  return '#52c41a'
-})
 
 // 消息分组（Slack 风格）
 const messageGroups = computed<MessageGroup[]>(() => {
@@ -248,19 +167,17 @@ const thinkingLabel = computed(() => {
   return '思考中…'
 })
 
-// 保存当前会话 ID 到 localStorage
 const saveCurrentSession = (sessionId: string) => {
-  localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
+  saveLastSessionId(sessionId)
 }
 
-// 从 localStorage 读取上次会话 ID（兼容旧版 key）
 const getLastSession = (): string | null => {
-  const current = localStorage.getItem(SESSION_STORAGE_KEY)
+  const current = getLastSessionId()
   if (current) return current
 
   const legacy = localStorage.getItem('helloclaw.lastSessionId')
   if (legacy) {
-    localStorage.setItem(SESSION_STORAGE_KEY, legacy)
+    saveLastSessionId(legacy)
     localStorage.removeItem('helloclaw.lastSessionId')
     return legacy
   }
@@ -284,8 +201,13 @@ const resolveMessageTimestamp = (
   return new Date(start + (end - start) * ratio)
 }
 
+let historyLoadSeq = 0
+
 // 加载会话历史（按照 OpenAI 标准格式解析）
 const loadSessionHistory = async (sessionId: string) => {
+  const seq = ++historyLoadSeq
+  historyLoading.value = true
+  messages.value = []
   contextUsage.value = null
   apiUsage.value = null
   contextCompressing.value = false
@@ -296,8 +218,16 @@ const loadSessionHistory = async (sessionId: string) => {
       sessionApi.get(sessionId),
     ])
     const rawMessages = historyRes.messages
+    sessionTodos.value = (historyRes.todos || []) as SessionTodoItem[]
     const sessionCreatedAt = sessionRes.created_at
     const sessionUpdatedAt = sessionRes.updated_at
+    boundWorkspacePath.value = sessionRes.workspace_path || null
+    if (sessionRes.workspace_path) {
+      folderDraft.value = sessionRes.workspace_path
+      saveLastWorkspacePath(sessionRes.workspace_path)
+    }
+    if (seq !== historyLoadSeq) return
+    setCurrentSession(sessionRes)
 
     // 用于存储工具调用结果（tool_call_id -> result）
     const toolResults: Map<string, string> = new Map()
@@ -350,7 +280,7 @@ const loadSessionHistory = async (sessionId: string) => {
               tool: tc.function.name,
               args: JSON.parse(tc.function.arguments || '{}'),
               result: result,
-              status: result?.startsWith('❌') ? 'error' : 'done'
+              status: result && toolResultLooksLikeError(result) ? 'error' : 'done'
             })
           })
 
@@ -416,6 +346,7 @@ const loadSessionHistory = async (sessionId: string) => {
       displayMessages.push(pendingAssistant)
     }
 
+    if (seq !== historyLoadSeq) return
     messages.value = displayMessages
     if (historyRes.context_usage) {
       contextUsage.value = historyRes.context_usage
@@ -424,8 +355,15 @@ const loadSessionHistory = async (sessionId: string) => {
       apiUsage.value = historyRes.api_usage
     }
   } catch (error) {
+    if (seq !== historyLoadSeq) return
     // 会话不存在或加载失败，清空消息
     messages.value = []
+    boundWorkspacePath.value = null
+    setCurrentSession(null)
+  } finally {
+    if (seq === historyLoadSeq) {
+      historyLoading.value = false
+    }
   }
 }
 
@@ -464,19 +402,9 @@ const initSession = async () => {
       initializing.value = false
       await scrollToBottom(true)
     } else {
-      // 没有上次会话，创建新会话
-      try {
-        const res = await sessionApi.create()
-        saveCurrentSession(res.session_id)
-        currentSessionId.value = res.session_id
-        await loadSessionHistory(res.session_id)
-        // 使用 replace 更新 URL（不触发导航）
-        window.history.replaceState({}, '', `/?session=${res.session_id}`)
-        initializing.value = false
-      } catch (error) {
-        message.error('创建会话失败')
-        initializing.value = false
-      }
+      boundWorkspacePath.value = null
+      setCurrentSession(null)
+      initializing.value = false
     }
   }
 }
@@ -497,9 +425,21 @@ watch(
     if (!sessionId) return
 
     // 切换到新会话
+    if (loading.value) {
+      chatApi.cancelGeneration()
+      if (abortController.value) {
+        abortController.value.abort()
+        abortController.value = null
+      }
+      loading.value = false
+      pendingApproval.value = null
+      pendingAskUser.value = null
+    }
     currentSessionId.value = sessionId
     saveCurrentSession(sessionId)
     inputMessage.value = ''
+    messages.value = []
+    historyLoading.value = true
     await loadSessionHistory(sessionId)
     await scrollToBottom(true)
   }
@@ -593,11 +533,10 @@ const handleScroll = () => {
 
 // 切换工具折叠状态
 const toggleToolCollapse = (toolId: number) => {
-  if (expandedTools.value.has(toolId)) {
-    expandedTools.value.delete(toolId)
-  } else {
-    expandedTools.value.add(toolId)
-  }
+  const next = new Set(expandedTools.value)
+  if (next.has(toolId)) next.delete(toolId)
+  else next.add(toolId)
+  expandedTools.value = next
 }
 
 // 检查工具是否展开（默认折叠，只有点击后才展开）
@@ -632,17 +571,6 @@ const hasTextContent = (msg: Message): boolean => {
   // 只检查文本段
   for (const segment of msg.segments) {
     if (segment.type === 'text' && segment.content) {
-      return true
-    }
-  }
-  return false
-}
-
-// 检查消息是否有可见的工具调用（用于决定是否显示工具卡片而非加载指示器）
-const hasVisibleTools = (msg: Message): boolean => {
-  if (!msg.segments) return false
-  for (const segment of msg.segments) {
-    if (segment.type === 'tool' && !getToolConfig(segment.tool).hidden) {
       return true
     }
   }
@@ -688,12 +616,19 @@ const stopGeneration = () => {
   finalizeLastAssistantTools(true)
   loading.value = false
   pendingApproval.value = null
+  pendingAskUser.value = null
 }
 
 const handleApproval = (decision: 'allow' | 'deny') => {
   if (!pendingApproval.value) return
   chatApi.approveTool(pendingApproval.value.runId, decision)
   pendingApproval.value = null
+}
+
+const handleAskUser = (answer: string | string[]) => {
+  if (!pendingAskUser.value) return
+  chatApi.answerAskUser(pendingAskUser.value.runId, answer)
+  pendingAskUser.value = null
 }
 
 // 更新消息段（触发 Vue 响应性）
@@ -712,6 +647,10 @@ const updateMessageSegments = (msgIndex: number, segments: MessageSegment[]) => 
 
 const sendMessage = async () => {
   if (!inputMessage.value.trim()) return
+  if (!boundWorkspacePath.value || !currentSessionId.value) {
+    message.warning('请先选择项目文件夹')
+    return
+  }
 
   const userMessage = inputMessage.value
   const userMsg: Message = {
@@ -726,225 +665,151 @@ const sendMessage = async () => {
   loading.value = true
   contextCompressing.value = false
 
-  // 创建 AbortController
   abortController.value = new AbortController()
 
-  // 助手消息的索引和段
   let assistantMsgIndex = -1
-  let currentSegments: MessageSegment[] = []
+  const currentSegments: MessageSegment[] = []
   let currentTextSegmentId = -1
 
   await scrollToBottom()
+
+  const streamCtx = {
+    messages,
+    currentSessionId,
+    contextUsage,
+    apiUsage,
+    contextCompressing,
+    pendingApproval,
+    pendingAskUser,
+    sessionTodos,
+    assistantName,
+    saveCurrentSession,
+    updateMessageSegments,
+    finalizeRunningToolSegments,
+    scrollToBottom: () => { scrollToBottom() },
+  }
 
   try {
     await chatApi.sendMessageWs(
       userMessage,
       currentSessionId.value || undefined,
       (event) => {
-        if (event.type === 'session') {
-          // 收到会话 ID
-          if (event.session_id) {
-            currentSessionId.value = event.session_id
-            saveCurrentSession(event.session_id)
-          }
-        } else if (event.type === 'step_start') {
-          // 新步骤开始：结束上一轮未闭合的工具状态
-          for (const seg of currentSegments) {
-            if (seg.type === 'tool' && seg.status === 'running') {
-              seg.status = 'done'
-              if (!seg.result) seg.result = '（已结束）'
-            }
-          }
-          // 新步骤开始 - 创建新的文本段
-          currentTextSegmentId = Date.now()
-          currentSegments.push({
-            type: 'text',
-            id: currentTextSegmentId,
-            content: ''
-          })
-
-          // 如果还没有助手消息，创建一个
-          if (assistantMsgIndex === -1) {
-            assistantMsgIndex = messages.value.length
-            messages.value.push({
-              id: Date.now(),
-              role: 'assistant',
-              content: '',
-              timestamp: new Date(),
-              segments: currentSegments
-            })
-          } else {
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
-          scrollToBottom()
-        } else if (event.type === 'chunk' && event.content) {
-          // 更新当前文本段
-          const textSegment = currentSegments.find(s => s.type === 'text' && s.id === currentTextSegmentId) as TextSegment | undefined
-          if (textSegment) {
-            textSegment.content += event.content
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
-          scrollToBottom()
-        } else if (event.type === 'tool_start') {
-          // 工具调用开始 - 创建工具段
-          currentSegments.push({
-            type: 'tool',
-            id: Date.now(),
-            tool: event.tool || '',
-            args: event.args || {},
-            status: 'running'
-          })
-
-          // 如果还没有助手消息，创建一个
-          if (assistantMsgIndex === -1) {
-            assistantMsgIndex = messages.value.length
-            messages.value.push({
-              id: Date.now(),
-              role: 'assistant',
-              content: '',
-              timestamp: new Date(),
-              segments: currentSegments
-            })
-          } else {
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
-          scrollToBottom()
-        } else if (event.type === 'tool_finish') {
-          // 工具调用结束 - 查找或创建工具段
-          const lastToolSegment = [...currentSegments].reverse().find(s => s.type === 'tool' && s.status === 'running') as ToolSegment | undefined
-          if (lastToolSegment) {
-            // 更新现有的运行中工具
-            lastToolSegment.result = event.result
-            lastToolSegment.status = 'done'
-          } else {
-            // 没有对应的 tool_start，直接添加为完成的工具
-            currentSegments.push({
-              type: 'tool',
-              id: Date.now(),
-              tool: event.tool || '',
-              args: {},
-              result: event.result,
-              status: 'done'
-            })
-          }
-          updateMessageSegments(assistantMsgIndex, currentSegments)
-          scrollToBottom()
-        } else if (event.type === 'context_usage' && event.context_usage) {
-          contextUsage.value = event.context_usage
-          if (event.context_usage.compressing) {
-            contextCompressing.value = true
-          } else {
-            contextCompressing.value = false
-          }
-        } else if (event.type === 'api_usage' && event.api_usage) {
-          apiUsage.value = event.api_usage
-        } else if (event.type === 'compression') {
-          contextCompressing.value = event.compression?.status !== 'done'
-        } else if (event.type === 'interrupt') {
-          pendingApproval.value = {
-            runId: event.run_id || '',
-            tool: event.tool || '未知工具',
-            args: event.args || {},
-            reason: event.reason || '此工具需要您的确认',
-          }
-        } else if (event.type === 'error') {
-          const cancelled = Boolean(event.error?.includes('已取消'))
-          if (cancelled) {
-            finalizeRunningToolSegments(currentSegments, true)
-            if (assistantMsgIndex >= 0) {
-              updateMessageSegments(assistantMsgIndex, currentSegments)
-            }
-            contextCompressing.value = false
-            pendingApproval.value = null
-          } else {
-            message.error(event.error || '发送消息失败')
-          }
-        } else if (event.type === 'done') {
-          finalizeRunningToolSegments(currentSegments)
-          // 兜底：若流式期间未收到任何文本（如未触发逐字流式），用最终内容渲染回复，
-          // 避免出现「思考完需刷新才看到回复」的问题。
-          if (event.content) {
-            const hasStreamedText = currentSegments.some(
-              (s) => s.type === 'text' && s.content && s.content.trim()
-            )
-            if (!hasStreamedText) {
-              const lastText = [...currentSegments].reverse().find(
-                (s) => s.type === 'text'
-              ) as TextSegment | undefined
-              if (lastText) {
-                lastText.content = event.content
-              } else {
-                currentSegments.push({ type: 'text', id: Date.now(), content: event.content })
-              }
-              if (assistantMsgIndex === -1) {
-                assistantMsgIndex = messages.value.length
-                messages.value.push({
-                  id: Date.now(),
-                  role: 'assistant',
-                  content: '',
-                  timestamp: new Date(),
-                  segments: currentSegments,
-                })
-              }
-            }
-          }
-          if (assistantMsgIndex >= 0) {
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
-          contextCompressing.value = false
-          // 完成
-          if (event.session_id) {
-            currentSessionId.value = event.session_id
-          }
-          // 对话结束后重新获取助手名字（可能在对话中更新了 IDENTITY.md）
-          configApi.getAgentInfo().then(agentInfo => {
-            if (agentInfo.name) {
-              assistantName.value = agentInfo.name
-            }
-          }).catch(() => {
-            // 忽略错误，保持当前名字
-          })
-          pendingApproval.value = null
-        }
+        const next = applyChatStreamEvent(event, streamCtx, {
+          assistantMsgIndex,
+          currentSegments,
+          currentTextSegmentId,
+        })
+        assistantMsgIndex = next.assistantMsgIndex
+        currentTextSegmentId = next.currentTextSegmentId
       },
       abortController.value.signal
     )
 
     await scrollToBottom()
   } catch (error: unknown) {
-    // 如果是用户主动取消，不显示错误
     if (error instanceof Error && error.name === 'AbortError') {
       console.log('用户取消了请求')
-      // 取消时保留已生成的内容
     } else {
       console.error('发送消息失败:', error)
       message.error('发送消息失败')
-      // 移除用户消息
       messages.value.pop()
     }
   } finally {
     loading.value = false
     abortController.value = null
+    refreshSessions().catch(() => {})
   }
 }
 
-const createNewSession = async () => {
+const applyFolderPath = async (path: string, mode: 'create' | 'rebind') => {
+  const trimmed = path.trim()
+  if (!trimmed) {
+    message.warning('请输入已存在的项目文件夹路径')
+    return
+  }
+  bindingFolder.value = true
   try {
-    const res = await sessionApi.create()
-    saveCurrentSession(res.session_id)
-    router.push({ name: 'chat', query: { session: res.session_id } })
-  } catch (error) {
-    message.error('新建会话失败')
+    if (mode === 'rebind' && currentSessionId.value) {
+      const session = await sessionApi.rebind(currentSessionId.value, trimmed)
+      boundWorkspacePath.value = session.workspace_path || trimmed
+    } else {
+      const res = await sessionApi.create(trimmed)
+      saveCurrentSession(res.session_id)
+      currentSessionId.value = res.session_id
+      boundWorkspacePath.value = trimmed
+      await router.replace({ name: 'chat', query: { session: res.session_id } })
+      await loadSessionHistory(res.session_id)
+    }
+    folderDraft.value = boundWorkspacePath.value || trimmed
+    saveLastWorkspacePath(folderDraft.value)
+    await refreshSessions()
+    if (currentSessionId.value) {
+      const latest = await sessionApi.get(currentSessionId.value)
+      setCurrentSession(latest)
+    }
+  } catch (error: unknown) {
+    const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    message.error(detail || (mode === 'rebind' ? '更换文件夹失败' : '绑定文件夹失败'))
+  } finally {
+    bindingFolder.value = false
+  }
+}
+
+const browseFolder = async () => {
+  const selected = await pickDirectory(folderDraft.value || boundWorkspacePath.value || '')
+  if (selected) folderDraft.value = selected
+}
+
+const confirmFolder = async () => {
+  await applyFolderPath(folderDraft.value, currentSessionId.value ? 'rebind' : 'create')
+}
+
+const createNewSession = async () => {
+  const path = (
+    currentProjectPath.value ||
+    folderDraft.value ||
+    boundWorkspacePath.value ||
+    getLastWorkspacePath()
+  ).trim()
+  if (!path) {
+    message.warning('请先选择项目文件夹')
+    return
+  }
+  await applyFolderPath(path, 'create')
+}
+
+const openWorkspaceFolder = async () => {
+  const path = boundWorkspacePath.value?.trim()
+  if (!path) {
+    await browseFolder()
+    if (folderDraft.value) {
+      await applyFolderPath(folderDraft.value, currentSessionId.value ? 'rebind' : 'create')
+    }
+    return
+  }
+  const result = await openDirectory(path)
+  if (result === 'copied') {
+    message.success('已复制路径')
+  } else if (result === 'failed') {
+    message.error('无法打开文件夹')
   }
 }
 </script>
 
 <template>
   <div class="chat-view">
+    <div class="workspace-bar">
+      <span class="workspace-label">工作区</span>
+      <span v-if="boundWorkspacePath" class="workspace-path" :title="boundWorkspacePath">{{ boundWorkspacePath }}</span>
+      <span v-else class="workspace-path muted">未绑定项目文件夹</span>
+      <Button size="small" type="link" :loading="bindingFolder" @click="openWorkspaceFolder">
+        {{ boundWorkspacePath ? '打开' : '选择' }}
+      </Button>
+    </div>
     <!-- 消息区域 -->
     <div class="chat-messages" ref="messagesContainer" @scroll="handleScroll">
       <!-- 初始化加载状态 -->
-      <div v-if="initializing" class="empty-state">
+      <div v-if="initializing || historyLoading" class="empty-state">
         <MailinLogo :size="100" logo-class="empty-icon loading" />
         <p class="empty-hint">加载中...</p>
       </div>
@@ -997,8 +862,8 @@ const createNewSession = async () => {
                       <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
                         <LoadingOutlined /> 执行中
                       </Tag>
+                      <Tag v-else-if="segment.status === 'error' || toolResultLooksLikeError(segment.result)" color="error" class="tool-tag">失败</Tag>
                       <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
-                      <Tag v-else-if="segment.status === 'error'" color="error" class="tool-tag">失败</Tag>
                       <span
                         v-if="segment.status !== 'running'"
                         class="collapse-indicator"
@@ -1006,6 +871,10 @@ const createNewSession = async () => {
                         {{ isToolExpanded(segment.id) ? '▼' : '▶' }}
                       </span>
                     </div>
+                    <p
+                      v-if="!isToolExpanded(segment.id) && toolResultLooksLikeError(segment.result)"
+                      class="tool-error-preview"
+                    >{{ toolErrorPreview(segment.result) }}</p>
                     <!-- 展开后显示入参和结果 -->
                     <div v-if="isToolExpanded(segment.id)" class="tool-details">
                       <!-- 入参 -->
@@ -1055,7 +924,21 @@ const createNewSession = async () => {
       <!-- 空状态 -->
       <div v-else class="empty-state">
         <MailinLogo :size="100" logo-class="empty-icon" />
-        <p class="empty-hint">发送消息开始对话</p>
+        <p class="empty-hint">{{ boundWorkspacePath ? '发送消息开始对话' : '先选择一个项目文件夹，再开始对话' }}</p>
+        <div v-if="!boundWorkspacePath" class="folder-picker">
+          <Input
+            v-model:value="folderDraft"
+            placeholder="项目文件夹的绝对路径"
+            @press-enter="confirmFolder"
+          />
+          <Button @click="browseFolder">
+            <FolderOpenOutlined />
+            浏览
+          </Button>
+          <Button type="primary" :loading="bindingFolder" @click="confirmFolder">
+            开始
+          </Button>
+        </div>
       </div>
 
       <!-- 加载指示器（助手消息组样式）- 等待响应时显示 -->
@@ -1078,82 +961,36 @@ const createNewSession = async () => {
       </div>
     </div>
 
-    <!-- 工具审批弹窗 -->
-    <Modal
-      :open="!!pendingApproval"
-      title="工具执行确认"
-      :closable="false"
-      :mask-closable="false"
-      :footer="null"
-      centered
-    >
-      <p v-if="pendingApproval">{{ pendingApproval.reason }}</p>
-      <p v-if="pendingApproval" class="approval-tool-name">
-        工具：<strong>{{ pendingApproval.tool }}</strong>
-      </p>
-      <pre v-if="pendingApproval && Object.keys(pendingApproval.args).length" class="approval-args">{{ formatToolArgs(pendingApproval.args) }}</pre>
-      <div class="approval-actions">
-        <Button danger @click="handleApproval('deny')">拒绝</Button>
-        <Button type="primary" @click="handleApproval('allow')">允许执行</Button>
-      </div>
-    </Modal>
+    <ToolApprovalModal :pending="pendingApproval" @decide="handleApproval" />
+    <AskUserModal :pending="pendingAskUser" @answer="handleAskUser" />
 
     <!-- 输入区域 -->
     <div class="chat-input-wrapper">
-      <div class="chat-input">
-        <!-- 上下文用量圆环 -->
-        <Tooltip
-          v-if="contextUsage"
-          placement="top"
-          overlay-class-name="context-usage-tooltip"
-          :overlay-inner-style="{ textAlign: 'left', padding: '8px 12px', maxWidth: '280px' }"
+      <ul v-if="sessionTodos.length" class="session-todos" aria-label="当前待办">
+        <li
+          v-for="item in sessionTodos"
+          :key="item.id"
+          class="session-todo"
+          :data-status="item.status"
         >
-          <template #title>
-            <div class="context-usage-tooltip-lines">
-              <div
-                v-for="(line, index) in contextUsageLines"
-                :key="index"
-                class="context-usage-tooltip-line"
-              >
-                {{ line }}
-              </div>
-            </div>
-          </template>
-          <div
-            class="context-usage-ring"
-            :class="[contextUsageLevel, { compressing: contextCompressing }]"
-            :aria-label="contextUsageTooltip"
-          >
-            <svg :width="RING_SIZE" :height="RING_SIZE" :viewBox="`0 0 ${RING_SIZE} ${RING_SIZE}`">
-              <circle
-                class="ring-track"
-                :cx="RING_SIZE / 2"
-                :cy="RING_SIZE / 2"
-                :r="RING_RADIUS"
-                fill="none"
-                stroke-width="3"
-              />
-              <circle
-                class="ring-progress"
-                :cx="RING_SIZE / 2"
-                :cy="RING_SIZE / 2"
-                :r="RING_RADIUS"
-                fill="none"
-                stroke-width="3"
-                :stroke="contextRingColor"
-                :stroke-dasharray="RING_CIRCUMFERENCE"
-                :stroke-dashoffset="contextRingOffset"
-                stroke-linecap="round"
-                :transform="`rotate(-90 ${RING_SIZE / 2} ${RING_SIZE / 2})`"
-              />
-            </svg>
-            <span class="ring-label">{{ contextUsagePercent }}%</span>
-          </div>
-        </Tooltip>
+          <span class="todo-status">{{
+            item.status === 'completed' ? '完成' : item.status === 'in_progress' ? '进行中' : '待办'
+          }}</span>
+          <span class="todo-content">{{ item.content }}</span>
+        </li>
+      </ul>
+      <div class="chat-input">
+        <ContextUsageRing
+          v-if="contextUsage"
+          :context-usage="contextUsage"
+          :api-usage="apiUsage"
+          :compressing="contextCompressing"
+        />
         <!-- 输入框 -->
         <Input.TextArea
           v-model:value="inputMessage"
-          placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+          :placeholder="boundWorkspacePath ? '输入消息... (Enter 发送, Shift+Enter 换行)' : '请先选择项目文件夹'"
+          :disabled="!boundWorkspacePath"
           :auto-size="{ minRows: 1, maxRows: 4 }"
           @press-enter="(e: KeyboardEvent) => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
         />
@@ -1201,6 +1038,41 @@ const createNewSession = async () => {
   width: 100%;
   box-sizing: border-box;
   background-color: var(--color-background);
+}
+
+.workspace-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px 0;
+  min-height: 36px;
+}
+
+.workspace-label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+}
+
+.workspace-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-path.muted {
+  color: var(--color-text-secondary);
+}
+
+.folder-picker {
+  display: flex;
+  gap: 8px;
+  width: min(560px, 90%);
+  margin-top: 8px;
 }
 
 .chat-messages {
@@ -1468,33 +1340,46 @@ const createNewSession = async () => {
   }
 }
 
-/* 工具审批 */
-.approval-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 16px;
-}
-
-.approval-args {
-  background: var(--color-surface);
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 12px;
-  max-height: 120px;
-  overflow: auto;
-  border: 1px solid var(--color-border);
-}
-
-.approval-tool-name {
-  margin: 8px 0;
-}
-
 /* 输入区域 */
 .chat-input-wrapper {
   padding: 16px 24px 32px;
   background-color: var(--color-surface);
   border-top: 1px solid var(--color-border);
+}
+
+.session-todos {
+  list-style: none;
+  margin: 0 auto 12px;
+  padding: 0;
+  max-width: 800px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-todo {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+.todo-status {
+  flex: none;
+  min-width: 48px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--color-text-muted, #8a8680);
+}
+
+.session-todo[data-status='in_progress'] .todo-status {
+  color: var(--color-primary, #1677ff);
+}
+
+.session-todo[data-status='completed'] .todo-content {
+  text-decoration: line-through;
+  opacity: 0.7;
 }
 
 .chat-input {
@@ -1503,62 +1388,6 @@ const createNewSession = async () => {
   align-items: center;
   max-width: 800px;
   margin: 0 auto;
-}
-
-.context-usage-ring {
-  position: relative;
-  flex-shrink: 0;
-  width: 40px;
-  height: 40px;
-  cursor: default;
-}
-
-.context-usage-ring.compressing {
-  animation: ring-pulse 1.2s ease-in-out infinite;
-}
-
-.context-usage-ring .ring-track {
-  stroke: var(--color-border);
-}
-
-.context-usage-ring .ring-progress {
-  transition: stroke-dashoffset 0.35s ease, stroke 0.25s ease;
-}
-
-.context-usage-ring .ring-label {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 9px;
-  font-weight: 600;
-  color: var(--color-text-secondary);
-  line-height: 1;
-  pointer-events: none;
-}
-
-.context-usage-ring.warning .ring-label {
-  color: #b8860b;
-}
-
-.context-usage-ring.danger .ring-label {
-  color: var(--color-primary);
-}
-
-@keyframes ring-pulse {
-  0%, 100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.75;
-    transform: scale(1.05);
-  }
-}
-
-.context-usage-tooltip-line + .context-usage-tooltip-line {
-  margin-top: 4px;
 }
 
 .chat-input :deep(.ant-input) {
@@ -1711,6 +1540,14 @@ const createNewSession = async () => {
 
 .tool-header:hover {
   opacity: 0.8;
+}
+
+.tool-error-preview {
+  margin: 6px 0 0;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-primary);
 }
 
 .tool-icon {

@@ -3,9 +3,12 @@ from __future__ import annotations
 import queue
 import threading
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 tool_session_id: ContextVar[str | None] = ContextVar("tool_session_id", default=None)
+tool_project_workspace: ContextVar[Path | None] = ContextVar("tool_project_workspace", default=None)
+tool_todos: ContextVar[list[dict[str, Any]] | None] = ContextVar("tool_todos", default=None)
 
 _lock = threading.Lock()
 _progress_queues: dict[str, queue.Queue] = {}
@@ -13,6 +16,14 @@ _progress_queues: dict[str, queue.Queue] = {}
 
 def set_tool_session(session_id: str | None) -> None:
     tool_session_id.set(session_id)
+
+
+def set_tool_project(path: Path | str | None) -> None:
+    tool_project_workspace.set(Path(path) if path else None)
+
+
+def get_project_workspace() -> Path | None:
+    return tool_project_workspace.get()
 
 
 def _get_progress_queue(session_id: str) -> queue.Queue:

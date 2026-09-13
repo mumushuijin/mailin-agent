@@ -13,18 +13,30 @@ class ShellPackage(ToolPackage):
         if not cfg.enabled:
             return []
 
-        doc = TOOL_DOCS["run_shell"]
+        run_doc = TOOL_DOCS["run_shell"]
+        proc_doc = TOOL_DOCS["process"]
         return [
             make_card(
                 package="shell",
                 name="run_shell",
                 handler=shell_handlers.run_shell,
-                summary=doc.summary,
-                description=doc.description,
+                summary=run_doc.summary,
+                description=run_doc.description,
                 display_name="Shell 命令",
                 display_icon="💻",
                 risk_level="moderate",
                 requires_confirmation=True,
+                sandbox_policy="workspace_only",
+            ),
+            make_card(
+                package="shell",
+                name="process",
+                handler=shell_handlers.process,
+                summary=proc_doc.summary,
+                description=proc_doc.description,
+                display_name="进程控制",
+                display_icon="📟",
+                risk_level="moderate",
                 sandbox_policy="workspace_only",
             ),
         ]

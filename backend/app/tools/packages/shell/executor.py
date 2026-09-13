@@ -11,9 +11,17 @@ from pathlib import Path
 
 from app.context.tool_cache import save_tool_result
 from app.core.settings import get_settings
-from app.storage.workspace import _resolve_safe_path, normalize_workspace_path
+from app.storage.workspace import assert_not_agent_space, _resolve_safe_path, normalize_workspace_path
+from app.tools.runtime import get_project_workspace
 from app.tools.packages.shell.env import build_subprocess_env
-from app.tools.packages.shell.process_registry import kill_session_processes, register, unregister
+from app.tools.packages.shell.process_registry import (
+    Job,
+    append_output,
+    kill_session_processes,
+    mark_job,
+    register,
+    unregister,
+)
 from app.tools.packages.shell.truncate import DEFAULT_MAX_BYTES, truncate_tail
 from app.tools.runtime import emit_tool_progress, tool_session_id
 
@@ -21,13 +29,17 @@ logger = logging.getLogger(__name__)
 
 
 def _workspace_root() -> Path:
-    return get_settings().workspace_path
+    root = get_project_workspace()
+    if root is None:
+        raise ValueError("未绑定项目工作区")
+    return root
 
 
 def resolve_workdir(workdir: str | None, default: str = ".") -> tuple[Path | None, str | None]:
     rel = normalize_workspace_path(workdir or default or ".")
     try:
         path = _resolve_safe_path(_workspace_root(), rel)
+        assert_not_agent_space(path)
     except ValueError as exc:
         return None, str(exc)
     path.mkdir(parents=True, exist_ok=True)
@@ -67,7 +79,7 @@ def execute_shell(
     except OSError as exc:
         return "", -1, f"无法启动命令: {exc}"
 
-    register(session_id, proc)
+    job = register(session_id, proc, command)
     output_parts: list[str] = []
     timed_out = False
     lock = threading.Lock()
@@ -75,6 +87,8 @@ def execute_shell(
     def _consume_line(line: str) -> None:
         with lock:
             output_parts.append(line)
+        if job is not None:
+            append_output(job, line)
         if on_line:
             on_line(line)
 
@@ -104,13 +118,69 @@ def execute_shell(
         proc.kill()
         timed_out = True
     finally:
-        unregister(session_id, proc)
+        unregister(session_id, proc, status="exited", exit_code=-1 if timed_out else (proc.returncode or 0))
+        if job is not None:
+            mark_job(
+                job,
+                status="exited",
+                exit_code=-1 if timed_out else (proc.returncode or 0),
+                error=f"命令超时（>{timeout}s）" if timed_out else None,
+            )
 
     reader.join(timeout=1)
     output = "".join(output_parts)
     if timed_out:
         return output, -1, f"命令超时（>{timeout}s）"
     return output, proc.returncode or 0, None
+
+
+def execute_shell_background(
+    command: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    session_id: str | None,
+) -> tuple[Job | None, str | None]:
+    """后台启动命令，立即返回作业。"""
+    creationflags = 0
+    preexec_fn = None
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        preexec_fn = os.setsid
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=creationflags,
+            preexec_fn=preexec_fn,
+        )
+    except OSError as exc:
+        return None, f"无法启动命令: {exc}"
+
+    job = register(session_id, proc, command)
+    if job is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return None, "无法登记后台作业（缺少 session）。"
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            append_output(job, line)
+        code = proc.wait()
+        mark_job(job, status="exited", exit_code=code)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return job, None
 
 
 def format_shell_result(

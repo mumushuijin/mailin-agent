@@ -32,6 +32,11 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayConfig> = {
   Edit: { name: '编辑文件', icon: '📝' },
   MultiEdit: { name: '批量编辑', icon: '📝' },
 
+  run_shell: { name: 'Shell 命令', icon: '💻' },
+  process: { name: '进程控制', icon: '📟' },
+  todo: { name: '待办', icon: '✅' },
+  ask_user: { name: '询问用户', icon: '❓' },
+
   // 计算工具
   python_calculator: { name: '计算器', icon: '🔢' },
 
@@ -128,4 +133,33 @@ export function formatToolResult(result: string | undefined): string {
   if (!result) return ''
   // 截断长结果
   return result.length > 500 ? result.slice(0, 500) + '...' : result
+}
+
+export function toolResultLooksLikeError(result?: string): boolean {
+  if (!result?.trim()) return false
+  const text = result.trim()
+  if (text.startsWith('❌')) return true
+  if (text.includes('未绑定项目工作区')) return true
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown }
+    if (parsed && typeof parsed === 'object' && parsed.error) return true
+  } catch {
+    return false
+  }
+  return false
+}
+
+export function toolErrorPreview(result?: string): string {
+  if (!result?.trim()) return ''
+  const text = result.trim()
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown }
+    if (parsed && typeof parsed === 'object' && parsed.error) {
+      return String(parsed.error)
+    }
+  } catch {
+    // 非 JSON 错误原文
+  }
+  const firstLine = text.split('\n')[0] || text
+  return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
 }

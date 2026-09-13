@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -59,8 +60,9 @@ def _elapsed_ms(started: float) -> float:
 def _run_with_timeout(fn: Callable[[], T], timeout: float | None) -> T:
     if timeout is None or timeout <= 0:
         return fn()
+    ctx = contextvars.copy_context()
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="resilience") as pool:
-        future = pool.submit(fn)
+        future = pool.submit(ctx.run, fn)
         try:
             return future.result(timeout=timeout)
         except FuturesTimeoutError as exc:

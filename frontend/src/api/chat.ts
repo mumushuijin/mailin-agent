@@ -73,6 +73,7 @@ export interface StreamEvent {
     | 'session_token_stats'
     | 'compression'
     | 'interrupt'
+    | 'todo'
     | 'background'
     | 'config_updated'
   content?: string
@@ -86,6 +87,11 @@ export interface StreamEvent {
   run_id?: string
   reason?: string
   tool_call_id?: string
+  kind?: string
+  prompt?: string
+  options?: string[]
+  allow_multiple?: boolean
+  todos?: Array<{ id: string; content: string; status: string }>
   background?: {
     kind: string
     message: string
@@ -104,20 +110,15 @@ export interface StreamEvent {
 export type StreamCallback = (event: StreamEvent) => void
 
 export const chatApi = {
-  // 流式发送消息 (SSE)
-  sendMessage: async (message: string, sessionId?: string) => {
-    return api.post('/chat/send', { message, session_id: sessionId })
-  },
-
-  // 同步发送消息（支持取消，超时时间 5 分钟）
-  sendMessageSync: async (
+  // 同步排障入口（产品对话走 WebSocket / SSE）
+  sendMessage: async (
     message: string,
     sessionId?: string,
     signal?: AbortSignal
   ): Promise<ChatResponse> => {
-    return api.post('/chat/send/sync', { message, session_id: sessionId }, {
+    return api.post('/chat/send', { message, session_id: sessionId }, {
       signal,
-      timeout: 300000, // 5 分钟超时
+      timeout: 300000,
     })
   },
 
@@ -251,8 +252,11 @@ export const chatApi = {
     chatWs.cancel()
   },
 
-  // 工具审批
+  // 工具审批 / 问人
   approveTool: (runId: string, decision: 'allow' | 'deny') => {
     chatWs.approve(runId, decision)
+  },
+  answerAskUser: (runId: string, answer: string | string[]) => {
+    chatWs.answerAskUser(runId, answer)
   },
 }

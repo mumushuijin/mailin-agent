@@ -6,7 +6,7 @@ from app.tools.packages.filesystem import handlers as fs
 from app.tools.packages.filesystem.descriptions import TOOL_DOCS
 
 
-def _card(name: str, handler, *, risk_level="safe", requires_confirmation=False):
+def _card(name: str, handler, *, risk_level="safe", requires_confirmation=False, concurrency="barrier"):
     doc = TOOL_DOCS[name]
     return make_card(
         package="filesystem",
@@ -19,6 +19,7 @@ def _card(name: str, handler, *, risk_level="safe", requires_confirmation=False)
         risk_level=risk_level,
         requires_confirmation=requires_confirmation,
         sandbox_policy="workspace_only",
+        concurrency=concurrency,
     )
 
 
@@ -50,12 +51,12 @@ _DISPLAY_ICONS = {
 class FilesystemPackage(ToolPackage):
     def build_cards(self, config: dict | None = None) -> list[ToolCard]:
         return [
-            _card("read_file", fs.read_file),
+            _card("read_file", fs.read_file, concurrency="safe"),
             _card("write_file", fs.write_file, risk_level="moderate", requires_confirmation=True),
             _card("replace_in_file", fs.replace_in_file, risk_level="moderate", requires_confirmation=True),
-            _card("list_directory", fs.list_directory),
-            _card("search_files", fs.search_files),
-            _card("glob_search", fs.glob_search),
+            _card("list_directory", fs.list_directory, concurrency="safe"),
+            _card("search_files", fs.search_files, concurrency="safe"),
+            _card("glob_search", fs.glob_search, concurrency="safe"),
             _card("mkdir", fs.mkdir),
             _card("move_file", fs.move_file, risk_level="moderate", requires_confirmation=True),
             _card("delete_file", fs.delete_file, risk_level="dangerous", requires_confirmation=True),

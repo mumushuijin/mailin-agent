@@ -17,7 +17,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from rank_bm25 import BM25Okapi
 
 from app.context.tool_cache import SKIP_CACHE_KWARG, is_tool_results_path
-from app.tools.card import ToolCard
+from app.tools.card import ToolCard, resolve_concurrency
 from app.tools.exposure import to_langchain_tool, to_langchain_tools
 from app.resilience import execute_sync, tool_error_json, tool_policy
 
@@ -31,14 +31,71 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 
 DEFAULT_HOT_TOOLS = (
     "read_file",
+    "write_file",
+    "replace_in_file",
+    "glob_search",
+    "search_files",
     "list_directory",
     "run_shell",
-    "memory_grep",
-    "memory_add",
-    "memory_consolidate",
-    "python_calculator",
-    "get_current_time",
+    "process",
+    "skill_list",
+    "skill_match",
+    "skill_read",
+    "todo",
+    "ask_user",
 )
+
+KERNEL_NINE_TOOLS = (
+    "read_file",
+    "write_file",
+    "replace_in_file",
+    "glob_search",
+    "search_files",
+    "run_shell",
+    "process",
+    "todo",
+    "ask_user",
+)
+
+_PRE_SKILLS_DEFAULT_HOT_TOOLS = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "replace_in_file",
+        "glob_search",
+        "search_files",
+        "list_directory",
+        "run_shell",
+        "process",
+        "todo",
+        "ask_user",
+    }
+)
+
+# 旧 workspace_defaults 拷贝出来的热列表；集合相等则升级为新默认。
+_LEGACY_DEFAULT_HOT_TOOLS = frozenset(
+    {
+        "read_file",
+        "list_directory",
+        "run_shell",
+        "memory_grep",
+        "memory_add",
+        "memory_consolidate",
+        "python_calculator",
+        "get_current_time",
+    }
+)
+
+
+def _resolve_hot_tools(hot_raw: Any) -> tuple[str, ...]:
+    if not isinstance(hot_raw, list) or not hot_raw:
+        return DEFAULT_HOT_TOOLS
+    hot_tools = tuple(str(n).strip() for n in hot_raw if str(n).strip())
+    if not hot_tools:
+        return DEFAULT_HOT_TOOLS
+    if frozenset(hot_tools) in {_LEGACY_DEFAULT_HOT_TOOLS, _PRE_SKILLS_DEFAULT_HOT_TOOLS}:
+        return DEFAULT_HOT_TOOLS
+    return hot_tools
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -76,11 +133,7 @@ class ToolSearchConfig:
         enabled_raw = raw.get("enabled", True)
         enabled = enabled_raw not in (False, "false", "0", "off")
 
-        hot_raw = raw.get("hot_tools")
-        if isinstance(hot_raw, list) and hot_raw:
-            hot_tools = tuple(str(n).strip() for n in hot_raw if str(n).strip())
-        else:
-            hot_tools = DEFAULT_HOT_TOOLS
+        hot_tools = _resolve_hot_tools(raw.get("hot_tools"))
 
         mcp_as_hot_raw = raw.get("mcp_as_hot", False)
         mcp_as_hot = mcp_as_hot_raw not in (False, "false", "0", "off")
@@ -706,50 +759,125 @@ def execute_single_tool_call(
     return name, invoke_card(card, args)
 
 
+def _parse_tool_call_args(tc: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+    name = tc.get("name", "")
+    args = tc.get("args") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return name, args, tc.get("id") or ""
+
+
+def _execute_parsed_call(
+    name: str,
+    args: dict[str, Any],
+    tool_call_id: str,
+    *,
+    cards: list[ToolCard],
+    config: ToolSearchConfig,
+    session_id: str,
+    process_for_cache,
+) -> ToolMessage:
+    display_name, content = execute_single_tool_call(name, args, cards=cards, config=config)
+
+    from app.agent.hooks import dispatch_transform_tool_result
+
+    transformed = dispatch_transform_tool_result(
+        tool_name=display_name,
+        arguments=args,
+        result=content,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+    )
+    if transformed is not None:
+        content = transformed
+
+    extra_kwargs: dict[str, Any] = {}
+    if display_name == "read_file":
+        file_path = args.get("file_path")
+        if isinstance(file_path, str) and is_tool_results_path(file_path):
+            extra_kwargs[SKIP_CACHE_KWARG] = True
+    msg = ToolMessage(
+        content=content,
+        tool_call_id=tool_call_id,
+        name=display_name,
+        additional_kwargs=extra_kwargs,
+    )
+    return process_for_cache(msg, session_id)
+
+
 def run_tool_calls(
     tool_calls: list[dict[str, Any]],
     session_id: str,
     *,
     process_for_cache,
 ) -> list[ToolMessage]:
-    """执行 AIMessage.tool_calls 列表，返回 ToolMessage（含 tool_call 解包展示名）。"""
+    """执行 AIMessage.tool_calls：连续 safe 调用并行，barrier 前 drain 且互不重叠。"""
+    from concurrent.futures import ThreadPoolExecutor
+
     cards, config = _cards_for_dispatch()
+    parsed: list[tuple[str, dict[str, Any], str]] = [_parse_tool_call_args(tc) for tc in tool_calls]
     messages: list[ToolMessage] = []
-    for tc in tool_calls:
-        name = tc.get("name", "")
-        args = tc.get("args") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        tool_call_id = tc.get("id") or ""
+    i = 0
+    while i < len(parsed):
+        name, args, _tc_id = parsed[i]
+        card = _find_card(cards, name)
+        if name == TOOL_CALL_NAME:
+            underlying, _, _ = resolve_tool_call(args, cards=cards, config=config)
+            card = _find_card(cards, underlying or "")
+            conc = resolve_concurrency(card, args.get("arguments") if isinstance(args.get("arguments"), dict) else args)
+        else:
+            conc = resolve_concurrency(card, args)
 
-        display_name, content = execute_single_tool_call(name, args, cards=cards, config=config)
+        if conc == "safe":
+            batch: list[tuple[str, dict[str, Any], str]] = []
+            while i < len(parsed):
+                n, a, tid = parsed[i]
+                c = _find_card(cards, n)
+                call_args = a
+                if n == TOOL_CALL_NAME:
+                    underlying, _, _ = resolve_tool_call(a, cards=cards, config=config)
+                    c = _find_card(cards, underlying or "")
+                    if isinstance(a.get("arguments"), dict):
+                        call_args = a["arguments"]
+                if resolve_concurrency(c, call_args) != "safe":
+                    break
+                batch.append(parsed[i])
+                i += 1
+            if len(batch) == 1:
+                n, a, tid = batch[0]
+                messages.append(
+                    _execute_parsed_call(
+                        n, a, tid, cards=cards, config=config, session_id=session_id, process_for_cache=process_for_cache
+                    )
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=min(8, len(batch))) as pool:
+                    futs = [
+                        pool.submit(
+                            _execute_parsed_call,
+                            n,
+                            a,
+                            tid,
+                            cards=cards,
+                            config=config,
+                            session_id=session_id,
+                            process_for_cache=process_for_cache,
+                        )
+                        for n, a, tid in batch
+                    ]
+                    messages.extend(fut.result() for fut in futs)
+            continue
 
-        # transform_tool_result：允许钩子在结果回传模型前改写（脱敏 / 摘要等）。
-        from app.agent.hooks import dispatch_transform_tool_result
-
-        transformed = dispatch_transform_tool_result(
-            tool_name=display_name,
-            arguments=args if isinstance(args, dict) else {},
-            result=content,
-            tool_call_id=tool_call_id,
-            session_id=session_id,
+        n, a, tid = parsed[i]
+        messages.append(
+            _execute_parsed_call(
+                n, a, tid, cards=cards, config=config, session_id=session_id, process_for_cache=process_for_cache
+            )
         )
-        if transformed is not None:
-            content = transformed
-
-        extra_kwargs: dict[str, Any] = {}
-        if display_name == "read_file":
-            file_path = args.get("file_path") if isinstance(args, dict) else None
-            if isinstance(file_path, str) and is_tool_results_path(file_path):
-                extra_kwargs[SKIP_CACHE_KWARG] = True
-        msg = ToolMessage(
-            content=content,
-            tool_call_id=tool_call_id,
-            name=display_name,
-            additional_kwargs=extra_kwargs,
-        )
-        messages.append(process_for_cache(msg, session_id))
+        i += 1
     return messages

@@ -14,19 +14,10 @@ def main():
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--reload", action="store_true")
 
-    eval_parser = sub.add_parser("eval", help="运行评估套件")
-    eval_parser.add_argument("--suite", default="smoke")
-
     args = parser.parse_args()
     settings = get_settings()
     setup_logging(level=settings.log_level, log_format=settings.log_format)
     init_workspace(settings)
-
-    if args.command == "eval":
-        from eval.runner import run_suite
-
-        run_suite(args.suite)
-        return
 
     host = getattr(args, "host", None) or settings.host
     port = getattr(args, "port", None) or settings.port

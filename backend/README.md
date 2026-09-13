@@ -23,7 +23,6 @@ uv run mailin serve --reload
 可选依赖：
 
 ```bash
-uv sync --extra eval   # 评估套件（ragas 等）
 uv sync --extra mcp    # MCP 协议支持
 ```
 
@@ -43,9 +42,8 @@ uv sync --extra mcp    # MCP 协议支持
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat/send` | 同步对话（JSON） |
-| POST | `/api/chat/send/sync` | 同步对话（强类型响应） |
-| POST | `/api/chat/send/stream` | SSE 流式对话 |
+| POST | `/api/chat/send` | 同步对话（排障 / 强类型 ChatResponse） |
+| POST | `/api/chat/send/stream` | SSE 流式对话（WebSocket 失败时的降级路径） |
 
 ### Session
 
@@ -103,8 +101,7 @@ app/
 ├── maintenance/         # 后台维护调度
 ├── storage/             # 工作区 + SQLite checkpoint
 └── core/                # 设置、LLM、遥测、异常
-cli/                     # `mailin serve` / `mailin eval` 命令行
-eval/                    # 评估子系统
+cli/                     # `mailin serve` 命令行
 tests/                   # pytest 测试
 ```
 
@@ -118,13 +115,17 @@ tests/                   # pytest 测试
 
 | 包 | config_key | 能力 |
 |----|------------|------|
-| filesystem | `filesystem` | 读写工作区文件 |
-| memory | `memory` | 记忆 grep / add / consolidate |
-| calculator | `calculator` | Python 计算器 |
-| datetime | `datetime` | 当前时间 |
-| web_search | `web_search` | 网络搜索（Tavily / DuckDuckGo） |
-| MCP | `mcp` | 外部 MCP 服务器工具 |
+| filesystem | `filesystem` | 读写、精确替换、glob、正则 grep |
+| shell | `shell` | `run_shell`（可后台）与 `process`（列/等/杀） |
+| session | `session` | `todo` 会话待办、`ask_user` 向用户提问 |
+| memory | `memory` | 记忆 grep / add / consolidate（默认冷工具） |
+| calculator | `calculator` | Python 计算器（默认冷工具） |
+| datetime | `datetime` | 当前时间（默认冷工具） |
+| web_search | `web_search` | 网络搜索（默认冷工具） |
+| MCP | `mcp` | 外部 MCP 服务器工具（默认冷工具） |
 | tool_search | `tool_search` | 按需检索工具（hot tools + 搜索） |
+
+默认热绑定（无需 `tool_search`）：`read_file`、`write_file`、`replace_in_file`、`glob_search`、`search_files`、`list_directory`、`run_shell`、`process`、`todo`、`ask_user`。关闭 MCP 后这九件内核工具仍可完成「读测试 → 改断言 → 跑测试」。
 
 **后台维护**（服务启动后自动运行）：
 
@@ -135,26 +136,30 @@ tests/                   # pytest 测试
 
 ## 工作区
 
-运行时数据在 `workspace/`，默认模板在 `workspace_defaults/`，首次启动自动复制。
+麦林区分三空间：`workspace_defaults/` 只作模板；`workspace/` 是 Agent 自有空间（人格、记忆、会话、全局技能、`CONFIG.json`）；对话前指定的项目文件夹才是文件/shell 沙箱。
 
 ```
-workspace/
-├── CONFIG.json          # 模型、工具开关、上下文预算、MCP 配置
-├── bootstraps/          # Agent 身份与人格
-│   ├── IDENTITY.md
+backend/workspace_defaults/          # 只读模板
+├── CONFIG.json
+├── bootstraps/                      # SOUL / USER / MEMORY / HEARTBEAT
+└── project/AGENTS.md                # 项目规则种子
+
+backend/workspace/                  # Agent 自有空间（不是对话 cwd）
+├── CONFIG.json
+├── bootstraps/
 │   ├── SOUL.md
-│   ├── AGENTS.md
-│   ├── HEARTBEAT.md
-│   ├── BOOTSTRAP.md
 │   ├── USER.md
-│   ├── MEMORY.md        # 长期记忆
-│   ├── memory_sections.json
-│   └── user_sections.json
-├── memory/              # 每日工作记忆（热层）
-├── sessions/            # 会话索引 + LangGraph checkpoint
-├── tool_results/        # 工具执行结果缓存
-├── skills/              # Agent 技能定义
-└── artifacts/           # Agent 生成的产物（HTML、报告等）
+│   ├── MEMORY.md
+│   └── HEARTBEAT.md
+├── memory/
+├── sessions/
+└── skills/
+
+<项目工作区>/                       # 用户指定，先绑定再对话
+├── AGENTS.md
+└── .mailin/                         # 建议加入项目 .gitignore
+    ├── tool_results/
+    └── artifacts/
 ```
 
 `CONFIG.json` 关键字段：
@@ -177,14 +182,6 @@ workspace/
 | `LANGCHAIN_TRACING_V2` | 启用 LangSmith 追踪 |
 | `LANGCHAIN_API_KEY` | LangSmith API 密钥 |
 | `LANGCHAIN_PROJECT` | LangSmith 项目名（默认 `mailin`） |
-
-## 评估
-
-```bash
-uv run mailin eval --suite smoke
-```
-
-评估数据集位于 `eval/datasets/{suite}/cases.jsonl`。
 
 ## 测试
 

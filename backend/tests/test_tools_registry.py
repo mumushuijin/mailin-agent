@@ -51,6 +51,8 @@ def test_registry_enables_web_search_when_configured():
             "datetime": False,
             "web_search": True,
             "shell": False,
+            "session": False,
+            "skills": False,
         }
     }
     registry = ToolRegistry(config=config)
@@ -84,11 +86,9 @@ def test_get_tools_returns_langchain_tools():
     # tool_search 启用时延时工具经桥接暴露，不直接 bind
     assert "glob_search" not in tool_names or "tool_search" not in tool_names
     if "tool_search" in tool_names:
-        assert "memory_grep" in tool_names
         assert "memory_list" not in tool_names
     else:
         assert "glob_search" in tool_names
-        assert "memory_grep" in tool_names
 
 
 def test_web_search_formats_results(monkeypatch):

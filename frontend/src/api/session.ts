@@ -5,6 +5,9 @@ export interface Session {
   id: string
   created_at: number
   updated_at: number
+  workspace_path?: string | null
+  title: string
+  title_source?: 'placeholder' | 'auto' | 'user'
 }
 
 // OpenAI 标准消息格式
@@ -33,14 +36,25 @@ export interface SessionHistory {
   context_usage?: ContextUsage | null
   api_usage?: ApiUsage | null
   session_token_stats?: SessionTokenStats | null
+  todos?: Array<{ id: string; content: string; status: string }> | null
 }
 
 export const sessionApi = {
   list: async () => {
     return api.get<{ sessions: Session[] }>('/session/list')
   },
-  create: async () => {
-    return api.post<{ session_id: string }>('/session/create')
+  create: async (workspacePath: string) => {
+    return api.post<{ session_id: string }>('/session/create', {
+      workspace_path: workspacePath,
+    })
+  },
+  rebind: async (id: string, workspacePath: string) => {
+    return api.post<Session>(`/session/${id}/workspace`, {
+      workspace_path: workspacePath,
+    })
+  },
+  rename: async (id: string, title: string) => {
+    return api.patch<Session>(`/session/${id}/title`, { title })
   },
   get: async (id: string) => {
     return api.get<Session>(`/session/${id}`)

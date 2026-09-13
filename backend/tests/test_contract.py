@@ -30,8 +30,8 @@ def test_agent_info(client):
     assert "name" in r.json()
 
 
-def test_session_crud(client):
-    r = client.post("/api/session/create")
+def test_session_crud(client, tmp_path):
+    r = client.post("/api/session/create", json={"workspace_path": str(tmp_path)})
     assert r.status_code == 200
     session_id = r.json()["session_id"]
 
@@ -49,6 +49,11 @@ def test_session_crud(client):
 
     r = client.delete(f"/api/session/{session_id}")
     assert r.status_code == 200
+
+
+def test_duplicate_sync_chat_route_removed(client):
+    r = client.post("/api/chat/send/sync", json={"message": "hi"})
+    assert r.status_code == 404
 
 
 def test_memory_list(client):
