@@ -28,12 +28,18 @@ def test_mcp_health_no_servers(monkeypatch):
     import app.maintenance.tasks.mcp_health as mcp_mod
 
     mcp_mod._last_health_snapshot = None
+    calls = {"ensure": 0}
+    monkeypatch.setattr(
+        "app.maintenance.tasks.mcp_health.ensure_mcp_connected",
+        lambda **_kwargs: calls.__setitem__("ensure", calls["ensure"] + 1) or False,
+    )
     monkeypatch.setattr(
         "app.maintenance.tasks.mcp_health.build_mcp_status_payload",
         lambda: {"configured_servers": [], "servers": []},
     )
     result = check_mcp_health()
     assert result is None
+    assert calls["ensure"] == 1
 
 
 def test_mcp_health_disconnected(monkeypatch):

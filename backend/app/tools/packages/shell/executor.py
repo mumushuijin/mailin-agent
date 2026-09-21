@@ -12,12 +12,13 @@ from pathlib import Path
 from app.context.tool_cache import save_tool_result
 from app.core.settings import get_settings
 from app.storage.workspace import assert_not_agent_space, _resolve_safe_path, normalize_workspace_path
+from app.tools.packages.filesystem.snapshots import is_snapshot_sidecar_path
 from app.tools.runtime import get_project_workspace
 from app.tools.packages.shell.env import build_subprocess_env
 from app.tools.packages.shell.process_registry import (
     Job,
     append_output,
-    kill_session_processes,
+    kill_job,
     mark_job,
     register,
     unregister,
@@ -40,6 +41,8 @@ def resolve_workdir(workdir: str | None, default: str = ".") -> tuple[Path | Non
     try:
         path = _resolve_safe_path(_workspace_root(), rel)
         assert_not_agent_space(path)
+        if is_snapshot_sidecar_path(path, _workspace_root()):
+            return None, "禁止将 cwd 设为 snapshot sidecar"
     except ValueError as exc:
         return None, str(exc)
     path.mkdir(parents=True, exist_ok=True)
@@ -105,11 +108,14 @@ def execute_shell(
         while reader.is_alive():
             if time.monotonic() > deadline:
                 timed_out = True
-                kill_session_processes(session_id)
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                # 仅终止当前 job 的进程树，不影响同 session 其他作业
+                if job is not None:
+                    kill_job(job)
+                else:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
                 break
             reader.join(timeout=0.05)
         if not timed_out:

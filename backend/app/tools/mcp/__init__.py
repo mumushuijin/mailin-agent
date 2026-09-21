@@ -16,6 +16,7 @@ from app.tools.mcp.lifecycle import (
     ensure_mcp_connected,
     get_mcp_server,
     get_mcp_status,
+    get_mcp_status_snapshot,
     reload_mcp_servers,
     shutdown_mcp_servers,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "shutdown_mcp_servers",
     "reload_mcp_servers",
     "get_mcp_status",
+    "get_mcp_status_snapshot",
     "get_mcp_cards",
     "get_mcp_server",
     "build_mcp_status_payload",

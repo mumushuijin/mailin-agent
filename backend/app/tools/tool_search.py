@@ -6,12 +6,14 @@ Catalog 每轮从当前 ToolCard 列表无状态重建，避免与会话注册�
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
 import time
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
@@ -23,6 +25,14 @@ from app.tools.exposure import to_langchain_tool, to_langchain_tools
 from app.resilience import execute_sync, tool_error_json, tool_policy
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+def _submit_with_context(pool: Executor, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Future[_T]:
+    """提交到线程池时复制 ContextVar（含项目工作区绑定），避免并行 safe 工具丢上下文。"""
+    ctx = contextvars.copy_context()
+    return pool.submit(ctx.run, fn, *args, **kwargs)
 
 TOOL_SEARCH_NAME = "tool_search"
 TOOL_DESCRIBE_NAME = "tool_describe"
@@ -701,7 +711,35 @@ def resolve_tool_call(
     return name, raw_args, None
 
 
-def invoke_card(card: ToolCard, arguments: dict[str, Any]) -> str:
+def invoke_card(
+    card: ToolCard,
+    arguments: dict[str, Any],
+    *,
+    tool_call_id: str = "",
+    session_id: str | None = None,
+    run_id: str | None = None,
+    approval_granted: bool = False,
+    allowlist_matched: bool = False,
+    skip_policy_gate: bool = False,
+) -> str:
+    if not skip_policy_gate:
+        from app.tools.policy import gate_before_handler
+
+        decision = gate_before_handler(
+            card,
+            arguments,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            run_id=run_id,
+            approval_granted=approval_granted,
+            allowlist_matched=allowlist_matched,
+        )
+        if decision.outcome == "deny":
+            return tool_error_json(decision.to_tool_error_message())
+        if decision.outcome == "needs_approval":
+            # 共同执行入口 fail-closed：未经 tools 节点审批不得进入 handler
+            return tool_error_json(decision.to_tool_error_message())
+
     def _run() -> str:
         if card.source == "plugin":
             result = card.handler(**(arguments or {}))
@@ -771,12 +809,25 @@ def execute_single_tool_call(
     *,
     cards: list[ToolCard] | None = None,
     config: ToolSearchConfig | None = None,
+    tool_call_id: str = "",
+    session_id: str | None = None,
+    run_id: str | None = None,
+    approval_granted: bool = False,
+    allowlist_matched: bool = False,
 ) -> tuple[str, str]:
     """执行一次工具调用。返回 (展示用工具名, 结果文本)。"""
     if cards is None or config is None:
         cards, config = _cards_for_dispatch()
     elif config is None:
         config = load_tool_search_config()
+
+    invoke_kwargs = {
+        "tool_call_id": tool_call_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "approval_granted": approval_granted,
+        "allowlist_matched": allowlist_matched,
+    }
 
     if name == TOOL_CALL_NAME:
         underlying, underlying_args, err = resolve_tool_call(args, cards=cards, config=config)
@@ -785,7 +836,7 @@ def execute_single_tool_call(
         card = _find_card(cards, underlying or "")
         if card is None:
             return underlying or name, _format_tool_not_found_error(underlying or name, cards, config)
-        return underlying or name, invoke_card(card, underlying_args)
+        return underlying or name, invoke_card(card, underlying_args, **invoke_kwargs)
 
     if is_bridge_tool(name):
         if name == TOOL_SEARCH_NAME:
@@ -797,7 +848,7 @@ def execute_single_tool_call(
     card = _find_card(cards, name)
     if card is None:
         return name, _format_tool_not_found_error(name, cards, config)
-    return name, invoke_card(card, args)
+    return name, invoke_card(card, args, **invoke_kwargs)
 
 
 def _parse_tool_call_args(tc: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
@@ -813,6 +864,29 @@ def _parse_tool_call_args(tc: dict[str, Any]) -> tuple[str, dict[str, Any], str]
     return name, args, tc.get("id") or ""
 
 
+def _terminal_tool_message(
+    name: str,
+    tool_call_id: str,
+    *,
+    status: str,
+    reason_code: str,
+    message: str,
+) -> ToolMessage:
+    content = json.dumps(
+        {"error": message, "reason_code": reason_code},
+        ensure_ascii=False,
+    )
+    return ToolMessage(
+        content=content,
+        tool_call_id=tool_call_id,
+        name=name or "tool",
+        additional_kwargs={
+            "tool_status": status,
+            "reason_code": reason_code,
+        },
+    )
+
+
 def _execute_parsed_call(
     name: str,
     args: dict[str, Any],
@@ -822,33 +896,78 @@ def _execute_parsed_call(
     config: ToolSearchConfig,
     session_id: str,
     process_for_cache,
+    run_id: str | None = None,
+    approval_granted: bool = True,
+    allowlist_matched: bool = False,
 ) -> ToolMessage:
-    display_name, content = execute_single_tool_call(name, args, cards=cards, config=config)
+    # 并行 ThreadPool 可能丢失 ContextVar；按 session 重新绑定项目工作区
+    from app.storage.project import bind_session_runtime
 
-    from app.agent.hooks import dispatch_transform_tool_result
+    bind_session_runtime(session_id)
+    try:
+        display_name, content = execute_single_tool_call(
+            name,
+            args,
+            cards=cards,
+            config=config,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            run_id=run_id,
+            approval_granted=approval_granted,
+            allowlist_matched=allowlist_matched,
+        )
 
-    transformed = dispatch_transform_tool_result(
-        tool_name=display_name,
-        arguments=args,
-        result=content,
-        tool_call_id=tool_call_id,
-        session_id=session_id,
-    )
-    if transformed is not None:
-        content = transformed
+        from app.agent.hooks import dispatch_transform_tool_result
 
-    extra_kwargs: dict[str, Any] = {}
-    if display_name == "read_file":
-        file_path = args.get("file_path")
-        if isinstance(file_path, str) and is_tool_results_path(file_path):
-            extra_kwargs[SKIP_CACHE_KWARG] = True
-    msg = ToolMessage(
-        content=content,
-        tool_call_id=tool_call_id,
-        name=display_name,
-        additional_kwargs=extra_kwargs,
-    )
-    return process_for_cache(msg, session_id)
+        transformed = dispatch_transform_tool_result(
+            tool_name=display_name,
+            arguments=args,
+            result=content,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+        )
+        if transformed is not None:
+            content = transformed
+
+        status = "completed"
+        reason_code = "ok"
+        try:
+            parsed_content = json.loads(content) if isinstance(content, str) else None
+        except json.JSONDecodeError:
+            parsed_content = None
+        if isinstance(parsed_content, dict) and parsed_content.get("error"):
+            status = "failed"
+            reason_code = str(parsed_content.get("reason_code") or "tool_error")
+
+        extra_kwargs: dict[str, Any] = {
+            "tool_status": status,
+            "reason_code": reason_code,
+        }
+        if display_name == "read_file":
+            file_path = args.get("file_path")
+            if isinstance(file_path, str) and is_tool_results_path(file_path):
+                extra_kwargs[SKIP_CACHE_KWARG] = True
+        msg = ToolMessage(
+            content=content,
+            tool_call_id=tool_call_id,
+            name=display_name,
+            additional_kwargs=extra_kwargs,
+        )
+        return process_for_cache(msg, session_id)
+    except Exception as exc:
+        logger.exception(
+            "工具调用结算失败 tool=%s tool_call_id=%s session=%s",
+            name,
+            tool_call_id,
+            session_id,
+        )
+        return _terminal_tool_message(
+            name,
+            tool_call_id,
+            status="failed",
+            reason_code="tool_error",
+            message=f"工具执行失败：{type(exc).__name__}",
+        )
 
 
 def run_tool_calls(
@@ -856,15 +975,67 @@ def run_tool_calls(
     session_id: str,
     *,
     process_for_cache,
+    run_id: str | None = None,
+    timeout_seconds: float | None = None,
+    cancel_event=None,
 ) -> list[ToolMessage]:
     """执行 AIMessage.tool_calls：连续 safe 调用并行，barrier 前 drain 且互不重叠。"""
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
 
     cards, config = _cards_for_dispatch()
     parsed: list[tuple[str, dict[str, Any], str]] = [_parse_tool_call_args(tc) for tc in tool_calls]
     messages: list[ToolMessage] = []
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+
+    def _stop_reason() -> str | None:
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled"
+        if deadline is not None and time.monotonic() >= deadline:
+            return "batch_timeout"
+        return None
+
+    def _append_unstarted(start_index: int, reason_code: str) -> None:
+        status = "cancelled" if reason_code == "cancelled" else "failed"
+        message = "工具调用已取消。" if reason_code == "cancelled" else "工具批次超时，调用未开始。"
+        for pending_name, _pending_args, pending_id in parsed[start_index:]:
+            messages.append(
+                _terminal_tool_message(
+                    pending_name,
+                    pending_id,
+                    status=status,
+                    reason_code=reason_code,
+                    message=message,
+                )
+            )
+
+    def _wait_for_futures(futures: set) -> tuple[set, set]:
+        if not futures:
+            return set(), set()
+        if deadline is None and cancel_event is None:
+            return wait(futures)
+
+        done: set = set()
+        pending = set(futures)
+        while pending:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            timeout = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                timeout = min(timeout, remaining)
+            done_now, pending = wait(pending, timeout=timeout)
+            done.update(done_now)
+        return done, pending
+
     i = 0
     while i < len(parsed):
+        stop_reason = _stop_reason()
+        if stop_reason:
+            _append_unstarted(i, stop_reason)
+            break
+
         name, args, _tc_id = parsed[i]
         card = _find_card(cards, name)
         if name == TOOL_CALL_NAME:
@@ -891,16 +1062,9 @@ def run_tool_calls(
                 i += 1
             if len(batch) == 1:
                 n, a, tid = batch[0]
-                messages.append(
-                    _execute_parsed_call(
-                        n, a, tid, cards=cards, config=config, session_id=session_id, process_for_cache=process_for_cache
-                    )
-                )
-            else:
-                with ThreadPoolExecutor(max_workers=min(8, len(batch))) as pool:
-                    futs = [
-                        pool.submit(
-                            _execute_parsed_call,
+                if deadline is None:
+                    messages.append(
+                        _execute_parsed_call(
                             n,
                             a,
                             tid,
@@ -908,16 +1072,136 @@ def run_tool_calls(
                             config=config,
                             session_id=session_id,
                             process_for_cache=process_for_cache,
+                            run_id=run_id,
                         )
-                        for n, a, tid in batch
-                    ]
-                    messages.extend(fut.result() for fut in futs)
+                    )
+                else:
+                    pool = ThreadPoolExecutor(max_workers=1)
+                    future = _submit_with_context(
+                        pool,
+                        _execute_parsed_call,
+                        n,
+                        a,
+                        tid,
+                        cards=cards,
+                        config=config,
+                        session_id=session_id,
+                        process_for_cache=process_for_cache,
+                        run_id=run_id,
+                    )
+                    pending_single = {future}
+                    try:
+                        done_single, pending_single = _wait_for_futures(pending_single)
+                        if done_single:
+                            try:
+                                messages.append(future.result())
+                            except Exception as exc:
+                                messages.append(
+                                    _terminal_tool_message(
+                                        n,
+                                        tid,
+                                        status="failed",
+                                        reason_code="tool_error",
+                                        message=f"工具执行失败：{type(exc).__name__}",
+                                    )
+                                )
+                        else:
+                            future.cancel()
+                            code = _stop_reason() or "batch_timeout"
+                            messages.append(
+                                _terminal_tool_message(
+                                    n,
+                                    tid,
+                                    status="cancelled" if code == "cancelled" else "failed",
+                                    reason_code=code,
+                                    message=(
+                                        "工具调用已取消。"
+                                        if code == "cancelled"
+                                        else "工具批次超时，调用未完成。"
+                                    ),
+                                )
+                            )
+                    finally:
+                        pool.shutdown(wait=not pending_single, cancel_futures=True)
+            else:
+                pool = ThreadPoolExecutor(max_workers=min(8, len(batch)))
+                futures = {
+                    _submit_with_context(
+                        pool,
+                        _execute_parsed_call,
+                        n,
+                        a,
+                        tid,
+                        cards=cards,
+                        config=config,
+                        session_id=session_id,
+                        process_for_cache=process_for_cache,
+                        run_id=run_id,
+                    ): (n, tid)
+                    for n, a, tid in batch
+                }
+                pending = set(futures)
+                done: set = set()
+                try:
+                    done, pending = _wait_for_futures(set(futures))
+                    results: dict[str, ToolMessage] = {}
+                    for future in done:
+                        n, tid = futures[future]
+                        try:
+                            results[tid] = future.result()
+                        except Exception as exc:
+                            logger.exception(
+                                "safe 工具 future 失败 tool=%s tool_call_id=%s",
+                                n,
+                                tid,
+                            )
+                            results[tid] = _terminal_tool_message(
+                                n,
+                                tid,
+                                status="failed",
+                                reason_code="tool_error",
+                                message=f"工具执行失败：{type(exc).__name__}",
+                            )
+
+                    stop_reason = _stop_reason()
+                    if pending:
+                        stop_reason = stop_reason or "batch_timeout"
+                    for future in pending:
+                        n, tid = futures[future]
+                        future.cancel()
+                        code = stop_reason or "batch_timeout"
+                        results[tid] = _terminal_tool_message(
+                            n,
+                            tid,
+                            status="cancelled" if code == "cancelled" else "failed",
+                            reason_code=code,
+                            message=(
+                                "工具调用已取消。"
+                                if code == "cancelled"
+                                else "工具批次超时，调用未完成。"
+                            ),
+                        )
+                    for _n, _a, tid in batch:
+                        messages.append(results[tid])
+                finally:
+                    pool.shutdown(wait=not pending, cancel_futures=True)
             continue
 
         n, a, tid = parsed[i]
+        stop_reason = _stop_reason()
+        if stop_reason:
+            _append_unstarted(i, stop_reason)
+            break
         messages.append(
             _execute_parsed_call(
-                n, a, tid, cards=cards, config=config, session_id=session_id, process_for_cache=process_for_cache
+                n,
+                a,
+                tid,
+                cards=cards,
+                config=config,
+                session_id=session_id,
+                process_for_cache=process_for_cache,
+                run_id=run_id,
             )
         )
         i += 1

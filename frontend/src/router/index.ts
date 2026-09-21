@@ -15,8 +15,13 @@ const router = createRouter({
     {
       path: '/settings',
       component: () => import('../views/SettingsView.vue'),
-      redirect: '/settings/config',
+      redirect: '/settings/markdown',
       children: [
+        {
+          path: 'markdown',
+          name: 'settings-markdown',
+          component: () => import('../views/SettingsMarkdownView.vue'),
+        },
         {
           path: 'config',
           name: 'settings-config',
@@ -31,6 +36,11 @@ const router = createRouter({
           path: 'skills',
           name: 'settings-skills',
           component: () => import('../views/SkillsView.vue'),
+        },
+        {
+          path: 'mcp',
+          name: 'settings-mcp',
+          component: () => import('../views/McpView.vue'),
         },
       ],
     },
@@ -49,6 +59,10 @@ const router = createRouter({
     {
       path: '/skills',
       redirect: '/settings/skills',
+    },
+    {
+      path: '/mcp',
+      redirect: '/settings/mcp',
     },
   ],
 })

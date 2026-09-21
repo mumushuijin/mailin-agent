@@ -272,7 +272,30 @@ TOOL_DOCS: dict[str, ToolDoc] = {
 
 风险限制：
 - 仅可删除工作区沙箱内的路径
-- 不可恢复；非空目录无法删除
+- 非空目录无法删除；受保护 mutation 会生成 snapshot，可用 undo_file_change 回滚
 - 高风险操作：必须在用户明确授权后使用，勿批量删除""",
+    ),
+    "undo_file_change": ToolDoc(
+        summary="按 snapshot_id 回滚同会话内的一次文件变更",
+        description="""一句话功能：根据 write/replace/move/delete 返回的 snapshot_id，将文件恢复到变更前状态。
+
+适用场景：
+- 用户要求撤销刚才的写入、替换、移动或删除
+- 工具结果中出现 `[snapshot_id=...]` 且用户确认回滚
+
+不适用场景：
+- 没有 snapshot_id
+- 文件已被用户或后续工具再次修改（会返回冲突）
+- 其他会话创建的 snapshot（跨 session 拒绝）
+
+参数说明：
+- snapshot_id（必填）：opaque 快照 id，来自 mutation 工具结果
+
+返回格式：
+- 成功：说明已撤销的操作与路径
+- 失败：冲突、过期、跨 session 或不存在
+
+风险限制：
+- 仅同 session 可用；冲突时绝不覆盖新内容""",
     ),
 }

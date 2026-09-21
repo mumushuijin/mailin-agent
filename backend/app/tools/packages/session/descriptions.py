@@ -33,25 +33,30 @@ TOOL_DOCS: dict[str, ToolDoc] = {
 - 非法 status 或找不到 id 时返回错误且不修改列表""",
     ),
     "ask_user": ToolDoc(
-        summary="遇到歧义时向用户提问（选项或短文本），等待回答后再继续",
-        description="""一句话功能：暂停当前回合，向用户提出一个澄清问题，得到回答后再继续。不要猜测答案。
+        summary="遇到歧义时向用户提问，或交还用户结束当前回合",
+        description="""一句话功能：暂停当前回合，向用户提出澄清问题或交还控制权。不要猜测答案。
 
 适用场景：
-- 需求有多种合理解释
+- 需求有多种合理解释（mode=answer_and_continue）
 - 需要用户在几个方案中选择
 - 缺关键信息无法安全执行
+- 已给出足够信息，应停止并交还用户（mode=handoff_and_stop）
 
 不适用场景：
 - 高风险命令审批（系统会单独弹出允许/拒绝）
 - 能靠读文件或跑测试自行确认的问题
 
 参数说明：
-- question（必填）：要问用户的问题
-- options（可选）：选项列表；为空则接受短文本
+- question（必填）：要问用户的问题或交还说明
+- options（可选）：选项列表；为空则接受短文本（仅 answer_and_continue）
 - allow_multiple（可选，默认 false）：是否允许多选
+- mode（可选，默认 answer_and_continue）：
+  - answer_and_continue：用户回答后继续本回合
+  - handoff_and_stop：用户确认已看到信息后结束本回合，不执行后续副作用工具
 
 返回格式：
-- 用户的选择或短回答
+- answer_and_continue：用户的选择或短回答
+- handoff_and_stop：交还确认后的终止说明
 - 用户取消/超时则返回错误，不要当作默认选项""",
     ),
 }

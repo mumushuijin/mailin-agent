@@ -28,6 +28,20 @@ class SessionPackage(ToolPackage):
                 description=ask_doc.description,
                 display_name="询问用户",
                 display_icon="❓",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "allow_multiple": {"type": "boolean"},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["answer_and_continue", "handoff_and_stop"],
+                            "description": "answer_and_continue 回答后继续；handoff_and_stop 交还用户并结束本回合",
+                        },
+                    },
+                    "required": ["question"],
+                },
             ),
         ]
 

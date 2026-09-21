@@ -31,6 +31,13 @@ def run_shell(
     if not command:
         return "命令不能为空。"
 
+    # 执行入口再次校验硬拒绝（与 policy gate 双保险；denied 时绝不建进程）
+    from app.tools.packages.shell.guards import check_command_guard
+
+    blocked = check_command_guard(command, safety_mode=cfg.safety_mode)
+    if blocked:
+        return blocked
+
     cwd, err = resolve_workdir(workdir, cfg.workdir)
     if err:
         return f"工作目录无效: {err}"
@@ -38,6 +45,8 @@ def run_shell(
 
     env = build_subprocess_env(cfg.extra_env)
     session_id = tool_session_id.get()
+    if not session_id:
+        return "缺少 session，拒绝启动 shell 进程。"
 
     if background:
         job, error = execute_shell_background(command, cwd=cwd, env=env, session_id=session_id)

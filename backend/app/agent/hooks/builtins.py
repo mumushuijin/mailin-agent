@@ -48,6 +48,10 @@ def hooks_enabled() -> bool:
 
 
 def _guard_run_shell(tool_name: str = "", args: dict | None = None, **kwargs) -> dict | None:
+    """Shell 观察钩子：硬拒绝已迁至 policy gate，此处只记录命中情况，不 block。
+
+    保留函数与注册，避免自定义钩子/测试依赖断裂；不再产生重复审批或双重 interrupt。
+    """
     if tool_name != "run_shell":
         return None
     from app.tools.packages.shell.config import load_shell_config
@@ -57,7 +61,11 @@ def _guard_run_shell(tool_name: str = "", args: dict | None = None, **kwargs) ->
     cfg = load_shell_config()
     reason = check_command_guard(str(command), safety_mode=cfg.safety_mode)
     if reason:
-        return {"action": "block", "message": reason}
+        logger.info(
+            "[hook] run_shell guard hit (observe-only) session=%s reason=%s",
+            kwargs.get("session_id"),
+            reason,
+        )
     return None
 
 

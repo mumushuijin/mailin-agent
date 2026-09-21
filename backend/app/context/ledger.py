@@ -114,6 +114,7 @@ def cancel_tool_calls_message(
     ai: AIMessage,
     *,
     reason: str = "未执行：工具调用已取消。",
+    reason_code: str = "cancelled",
 ) -> list[ToolMessage]:
     """为 AIMessage 上每个 tool_call 生成配对的取消型 ToolMessage。"""
     cancelled: list[ToolMessage] = []
@@ -126,6 +127,10 @@ def cancel_tool_calls_message(
                 content=reason,
                 tool_call_id=tc_id,
                 name=tc.get("name"),
+                additional_kwargs={
+                    "tool_status": "cancelled",
+                    "reason_code": reason_code,
+                },
             )
         )
     return cancelled
@@ -160,6 +165,7 @@ def repair_orphan_tool_calls(
     messages: list[BaseMessage],
     *,
     reason: str = "未执行：历史工具调用未完成（可能因步数截断）。",
+    reason_code: str = "orphan_repair",
 ) -> list[BaseMessage]:
     """修补账本中「有 tool_calls、无对应 ToolMessage」的畸形记录。"""
     if not messages:
@@ -207,6 +213,10 @@ def repair_orphan_tool_calls(
                     content=reason,
                     tool_call_id=tc_id,
                     name=tc.get("name"),
+                    additional_kwargs={
+                        "tool_status": "repaired",
+                        "reason_code": reason_code,
+                    },
                 )
             )
             answered_ids.add(tc_id)

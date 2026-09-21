@@ -72,7 +72,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _load_workspace_config(workspace: Path) -> dict[str, Any]:
-    path = workspace / "CONFIG.json"
+    from app.storage.workspace import config_file_path
+
+    path = config_file_path()
     if not path.exists():
         return {}
     try:
@@ -83,7 +85,12 @@ def _load_workspace_config(workspace: Path) -> dict[str, Any]:
 
 def load_skill_config(workspace: Path | None = None) -> dict[str, Any]:
     workspace = workspace or get_settings().workspace_path
-    full = _load_workspace_config(workspace)
+    try:
+        from app.tools.registry import load_full_config
+
+        full = load_full_config(workspace)
+    except Exception:
+        full = _load_workspace_config(workspace)
     raw = full.get("skills", {})
     config = dict(DEFAULT_SKILL_CONFIG)
     if isinstance(raw, dict):
@@ -495,11 +502,13 @@ class SkillService:
         return 0, ""
 
     def _write_skill_config(self, config: dict[str, Any]) -> None:
-        path = self.workspace / "CONFIG.json"
+        from app.config.persistence import atomic_write_json
+        from app.storage.workspace import config_file_path
+
+        path = config_file_path()
         full = _load_workspace_config(self.workspace)
         full["skills"] = config
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(full, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, full)
         clear_skill_cache()
 
     def set_enabled(self, skill_id: str, enabled: bool, *, source: SkillSource | None = None) -> SkillToggleResponse:

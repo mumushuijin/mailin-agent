@@ -1,6 +1,12 @@
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from app.agent.iteration_budget import DEFAULT_MAX_STEPS, IterationBudget
+from app.agent.iteration_budget import (
+    DEFAULT_MAX_STEPS,
+    HARD_MAX_STEPS,
+    MIN_MAX_STEPS,
+    IterationBudget,
+    clamp_max_steps,
+)
 from app.agent.nodes.agent import _needs_grace_summary, _run_grace_summary
 from app.agent.nodes.router import effective_step, should_continue
 from langgraph.graph import END
@@ -9,19 +15,19 @@ from langgraph.graph import END
 def test_budget_resets_on_new_human_message():
     state = {
         "step": 10,
-        "max_steps": 24,
+        "max_steps": DEFAULT_MAX_STEPS,
         "messages": [HumanMessage(content="新问题")],
     }
     budget = IterationBudget.from_state(state)
     assert budget.used == 0
-    assert budget.remaining == 24
+    assert budget.remaining == DEFAULT_MAX_STEPS
     assert not budget.exhausted
 
 
 def test_budget_tracks_step_during_tool_loop():
     state = {
         "step": 3,
-        "max_steps": 24,
+        "max_steps": DEFAULT_MAX_STEPS,
         "messages": [
             HumanMessage(content="hi"),
             AIMessage(content="", tool_calls=[{"id": "c1", "name": "read_file", "args": {}}]),
@@ -30,11 +36,11 @@ def test_budget_tracks_step_during_tool_loop():
     }
     budget = IterationBudget.from_state(state)
     assert budget.used == 3
-    assert budget.remaining == 21
+    assert budget.remaining == DEFAULT_MAX_STEPS - 3
 
 
 def test_budget_exhausted_at_max_steps():
-    budget = IterationBudget(used=24, max_total=24)
+    budget = IterationBudget(used=DEFAULT_MAX_STEPS, max_total=DEFAULT_MAX_STEPS)
     assert budget.exhausted
     assert budget.remaining == 0
 
@@ -44,6 +50,21 @@ def test_default_max_steps():
     assert budget.max_total == DEFAULT_MAX_STEPS
 
 
+def test_clamp_max_steps_hard_ceiling_and_floor():
+    assert clamp_max_steps(None) == DEFAULT_MAX_STEPS
+    assert clamp_max_steps(1) == MIN_MAX_STEPS
+    assert clamp_max_steps(9999) == HARD_MAX_STEPS
+    assert clamp_max_steps("48") == 48
+    assert clamp_max_steps("bad") == DEFAULT_MAX_STEPS
+
+
+def test_budget_clamps_oversized_state_max_steps():
+    budget = IterationBudget.from_state(
+        {"step": 0, "max_steps": 10_000, "messages": [HumanMessage(content="hi")]}
+    )
+    assert budget.max_total == HARD_MAX_STEPS
+
+
 def test_effective_step_matches_budget_used():
     state = {"step": 2, "max_steps": 6, "messages": [HumanMessage(content="q"), AIMessage(content="a")]}
     assert effective_step(state) == 2
@@ -51,8 +72,8 @@ def test_effective_step_matches_budget_used():
 
 def test_router_routes_to_tools_when_pending_tool_calls():
     state = {
-        "step": 24,
-        "max_steps": 24,
+        "step": DEFAULT_MAX_STEPS,
+        "max_steps": DEFAULT_MAX_STEPS,
         "messages": [
             HumanMessage(content="hi"),
             AIMessage(content="", tool_calls=[{"id": "c1", "name": "list_directory", "args": {}}]),
@@ -63,8 +84,8 @@ def test_router_routes_to_tools_when_pending_tool_calls():
 
 def test_router_ends_without_pending_tool_calls():
     state = {
-        "step": 24,
-        "max_steps": 24,
+        "step": DEFAULT_MAX_STEPS,
+        "max_steps": DEFAULT_MAX_STEPS,
         "messages": [HumanMessage(content="hi"), AIMessage(content="done")],
     }
     assert should_continue(state) == END

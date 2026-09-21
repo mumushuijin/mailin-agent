@@ -8,11 +8,9 @@ from app.core.settings import get_settings
 
 
 def load_agent_config(workspace: Path | None = None) -> dict:
-    workspace = workspace or get_settings().workspace_path
-    config_path = workspace / "CONFIG.json"
-    if not config_path.exists():
-        return {}
-    return json.loads(config_path.read_text(encoding="utf-8"))
+    from app.tools.registry import load_full_config
+
+    return load_full_config(workspace)
 
 
 @lru_cache

@@ -2,7 +2,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.agent.nodes.router import effective_step, should_continue
 from app.context.engine import assemble_context
-from app.context.ledger import repair_orphan_tool_calls
+from app.context.ledger import cancel_tool_calls_message, repair_orphan_tool_calls
 from app.storage.workspace import normalize_workspace_path
 
 
@@ -53,6 +53,22 @@ def test_repair_orphan_tool_calls_backfills_tool_messages():
     assert len(repaired) == 3
     assert isinstance(repaired[2], ToolMessage)
     assert repaired[2].tool_call_id == "c1"
+    assert repaired[2].additional_kwargs["reason_code"] == "orphan_repair"
+
+
+def test_cancelled_tool_calls_keep_distinct_reason_code():
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {"id": "c1", "name": "read_file", "args": {}},
+            {"id": "c2", "name": "list_directory", "args": {}},
+        ],
+    )
+
+    cancelled = cancel_tool_calls_message(ai)
+
+    assert [msg.tool_call_id for msg in cancelled] == ["c1", "c2"]
+    assert all(msg.additional_kwargs["reason_code"] == "cancelled" for msg in cancelled)
 
 
 def test_assemble_keeps_previous_turn_final_answer():

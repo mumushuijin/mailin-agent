@@ -47,6 +47,8 @@ class ChatMessage(BaseModel):
     tool_result_ref: str | None = None
     tool_result_preview: str | None = None
     tool_result_truncated: bool = False
+    tool_reason_code: str | None = None
+    tool_reason_code: str | None = None
 
 
 class SessionHistory(BaseModel):

@@ -2,7 +2,16 @@ import type { Ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { configApi } from '@/api/config'
 import type { ApiUsage, ContextUsage, StreamEvent } from '@/api/chat'
-import type { ChatUiMessage, MessageSegment, PendingApproval, PendingAskUser, SessionTodoItem, TextSegment, ToolSegment } from '@/types/chat-ui'
+import type {
+  ChatUiMessage,
+  MessageSegment,
+  NarrativeNode,
+  PendingApproval,
+  PendingAskUser,
+  SessionTodoItem,
+  TextSegment,
+  ToolSegment,
+} from '@/types/chat-ui'
 import { toolResultLooksLikeError } from '@/utils/toolDisplay'
 
 export interface ChatStreamState {
@@ -19,7 +28,32 @@ export interface ChatStreamState {
   saveCurrentSession: (sessionId: string) => void
   updateMessageSegments: (msgIndex: number, segments: MessageSegment[]) => void
   finalizeRunningToolSegments: (segments: MessageSegment[], cancelled?: boolean) => void
+  markRunTerminal: (status: 'done' | 'cancelled' | 'error' | 'handoff') => void
   scrollToBottom: () => void
+}
+
+export function buildNarrativeNodes(segments: MessageSegment[]): NarrativeNode[] {
+  const nodes: NarrativeNode[] = []
+
+  for (const segment of segments) {
+    if (segment.type === 'text') {
+      nodes.push({
+        id: `text:${segment.id}`,
+        kind: segment.presentation === 'system' ? 'system_result' : 'agent_text',
+        segmentId: segment.id,
+      })
+      continue
+    }
+
+    nodes.push({
+      id: `tool:${segment.id}`,
+      kind: 'action',
+      segmentId: segment.id,
+      status: segment.status,
+    })
+  }
+
+  return nodes
 }
 
 export function applyChatStreamEvent(
@@ -97,12 +131,30 @@ export function applyChatStreamEvent(
     ensureAssistant()
     ctx.scrollToBottom()
   } else if (event.type === 'tool_finish') {
+    const resultText = event.result || ''
+    const snapshotMatch = resultText.match(/\[snapshot_id=([0-9a-f]+)\]/i)
+    const snapshotId = snapshotMatch?.[1] || null
+    const policyDenied = /\[policy_denied\]/i.test(resultText)
+    let undoStatus: ToolSegment['undoStatus'] = snapshotId ? 'available' : null
+    if (/跨 session|其他会话/i.test(resultText)) undoStatus = 'cross_session'
+    else if (/冲突/i.test(resultText)) undoStatus = 'conflict'
+    else if (/过期|不存在/i.test(resultText) && event.tool === 'undo_file_change') {
+      undoStatus = /过期/.test(resultText) ? 'expired' : 'unavailable'
+    }
+
     const lastToolSegment = [...currentSegments]
       .reverse()
       .find((s) => s.type === 'tool' && s.status === 'running') as ToolSegment | undefined
     if (lastToolSegment) {
       lastToolSegment.result = event.result
-      lastToolSegment.status = toolResultLooksLikeError(event.result) ? 'error' : 'done'
+      lastToolSegment.reasonCode = event.reason_code || null
+      lastToolSegment.status = policyDenied
+        ? 'policy_denied'
+        : toolResultLooksLikeError(event.result)
+          ? 'error'
+          : 'done'
+      lastToolSegment.snapshotId = snapshotId
+      lastToolSegment.undoStatus = undoStatus
     } else {
       currentSegments.push({
         type: 'tool',
@@ -110,7 +162,14 @@ export function applyChatStreamEvent(
         tool: event.tool || '',
         args: {},
         result: event.result,
-        status: toolResultLooksLikeError(event.result) ? 'error' : 'done',
+        reasonCode: event.reason_code || null,
+        status: policyDenied
+          ? 'policy_denied'
+          : toolResultLooksLikeError(event.result)
+            ? 'error'
+            : 'done',
+        snapshotId,
+        undoStatus,
       })
     }
     ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
@@ -131,36 +190,61 @@ export function applyChatStreamEvent(
     ctx.activeStage.value = 'waiting_user'
     if (event.kind === 'ask_user') {
       ctx.pendingApproval.value = null
+      const mode =
+        event.mode === 'handoff_and_stop' ? 'handoff_and_stop' : 'answer_and_continue'
       ctx.pendingAskUser.value = {
         runId: event.run_id || '',
         prompt: event.prompt || event.reason || '需要你补充一点信息',
         options: event.options || [],
         allowMultiple: Boolean(event.allow_multiple),
+        interruptId: event.interrupt_id,
+        toolCallId: event.tool_call_id,
+        mode,
+        terminalOnAck: Boolean(event.terminal_on_ack) || mode === 'handoff_and_stop',
       }
     } else {
       ctx.pendingAskUser.value = null
+      const preview = event.preview as PendingApproval['preview'] | undefined
       ctx.pendingApproval.value = {
         runId: event.run_id || '',
         tool: event.tool || '未知工具',
         args: event.args || {},
         reason: event.reason || '此工具需要您的确认',
+        toolCallId: event.tool_call_id,
+        reasonCode: event.reason_code,
+        preview: preview || null,
       }
     }
   } else if (event.type === 'error') {
-    const cancelled = Boolean(event.error?.includes('已取消'))
-    if (cancelled) {
-      ctx.finalizeRunningToolSegments(currentSegments, true)
-      if (assistantMsgIndex >= 0) {
-        ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
-      }
-      ctx.contextCompressing.value = false
-      ctx.activeStage.value = null
-      ctx.pendingApproval.value = null
-      ctx.pendingAskUser.value = null
-    } else {
+    const cancelled = Boolean(event.cancelled || event.error?.includes('已取消'))
+    ctx.markRunTerminal(cancelled ? 'cancelled' : 'error')
+    ctx.finalizeRunningToolSegments(currentSegments, true)
+    if (assistantMsgIndex >= 0) {
+      ctx.updateMessageSegments(assistantMsgIndex, currentSegments)
+    }
+    ctx.contextCompressing.value = false
+    ctx.activeStage.value = null
+    ctx.pendingApproval.value = null
+    ctx.pendingAskUser.value = null
+    if (!cancelled) {
       message.error(event.error || '发送消息失败')
     }
   } else if (event.type === 'done') {
+    // 审批等待中若误收到普通 done，不要清掉弹窗（后端也不应在 pending interrupt 时发 done）
+    const isHandoffDone = Boolean(event.handoff || event.terminal_reason === 'handoff')
+    if (
+      (ctx.pendingApproval.value || ctx.pendingAskUser.value) &&
+      !event.cancelled &&
+      !isHandoffDone
+    ) {
+      return { assistantMsgIndex, currentTextSegmentId }
+    }
+    const terminal = event.cancelled
+      ? 'cancelled'
+      : isHandoffDone
+        ? 'handoff'
+        : 'done'
+    ctx.markRunTerminal(terminal)
     ctx.finalizeRunningToolSegments(currentSegments)
     if (event.content) {
       const hasStreamedText = currentSegments.some(

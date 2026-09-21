@@ -8,7 +8,8 @@ import pytest
 
 from app.tools.card import make_card
 from app.tools.context import build_tools_disclosure_context
-from app.tools.mcp.status import build_mcp_status_payload
+from app.tools.mcp.bridge import set_mcp_cards
+from app.tools.mcp.status import build_mcp_status_card, build_mcp_status_payload, mcp_status_handler
 from app.tools.registry import ToolRegistry, clear_tools_cache
 from app.tools.tool_search import (
     TOOL_SEARCH_NAME,
@@ -35,8 +36,10 @@ def _config_with_mcp_card():
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
+    set_mcp_cards([])
     clear_tools_cache()
     yield
+    set_mcp_cards([])
     clear_tools_cache()
 
 
@@ -146,9 +149,93 @@ def test_mcp_status_deferred_and_searchable():
     assert "mcp_status" in matches
 
 
+def test_tool_call_resolves_mcp_status_with_registry_config(monkeypatch):
+    cfg = _config_with_mcp_card()
+    from app.agent.nodes import tools as tools_node
+    from app.tools.mcp.bridge import set_mcp_cards
+
+    set_mcp_cards([])
+    registry = ToolRegistry(config=cfg)
+    monkeypatch.setattr(tools_node, "get_registry", lambda: registry)
+
+    card, arguments, error = tools_node._resolve_effective_card_and_args(
+        "tool_call",
+        {"name": "mcp_status", "arguments": {}},
+    )
+
+    assert error is None
+    assert card is not None
+    assert card.name == "mcp_status"
+    assert arguments == {}
+
+
 def test_mcp_status_payload_shape():
     from app.tools.mcp.bridge import set_mcp_cards
 
     set_mcp_cards([])
     payload = build_mcp_status_payload()
     assert "usage_hint" in payload
+
+
+def test_mcp_status_card_is_safe_for_read_batch():
+    card = build_mcp_status_card()
+    assert card.concurrency == "safe"
+    assert card.risk_level == "safe"
+
+
+def test_mcp_status_payload_is_bounded(monkeypatch):
+    from app.tools.mcp import status as status_module
+    from app.tools.mcp.bridge import set_mcp_cards
+    from app.tools.mcp.types import McpServerStatus, McpStatusSnapshot, McpTransport
+
+    class _Card:
+        def __init__(self, index: int):
+            self.name = f"mcp_tool_{index}"
+            self.package = "mcp-demo"
+            self.summary = "x" * 500
+
+    monkeypatch.setattr(
+        status_module,
+        "get_mcp_status_snapshot",
+        lambda: McpStatusSnapshot(
+            statuses=[
+                McpServerStatus(
+                    name="demo",
+                    connected=True,
+                    transport=McpTransport.HTTP,
+                    tool_count=100,
+                    tool_names=[f"tool_{i}" for i in range(100)],
+                )
+            ],
+            captured_at=1_000.0,
+            source="test",
+        ),
+    )
+    monkeypatch.setattr(status_module, "load_mcp_catalog", lambda: type("C", (), {"servers": {"demo": object()}, "revision": 0})())
+    set_mcp_cards([_Card(i) for i in range(100)])
+
+    payload = build_mcp_status_payload()
+
+    assert payload["servers"][0]["tool_count"] == 100
+    assert len(payload["servers"][0]["tools"]) == 40
+    assert payload["servers"][0]["tools_truncated"] is True
+    assert len(payload["registered_tools"]) == 40
+    assert payload["registered_tools_total"] == 100
+    assert payload["registered_tools_truncated"] is True
+    assert len(payload["registered_tools"][0]["summary"]) == 160
+    assert payload["snapshot_source"] == "test"
+    assert payload["snapshot_stale"] is False
+
+
+def test_mcp_status_handler_returns_structured_error(monkeypatch):
+    from app.tools.mcp import status as status_module
+
+    monkeypatch.setattr(
+        status_module,
+        "build_mcp_status_payload",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    payload = json.loads(mcp_status_handler())
+    assert payload["error"] == "mcp_status_unavailable"
+    assert payload["registered_tools"] == []

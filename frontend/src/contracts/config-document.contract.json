@@ -1,0 +1,1770 @@
+{
+  "schema_version": 1,
+  "ordinary_modules": [
+    "agent",
+    "tools",
+    "middleware",
+    "skills",
+    "telemetry",
+    "context"
+  ],
+  "user_visible_modules": [
+    "agent",
+    "tools"
+  ],
+  "enums": {
+    "enforcement_mode": [
+      "audit",
+      "enforce"
+    ],
+    "mcp_transport": [
+      "stdio",
+      "streamable-http",
+      "sse"
+    ]
+  },
+  "modules": {
+    "agent": {
+      "key": "agent",
+      "display_name": "Agent",
+      "defaults": {
+        "model": "qwen-plus",
+        "temperature": 0.7,
+        "max_steps": 48,
+        "graph_version": "0.1.0-mvp"
+      },
+      "json_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "model": {
+            "default": "qwen-plus",
+            "title": "Model",
+            "type": "string"
+          },
+          "temperature": {
+            "default": 0.7,
+            "title": "Temperature",
+            "type": "number"
+          },
+          "max_steps": {
+            "default": 48,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "graph_version": {
+            "default": "0.1.0-mvp",
+            "title": "Graph Version",
+            "type": "string"
+          }
+        },
+        "title": "AgentModule",
+        "type": "object"
+      }
+    },
+    "tools": {
+      "key": "tools",
+      "display_name": "工具",
+      "defaults": {
+        "enforcement_mode": "enforce",
+        "filesystem": true,
+        "shell": true,
+        "memory": true,
+        "session": true,
+        "skills": true,
+        "calculator": true,
+        "datetime": true,
+        "web_search": false,
+        "mcp": true,
+        "tool_search": true
+      },
+      "json_schema": {
+        "$defs": {
+          "FilesystemPackageModel": {
+            "additionalProperties": true,
+            "properties": {
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "snapshots": {
+                "$ref": "#/$defs/SnapshotConfigModel"
+              }
+            },
+            "title": "FilesystemPackageModel",
+            "type": "object"
+          },
+          "ShellCommandPolicyModel": {
+            "additionalProperties": true,
+            "properties": {
+              "executable": {
+                "title": "Executable",
+                "type": "string"
+              },
+              "args_prefix": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Args Prefix",
+                "type": "array"
+              },
+              "allowed_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Allowed Roots",
+                "type": "array"
+              },
+              "capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Capabilities",
+                "type": "array"
+              }
+            },
+            "required": [
+              "executable"
+            ],
+            "title": "ShellCommandPolicyModel",
+            "type": "object"
+          },
+          "ShellPackageModel": {
+            "additionalProperties": true,
+            "properties": {
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "default_timeout": {
+                "default": 60,
+                "title": "Default Timeout",
+                "type": "integer"
+              },
+              "max_timeout": {
+                "default": 300,
+                "title": "Max Timeout",
+                "type": "integer"
+              },
+              "safety_mode": {
+                "default": true,
+                "title": "Safety Mode",
+                "type": "boolean"
+              },
+              "workdir": {
+                "default": ".",
+                "title": "Workdir",
+                "type": "string"
+              },
+              "auto_approve_patterns": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Auto Approve Patterns",
+                "type": "array"
+              },
+              "policy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ShellPolicyModel"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
+              "extra_env": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "title": "Extra Env",
+                "type": "object"
+              }
+            },
+            "title": "ShellPackageModel",
+            "type": "object"
+          },
+          "ShellPolicyModel": {
+            "additionalProperties": true,
+            "properties": {
+              "allowed_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Allowed Roots",
+                "type": "array"
+              },
+              "capabilities": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Capabilities",
+                "type": "array"
+              },
+              "commands": {
+                "items": {
+                  "$ref": "#/$defs/ShellCommandPolicyModel"
+                },
+                "title": "Commands",
+                "type": "array"
+              }
+            },
+            "title": "ShellPolicyModel",
+            "type": "object"
+          },
+          "SnapshotConfigModel": {
+            "additionalProperties": true,
+            "properties": {
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "retention": {
+                "$ref": "#/$defs/SnapshotRetentionModel"
+              }
+            },
+            "title": "SnapshotConfigModel",
+            "type": "object"
+          },
+          "SnapshotRetentionModel": {
+            "additionalProperties": true,
+            "properties": {
+              "max_count": {
+                "default": 50,
+                "title": "Max Count",
+                "type": "integer"
+              },
+              "max_age_seconds": {
+                "default": 604800,
+                "title": "Max Age Seconds",
+                "type": "integer"
+              },
+              "max_total_bytes": {
+                "default": 209715200,
+                "title": "Max Total Bytes",
+                "type": "integer"
+              }
+            },
+            "title": "SnapshotRetentionModel",
+            "type": "object"
+          },
+          "ToolSearchPackageModel": {
+            "additionalProperties": true,
+            "properties": {
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "hot_tools": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Hot Tools",
+                "type": "array"
+              },
+              "search_default_limit": {
+                "default": 5,
+                "title": "Search Default Limit",
+                "type": "integer"
+              },
+              "max_search_limit": {
+                "default": 20,
+                "title": "Max Search Limit",
+                "type": "integer"
+              },
+              "mcp_as_hot": {
+                "default": false,
+                "title": "Mcp As Hot",
+                "type": "boolean"
+              }
+            },
+            "title": "ToolSearchPackageModel",
+            "type": "object"
+          }
+        },
+        "additionalProperties": true,
+        "properties": {
+          "enforcement_mode": {
+            "default": "enforce",
+            "enum": [
+              "audit",
+              "enforce"
+            ],
+            "title": "Enforcement Mode",
+            "type": "string"
+          },
+          "filesystem": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/FilesystemPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Filesystem"
+          },
+          "shell": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/ShellPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Shell"
+          },
+          "memory": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Memory"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Session"
+          },
+          "skills": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Skills"
+          },
+          "calculator": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Calculator"
+          },
+          "datetime": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Datetime"
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": false,
+            "title": "Web Search"
+          },
+          "mcp": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Mcp"
+          },
+          "tool_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/ToolSearchPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Tool Search"
+          }
+        },
+        "title": "ToolsModule",
+        "type": "object"
+      }
+    },
+    "middleware": {
+      "key": "middleware",
+      "display_name": "中间件",
+      "defaults": {},
+      "json_schema": {
+        "additionalProperties": true,
+        "description": "占位模块：当前运行时未消费，保留对象形状供后续扩展。",
+        "properties": {},
+        "title": "MiddlewareModule",
+        "type": "object"
+      }
+    },
+    "skills": {
+      "key": "skills",
+      "display_name": "技能",
+      "defaults": {
+        "global_roots": [
+          "skills"
+        ],
+        "project_enabled": true,
+        "catalog_max_items": 80,
+        "catalog_max_chars": 12000,
+        "cache_ttl_seconds": 5,
+        "disabled": []
+      },
+      "json_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "global_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Global Roots",
+            "type": "array"
+          },
+          "project_enabled": {
+            "default": true,
+            "title": "Project Enabled",
+            "type": "boolean"
+          },
+          "catalog_max_items": {
+            "default": 80,
+            "title": "Catalog Max Items",
+            "type": "integer"
+          },
+          "catalog_max_chars": {
+            "default": 12000,
+            "title": "Catalog Max Chars",
+            "type": "integer"
+          },
+          "cache_ttl_seconds": {
+            "default": 5,
+            "title": "Cache Ttl Seconds",
+            "type": "integer"
+          },
+          "disabled": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Disabled",
+            "type": "array"
+          }
+        },
+        "title": "SkillsModule",
+        "type": "object"
+      }
+    },
+    "telemetry": {
+      "key": "telemetry",
+      "display_name": "遥测",
+      "defaults": {
+        "langsmith_enabled": false,
+        "sample_rate": 0.01
+      },
+      "json_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "langsmith_enabled": {
+            "default": false,
+            "title": "Langsmith Enabled",
+            "type": "boolean"
+          },
+          "sample_rate": {
+            "default": 0.01,
+            "title": "Sample Rate",
+            "type": "number"
+          }
+        },
+        "title": "TelemetryModule",
+        "type": "object"
+      }
+    },
+    "context": {
+      "key": "context",
+      "display_name": "上下文",
+      "defaults": {
+        "max_tokens": 128000,
+        "compress_threshold_ratio": 0.75,
+        "bootstrap": {
+          "single_file_max_chars": 20000,
+          "total_max_chars": 150000
+        },
+        "tool_result_max_tokens": 4000,
+        "tool_summary_max_chars": 500,
+        "budget": {
+          "bootstrap": 0.18,
+          "skills": 0.04,
+          "summary": 0.12,
+          "recent_turns": 0.28,
+          "tool_results": 0.25,
+          "current_message": 0.05,
+          "reserved": 0.08
+        },
+        "recent_turn_pairs": 5,
+        "recent_tail_max_tokens": 20000,
+        "summary_max_chars": 3000,
+        "summary_chunk_max_chars": 12000,
+        "max_compression_attempts": 3,
+        "memory": {
+          "daily_sediment_every_turns": 5,
+          "longterm_consolidate_interval_hours": 24,
+          "longterm_consolidate_days": 7,
+          "hot": {
+            "memory_char_limit": 3000,
+            "user_char_limit": 1500,
+            "section_char_limit": 800,
+            "consolidate_interval_hours": 24,
+            "max_candidates_per_run": 20,
+            "arbiter_batch_by_section": true,
+            "empty_section_placeholder": "（空）",
+            "misc_compact_every": 5
+          },
+          "warm": {
+            "nudge_every_user_turns": 5,
+            "daily_file_max_chars": 8000
+          }
+        }
+      },
+      "json_schema": {
+        "$defs": {
+          "ContextBootstrapModel": {
+            "additionalProperties": true,
+            "properties": {
+              "single_file_max_chars": {
+                "default": 20000,
+                "title": "Single File Max Chars",
+                "type": "integer"
+              },
+              "total_max_chars": {
+                "default": 150000,
+                "title": "Total Max Chars",
+                "type": "integer"
+              }
+            },
+            "title": "ContextBootstrapModel",
+            "type": "object"
+          },
+          "ContextBudgetModel": {
+            "additionalProperties": true,
+            "properties": {
+              "bootstrap": {
+                "default": 0.18,
+                "title": "Bootstrap",
+                "type": "number"
+              },
+              "skills": {
+                "default": 0.04,
+                "title": "Skills",
+                "type": "number"
+              },
+              "summary": {
+                "default": 0.12,
+                "title": "Summary",
+                "type": "number"
+              },
+              "recent_turns": {
+                "default": 0.28,
+                "title": "Recent Turns",
+                "type": "number"
+              },
+              "tool_results": {
+                "default": 0.25,
+                "title": "Tool Results",
+                "type": "number"
+              },
+              "current_message": {
+                "default": 0.05,
+                "title": "Current Message",
+                "type": "number"
+              },
+              "reserved": {
+                "default": 0.08,
+                "title": "Reserved",
+                "type": "number"
+              }
+            },
+            "title": "ContextBudgetModel",
+            "type": "object"
+          },
+          "ContextHotMemoryModel": {
+            "additionalProperties": true,
+            "properties": {
+              "memory_char_limit": {
+                "default": 3000,
+                "title": "Memory Char Limit",
+                "type": "integer"
+              },
+              "user_char_limit": {
+                "default": 1500,
+                "title": "User Char Limit",
+                "type": "integer"
+              },
+              "section_char_limit": {
+                "default": 800,
+                "title": "Section Char Limit",
+                "type": "integer"
+              },
+              "consolidate_interval_hours": {
+                "default": 24,
+                "title": "Consolidate Interval Hours",
+                "type": "integer"
+              },
+              "max_candidates_per_run": {
+                "default": 20,
+                "title": "Max Candidates Per Run",
+                "type": "integer"
+              },
+              "arbiter_batch_by_section": {
+                "default": true,
+                "title": "Arbiter Batch By Section",
+                "type": "boolean"
+              },
+              "empty_section_placeholder": {
+                "default": "（空）",
+                "title": "Empty Section Placeholder",
+                "type": "string"
+              },
+              "misc_compact_every": {
+                "default": 5,
+                "title": "Misc Compact Every",
+                "type": "integer"
+              }
+            },
+            "title": "ContextHotMemoryModel",
+            "type": "object"
+          },
+          "ContextMemoryModel": {
+            "additionalProperties": true,
+            "properties": {
+              "daily_sediment_every_turns": {
+                "default": 5,
+                "title": "Daily Sediment Every Turns",
+                "type": "integer"
+              },
+              "longterm_consolidate_interval_hours": {
+                "default": 24,
+                "title": "Longterm Consolidate Interval Hours",
+                "type": "integer"
+              },
+              "longterm_consolidate_days": {
+                "default": 7,
+                "title": "Longterm Consolidate Days",
+                "type": "integer"
+              },
+              "hot": {
+                "$ref": "#/$defs/ContextHotMemoryModel"
+              },
+              "warm": {
+                "$ref": "#/$defs/ContextWarmMemoryModel"
+              }
+            },
+            "title": "ContextMemoryModel",
+            "type": "object"
+          },
+          "ContextWarmMemoryModel": {
+            "additionalProperties": true,
+            "properties": {
+              "nudge_every_user_turns": {
+                "default": 5,
+                "title": "Nudge Every User Turns",
+                "type": "integer"
+              },
+              "daily_file_max_chars": {
+                "default": 8000,
+                "title": "Daily File Max Chars",
+                "type": "integer"
+              }
+            },
+            "title": "ContextWarmMemoryModel",
+            "type": "object"
+          }
+        },
+        "additionalProperties": true,
+        "properties": {
+          "max_tokens": {
+            "default": 128000,
+            "title": "Max Tokens",
+            "type": "integer"
+          },
+          "compress_threshold_ratio": {
+            "default": 0.75,
+            "title": "Compress Threshold Ratio",
+            "type": "number"
+          },
+          "bootstrap": {
+            "$ref": "#/$defs/ContextBootstrapModel"
+          },
+          "tool_result_max_tokens": {
+            "default": 4000,
+            "title": "Tool Result Max Tokens",
+            "type": "integer"
+          },
+          "tool_summary_max_chars": {
+            "default": 500,
+            "title": "Tool Summary Max Chars",
+            "type": "integer"
+          },
+          "budget": {
+            "$ref": "#/$defs/ContextBudgetModel"
+          },
+          "recent_turn_pairs": {
+            "default": 5,
+            "title": "Recent Turn Pairs",
+            "type": "integer"
+          },
+          "recent_tail_max_tokens": {
+            "default": 20000,
+            "title": "Recent Tail Max Tokens",
+            "type": "integer"
+          },
+          "summary_max_chars": {
+            "default": 3000,
+            "title": "Summary Max Chars",
+            "type": "integer"
+          },
+          "summary_chunk_max_chars": {
+            "default": 12000,
+            "title": "Summary Chunk Max Chars",
+            "type": "integer"
+          },
+          "max_compression_attempts": {
+            "default": 3,
+            "title": "Max Compression Attempts",
+            "type": "integer"
+          },
+          "memory": {
+            "$ref": "#/$defs/ContextMemoryModel"
+          }
+        },
+        "title": "ContextModule",
+        "type": "object"
+      }
+    }
+  },
+  "document_json_schema": {
+    "$defs": {
+      "AgentModule": {
+        "additionalProperties": true,
+        "properties": {
+          "model": {
+            "default": "qwen-plus",
+            "title": "Model",
+            "type": "string"
+          },
+          "temperature": {
+            "default": 0.7,
+            "title": "Temperature",
+            "type": "number"
+          },
+          "max_steps": {
+            "default": 48,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "graph_version": {
+            "default": "0.1.0-mvp",
+            "title": "Graph Version",
+            "type": "string"
+          }
+        },
+        "title": "AgentModule",
+        "type": "object"
+      },
+      "ConfigDomainModel": {
+        "additionalProperties": true,
+        "properties": {
+          "agent": {
+            "$ref": "#/$defs/AgentModule"
+          },
+          "tools": {
+            "$ref": "#/$defs/ToolsModule"
+          },
+          "middleware": {
+            "$ref": "#/$defs/MiddlewareModule"
+          },
+          "skills": {
+            "$ref": "#/$defs/SkillsModule"
+          },
+          "telemetry": {
+            "$ref": "#/$defs/TelemetryModule"
+          },
+          "context": {
+            "$ref": "#/$defs/ContextModule"
+          }
+        },
+        "title": "ConfigDomainModel",
+        "type": "object"
+      },
+      "ContextBootstrapModel": {
+        "additionalProperties": true,
+        "properties": {
+          "single_file_max_chars": {
+            "default": 20000,
+            "title": "Single File Max Chars",
+            "type": "integer"
+          },
+          "total_max_chars": {
+            "default": 150000,
+            "title": "Total Max Chars",
+            "type": "integer"
+          }
+        },
+        "title": "ContextBootstrapModel",
+        "type": "object"
+      },
+      "ContextBudgetModel": {
+        "additionalProperties": true,
+        "properties": {
+          "bootstrap": {
+            "default": 0.18,
+            "title": "Bootstrap",
+            "type": "number"
+          },
+          "skills": {
+            "default": 0.04,
+            "title": "Skills",
+            "type": "number"
+          },
+          "summary": {
+            "default": 0.12,
+            "title": "Summary",
+            "type": "number"
+          },
+          "recent_turns": {
+            "default": 0.28,
+            "title": "Recent Turns",
+            "type": "number"
+          },
+          "tool_results": {
+            "default": 0.25,
+            "title": "Tool Results",
+            "type": "number"
+          },
+          "current_message": {
+            "default": 0.05,
+            "title": "Current Message",
+            "type": "number"
+          },
+          "reserved": {
+            "default": 0.08,
+            "title": "Reserved",
+            "type": "number"
+          }
+        },
+        "title": "ContextBudgetModel",
+        "type": "object"
+      },
+      "ContextHotMemoryModel": {
+        "additionalProperties": true,
+        "properties": {
+          "memory_char_limit": {
+            "default": 3000,
+            "title": "Memory Char Limit",
+            "type": "integer"
+          },
+          "user_char_limit": {
+            "default": 1500,
+            "title": "User Char Limit",
+            "type": "integer"
+          },
+          "section_char_limit": {
+            "default": 800,
+            "title": "Section Char Limit",
+            "type": "integer"
+          },
+          "consolidate_interval_hours": {
+            "default": 24,
+            "title": "Consolidate Interval Hours",
+            "type": "integer"
+          },
+          "max_candidates_per_run": {
+            "default": 20,
+            "title": "Max Candidates Per Run",
+            "type": "integer"
+          },
+          "arbiter_batch_by_section": {
+            "default": true,
+            "title": "Arbiter Batch By Section",
+            "type": "boolean"
+          },
+          "empty_section_placeholder": {
+            "default": "（空）",
+            "title": "Empty Section Placeholder",
+            "type": "string"
+          },
+          "misc_compact_every": {
+            "default": 5,
+            "title": "Misc Compact Every",
+            "type": "integer"
+          }
+        },
+        "title": "ContextHotMemoryModel",
+        "type": "object"
+      },
+      "ContextMemoryModel": {
+        "additionalProperties": true,
+        "properties": {
+          "daily_sediment_every_turns": {
+            "default": 5,
+            "title": "Daily Sediment Every Turns",
+            "type": "integer"
+          },
+          "longterm_consolidate_interval_hours": {
+            "default": 24,
+            "title": "Longterm Consolidate Interval Hours",
+            "type": "integer"
+          },
+          "longterm_consolidate_days": {
+            "default": 7,
+            "title": "Longterm Consolidate Days",
+            "type": "integer"
+          },
+          "hot": {
+            "$ref": "#/$defs/ContextHotMemoryModel"
+          },
+          "warm": {
+            "$ref": "#/$defs/ContextWarmMemoryModel"
+          }
+        },
+        "title": "ContextMemoryModel",
+        "type": "object"
+      },
+      "ContextModule": {
+        "additionalProperties": true,
+        "properties": {
+          "max_tokens": {
+            "default": 128000,
+            "title": "Max Tokens",
+            "type": "integer"
+          },
+          "compress_threshold_ratio": {
+            "default": 0.75,
+            "title": "Compress Threshold Ratio",
+            "type": "number"
+          },
+          "bootstrap": {
+            "$ref": "#/$defs/ContextBootstrapModel"
+          },
+          "tool_result_max_tokens": {
+            "default": 4000,
+            "title": "Tool Result Max Tokens",
+            "type": "integer"
+          },
+          "tool_summary_max_chars": {
+            "default": 500,
+            "title": "Tool Summary Max Chars",
+            "type": "integer"
+          },
+          "budget": {
+            "$ref": "#/$defs/ContextBudgetModel"
+          },
+          "recent_turn_pairs": {
+            "default": 5,
+            "title": "Recent Turn Pairs",
+            "type": "integer"
+          },
+          "recent_tail_max_tokens": {
+            "default": 20000,
+            "title": "Recent Tail Max Tokens",
+            "type": "integer"
+          },
+          "summary_max_chars": {
+            "default": 3000,
+            "title": "Summary Max Chars",
+            "type": "integer"
+          },
+          "summary_chunk_max_chars": {
+            "default": 12000,
+            "title": "Summary Chunk Max Chars",
+            "type": "integer"
+          },
+          "max_compression_attempts": {
+            "default": 3,
+            "title": "Max Compression Attempts",
+            "type": "integer"
+          },
+          "memory": {
+            "$ref": "#/$defs/ContextMemoryModel"
+          }
+        },
+        "title": "ContextModule",
+        "type": "object"
+      },
+      "ContextWarmMemoryModel": {
+        "additionalProperties": true,
+        "properties": {
+          "nudge_every_user_turns": {
+            "default": 5,
+            "title": "Nudge Every User Turns",
+            "type": "integer"
+          },
+          "daily_file_max_chars": {
+            "default": 8000,
+            "title": "Daily File Max Chars",
+            "type": "integer"
+          }
+        },
+        "title": "ContextWarmMemoryModel",
+        "type": "object"
+      },
+      "FilesystemPackageModel": {
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "snapshots": {
+            "$ref": "#/$defs/SnapshotConfigModel"
+          }
+        },
+        "title": "FilesystemPackageModel",
+        "type": "object"
+      },
+      "McpDomainModel": {
+        "additionalProperties": true,
+        "properties": {
+          "version": {
+            "default": 1,
+            "title": "Version",
+            "type": "integer"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "servers": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Servers",
+            "type": "object"
+          }
+        },
+        "title": "McpDomainModel",
+        "type": "object"
+      },
+      "MiddlewareModule": {
+        "additionalProperties": true,
+        "description": "占位模块：当前运行时未消费，保留对象形状供后续扩展。",
+        "properties": {},
+        "title": "MiddlewareModule",
+        "type": "object"
+      },
+      "ShellCommandPolicyModel": {
+        "additionalProperties": true,
+        "properties": {
+          "executable": {
+            "title": "Executable",
+            "type": "string"
+          },
+          "args_prefix": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args Prefix",
+            "type": "array"
+          },
+          "allowed_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Roots",
+            "type": "array"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          }
+        },
+        "required": [
+          "executable"
+        ],
+        "title": "ShellCommandPolicyModel",
+        "type": "object"
+      },
+      "ShellPackageModel": {
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "default_timeout": {
+            "default": 60,
+            "title": "Default Timeout",
+            "type": "integer"
+          },
+          "max_timeout": {
+            "default": 300,
+            "title": "Max Timeout",
+            "type": "integer"
+          },
+          "safety_mode": {
+            "default": true,
+            "title": "Safety Mode",
+            "type": "boolean"
+          },
+          "workdir": {
+            "default": ".",
+            "title": "Workdir",
+            "type": "string"
+          },
+          "auto_approve_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Auto Approve Patterns",
+            "type": "array"
+          },
+          "policy": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ShellPolicyModel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "extra_env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Extra Env",
+            "type": "object"
+          }
+        },
+        "title": "ShellPackageModel",
+        "type": "object"
+      },
+      "ShellPolicyModel": {
+        "additionalProperties": true,
+        "properties": {
+          "allowed_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Roots",
+            "type": "array"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "commands": {
+            "items": {
+              "$ref": "#/$defs/ShellCommandPolicyModel"
+            },
+            "title": "Commands",
+            "type": "array"
+          }
+        },
+        "title": "ShellPolicyModel",
+        "type": "object"
+      },
+      "SkillsModule": {
+        "additionalProperties": true,
+        "properties": {
+          "global_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Global Roots",
+            "type": "array"
+          },
+          "project_enabled": {
+            "default": true,
+            "title": "Project Enabled",
+            "type": "boolean"
+          },
+          "catalog_max_items": {
+            "default": 80,
+            "title": "Catalog Max Items",
+            "type": "integer"
+          },
+          "catalog_max_chars": {
+            "default": 12000,
+            "title": "Catalog Max Chars",
+            "type": "integer"
+          },
+          "cache_ttl_seconds": {
+            "default": 5,
+            "title": "Cache Ttl Seconds",
+            "type": "integer"
+          },
+          "disabled": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Disabled",
+            "type": "array"
+          }
+        },
+        "title": "SkillsModule",
+        "type": "object"
+      },
+      "SnapshotConfigModel": {
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "retention": {
+            "$ref": "#/$defs/SnapshotRetentionModel"
+          }
+        },
+        "title": "SnapshotConfigModel",
+        "type": "object"
+      },
+      "SnapshotRetentionModel": {
+        "additionalProperties": true,
+        "properties": {
+          "max_count": {
+            "default": 50,
+            "title": "Max Count",
+            "type": "integer"
+          },
+          "max_age_seconds": {
+            "default": 604800,
+            "title": "Max Age Seconds",
+            "type": "integer"
+          },
+          "max_total_bytes": {
+            "default": 209715200,
+            "title": "Max Total Bytes",
+            "type": "integer"
+          }
+        },
+        "title": "SnapshotRetentionModel",
+        "type": "object"
+      },
+      "TelemetryModule": {
+        "additionalProperties": true,
+        "properties": {
+          "langsmith_enabled": {
+            "default": false,
+            "title": "Langsmith Enabled",
+            "type": "boolean"
+          },
+          "sample_rate": {
+            "default": 0.01,
+            "title": "Sample Rate",
+            "type": "number"
+          }
+        },
+        "title": "TelemetryModule",
+        "type": "object"
+      },
+      "ToolSearchPackageModel": {
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "hot_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Hot Tools",
+            "type": "array"
+          },
+          "search_default_limit": {
+            "default": 5,
+            "title": "Search Default Limit",
+            "type": "integer"
+          },
+          "max_search_limit": {
+            "default": 20,
+            "title": "Max Search Limit",
+            "type": "integer"
+          },
+          "mcp_as_hot": {
+            "default": false,
+            "title": "Mcp As Hot",
+            "type": "boolean"
+          }
+        },
+        "title": "ToolSearchPackageModel",
+        "type": "object"
+      },
+      "ToolsModule": {
+        "additionalProperties": true,
+        "properties": {
+          "enforcement_mode": {
+            "default": "enforce",
+            "enum": [
+              "audit",
+              "enforce"
+            ],
+            "title": "Enforcement Mode",
+            "type": "string"
+          },
+          "filesystem": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/FilesystemPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Filesystem"
+          },
+          "shell": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/ShellPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Shell"
+          },
+          "memory": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Memory"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Session"
+          },
+          "skills": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Skills"
+          },
+          "calculator": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Calculator"
+          },
+          "datetime": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Datetime"
+          },
+          "web_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": false,
+            "title": "Web Search"
+          },
+          "mcp": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ],
+            "default": true,
+            "title": "Mcp"
+          },
+          "tool_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "$ref": "#/$defs/ToolSearchPackageModel"
+              }
+            ],
+            "default": true,
+            "title": "Tool Search"
+          }
+        },
+        "title": "ToolsModule",
+        "type": "object"
+      }
+    },
+    "additionalProperties": true,
+    "description": "规范 CONFIG.json 根结构。",
+    "properties": {
+      "schema_version": {
+        "default": 1,
+        "title": "Schema Version",
+        "type": "integer"
+      },
+      "config": {
+        "$ref": "#/$defs/ConfigDomainModel"
+      },
+      "mcp": {
+        "$ref": "#/$defs/McpDomainModel"
+      }
+    },
+    "title": "CanonicalConfigDocument",
+    "type": "object"
+  },
+  "mcp_server_json_schema": {
+    "$defs": {
+      "McpAuthModel": {
+        "properties": {
+          "required_env": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Required Env",
+            "type": "array"
+          }
+        },
+        "title": "McpAuthModel",
+        "type": "object"
+      },
+      "McpConnectionModel": {
+        "properties": {
+          "type": {
+            "default": "stdio",
+            "enum": [
+              "stdio",
+              "streamable-http",
+              "sse"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Url"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Headers",
+            "type": "object"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Command"
+          },
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Env",
+            "type": "object"
+          }
+        },
+        "title": "McpConnectionModel",
+        "type": "object"
+      },
+      "McpRuntimeModel": {
+        "properties": {
+          "supports_parallel_tool_calls": {
+            "default": false,
+            "title": "Supports Parallel Tool Calls",
+            "type": "boolean"
+          }
+        },
+        "title": "McpRuntimeModel",
+        "type": "object"
+      },
+      "McpTimeoutsModel": {
+        "properties": {
+          "connect": {
+            "default": 60.0,
+            "title": "Connect",
+            "type": "number"
+          },
+          "call": {
+            "default": 25.0,
+            "title": "Call",
+            "type": "number"
+          }
+        },
+        "title": "McpTimeoutsModel",
+        "type": "object"
+      },
+      "McpToolsModel": {
+        "properties": {
+          "include": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Include",
+            "type": "array"
+          },
+          "exclude": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Exclude",
+            "type": "array"
+          },
+          "resources": {
+            "default": false,
+            "title": "Resources",
+            "type": "boolean"
+          },
+          "prompts": {
+            "default": false,
+            "title": "Prompts",
+            "type": "boolean"
+          }
+        },
+        "title": "McpToolsModel",
+        "type": "object"
+      }
+    },
+    "additionalProperties": true,
+    "description": "规范 mcp.servers.<id> 条目（与管理 API 契约对齐）。",
+    "properties": {
+      "display_name": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Display Name"
+      },
+      "enabled": {
+        "default": true,
+        "title": "Enabled",
+        "type": "boolean"
+      },
+      "connection": {
+        "$ref": "#/$defs/McpConnectionModel"
+      },
+      "auth": {
+        "$ref": "#/$defs/McpAuthModel"
+      },
+      "timeouts": {
+        "$ref": "#/$defs/McpTimeoutsModel"
+      },
+      "tools": {
+        "$ref": "#/$defs/McpToolsModel"
+      },
+      "runtime": {
+        "$ref": "#/$defs/McpRuntimeModel"
+      }
+    },
+    "title": "McpServerCanonicalModel",
+    "type": "object"
+  },
+  "example": {
+    "schema_version": 1,
+    "config": {
+      "agent": {
+        "model": "qwen-plus",
+        "temperature": 0.7,
+        "max_steps": 48,
+        "graph_version": "0.1.0-mvp"
+      },
+      "tools": {
+        "enforcement_mode": "enforce",
+        "filesystem": true,
+        "shell": true,
+        "memory": true,
+        "session": true,
+        "skills": true,
+        "calculator": true,
+        "datetime": true,
+        "web_search": false,
+        "mcp": true,
+        "tool_search": true
+      },
+      "middleware": {},
+      "skills": {
+        "global_roots": [
+          "skills"
+        ],
+        "project_enabled": true,
+        "catalog_max_items": 80,
+        "catalog_max_chars": 12000,
+        "cache_ttl_seconds": 5,
+        "disabled": []
+      },
+      "telemetry": {
+        "langsmith_enabled": false,
+        "sample_rate": 0.01
+      },
+      "context": {
+        "max_tokens": 128000,
+        "compress_threshold_ratio": 0.75,
+        "bootstrap": {
+          "single_file_max_chars": 20000,
+          "total_max_chars": 150000
+        },
+        "tool_result_max_tokens": 4000,
+        "tool_summary_max_chars": 500,
+        "budget": {
+          "bootstrap": 0.18,
+          "skills": 0.04,
+          "summary": 0.12,
+          "recent_turns": 0.28,
+          "tool_results": 0.25,
+          "current_message": 0.05,
+          "reserved": 0.08
+        },
+        "recent_turn_pairs": 5,
+        "recent_tail_max_tokens": 20000,
+        "summary_max_chars": 3000,
+        "summary_chunk_max_chars": 12000,
+        "max_compression_attempts": 3,
+        "memory": {
+          "daily_sediment_every_turns": 5,
+          "longterm_consolidate_interval_hours": 24,
+          "longterm_consolidate_days": 7,
+          "hot": {
+            "memory_char_limit": 3000,
+            "user_char_limit": 1500,
+            "section_char_limit": 800,
+            "consolidate_interval_hours": 24,
+            "max_candidates_per_run": 20,
+            "arbiter_batch_by_section": true,
+            "empty_section_placeholder": "（空）",
+            "misc_compact_every": 5
+          },
+          "warm": {
+            "nudge_every_user_turns": 5,
+            "daily_file_max_chars": 8000
+          }
+        }
+      }
+    },
+    "mcp": {
+      "version": 1,
+      "revision": 0,
+      "servers": {}
+    }
+  }
+}

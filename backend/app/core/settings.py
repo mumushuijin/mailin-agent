@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     port: int = 8000
     workspace_path: Path = _BACKEND_ROOT / "workspace"
     workspace_defaults_path: Path = _BACKEND_ROOT / "workspace_defaults"
+    # 结构化运行配置落在 Python 包 app/config 下（与代码同目录，与 workspace 数据分离）
+    config_dir: Path = _BACKEND_ROOT / "app" / "config"
+    config_defaults_path: Path = _BACKEND_ROOT / "app" / "config" / "defaults"
 
     openai_api_key: str | None = None
     openai_base_url: str | None = None
@@ -36,6 +39,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "console"
     mailin_timezone: str = "Asia/Shanghai"
+
+    @property
+    def config_path(self) -> Path:
+        return self.config_dir / "CONFIG.json"
 
     @property
     def llm_api_key(self) -> str | None:
@@ -65,6 +72,7 @@ def init_workspace(settings: Settings | None = None) -> None:
         CONFIG_FILE,
         _config_filename,
         bootstraps_dir,
+        ensure_runtime_config,
         migrate_workspace_layout,
     )
 
@@ -78,11 +86,7 @@ def init_workspace(settings: Settings | None = None) -> None:
     (workspace / "skills").mkdir(parents=True, exist_ok=True)
     bootstraps_dir(workspace).mkdir(parents=True, exist_ok=True)
 
-    config_target = workspace / CONFIG_FILE
-    if not config_target.exists():
-        config_src = defaults / CONFIG_FILE
-        if config_src.exists():
-            config_target.write_text(config_src.read_text(encoding="utf-8"), encoding="utf-8")
+    ensure_runtime_config(settings)
 
     defaults_bootstraps = defaults / "bootstraps"
     _skip_md_bootstrap = {"MEMORY", "USER"}

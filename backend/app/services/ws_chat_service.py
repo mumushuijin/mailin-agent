@@ -23,6 +23,7 @@ class WsChatService:
         self._active_runs: dict[str, asyncio.Task] = {}
         self._approval_futures: dict[str, asyncio.Future] = {}
         self._run_sessions: dict[str, str] = {}
+        self._pending_interrupt_meta: dict[str, dict[str, Any]] = {}
 
     async def handle_message(self, conn_id: int, payload: dict[str, Any]) -> None:
         op = payload.get("op")
@@ -50,14 +51,54 @@ class WsChatService:
 
         if op == "approve":
             run_id = payload.get("run_id")
-            if run_id and run_id in self._approval_futures:
-                future = self._approval_futures.pop(run_id)
-                if not future.done():
-                    if payload.get("kind") == "ask_user":
-                        future.set_result({"kind": "ask_user", "answer": payload.get("answer")})
-                    else:
-                        decision = payload.get("decision", "deny")
-                        future.set_result("allow" if decision == "allow" else "deny")
+            if not run_id or run_id not in self._approval_futures:
+                return
+            expected_session = self._run_sessions.get(run_id)
+            payload_session = payload.get("session_id")
+            if expected_session and payload_session and payload_session != expected_session:
+                log.warning(
+                    "stale approval ignored: session mismatch run=%s",
+                    run_id,
+                )
+                return
+
+            pending = self._pending_interrupt_meta.get(run_id) or {}
+            future = self._approval_futures.pop(run_id)
+            if future.done():
+                return
+
+            if payload.get("kind") == "ask_user":
+                interrupt_id = payload.get("interrupt_id")
+                expected_iid = pending.get("interrupt_id")
+                if expected_iid and interrupt_id and interrupt_id != expected_iid:
+                    log.warning("stale ask_user ignored: interrupt_id mismatch run=%s", run_id)
+                    return
+                tool_call_id = payload.get("tool_call_id")
+                expected_tc = pending.get("tool_call_id")
+                if expected_tc and tool_call_id and tool_call_id != expected_tc:
+                    log.warning("stale ask_user ignored: tool_call_id mismatch run=%s", run_id)
+                    return
+                mode = payload.get("mode") or pending.get("mode") or "answer_and_continue"
+                result: dict[str, Any] = {
+                    "kind": "ask_user",
+                    "mode": mode,
+                    "interrupt_id": interrupt_id or expected_iid,
+                    "tool_call_id": tool_call_id or expected_tc,
+                }
+                if mode == "handoff_and_stop":
+                    result["ack"] = True
+                else:
+                    result["answer"] = payload.get("answer")
+                future.set_result(result)
+            else:
+                # 工具审批：校验 tool_call_id
+                tool_call_id = payload.get("tool_call_id")
+                expected_tc = pending.get("tool_call_id")
+                if expected_tc and tool_call_id and tool_call_id != expected_tc:
+                    log.warning("stale approval ignored: tool_call_id mismatch run=%s", run_id)
+                    return
+                decision = payload.get("decision", "deny")
+                future.set_result("allow" if decision == "allow" else "deny")
             return
 
         await self.manager.send_event(
@@ -144,6 +185,7 @@ class WsChatService:
                 self._active_runs.pop(run_id, None)
                 self._approval_futures.pop(run_id, None)
                 self._run_sessions.pop(run_id, None)
+                self._pending_interrupt_meta.pop(run_id, None)
 
     async def _handle_interrupts(self, conn_id: int, run_id: str, session_id: str) -> None:
         graph = await asyncio.to_thread(get_graph)
@@ -156,27 +198,77 @@ class WsChatService:
 
             intr = interrupts[0]
             if isinstance(intr, dict):
-                interrupt_data = intr
+                interrupt_data = dict(intr)
             else:
                 interrupt_data = {"value": intr}
 
+            # 规范化给客户端的字段
+            value = interrupt_data.get("value") if "value" in interrupt_data else interrupt_data
+            if isinstance(value, dict):
+                self._pending_interrupt_meta[run_id] = {
+                    "kind": value.get("kind"),
+                    "interrupt_id": value.get("interrupt_id"),
+                    "tool_call_id": value.get("tool_call_id"),
+                    "mode": value.get("mode"),
+                    "session_id": session_id,
+                    "run_id": run_id,
+                }
+                # 展平 value 便于前端直接读 kind/prompt
+                event_data = {**value, "run_id": run_id, "session_id": session_id}
+            else:
+                self._pending_interrupt_meta[run_id] = {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                }
+                event_data = {**interrupt_data, "run_id": run_id, "session_id": session_id}
+
             await self.manager.send_event(
                 conn_id,
-                AgentEvent("interrupt", interrupt_data, run_id),
+                AgentEvent("interrupt", event_data, run_id),
             )
 
             loop = asyncio.get_running_loop()
-            future: asyncio.Future[str] = loop.create_future()
+            future: asyncio.Future = loop.create_future()
             self._approval_futures[run_id] = future
 
             try:
                 decision = await asyncio.wait_for(future, timeout=300.0)
             except TimeoutError:
-                decision = "deny"
+                # fail-closed：超时视为拒绝 / 无回答
+                kind = (self._pending_interrupt_meta.get(run_id) or {}).get("kind")
+                if kind == "ask_user":
+                    decision = {
+                        "kind": "ask_user",
+                        "mode": (self._pending_interrupt_meta.get(run_id) or {}).get("mode"),
+                        "interrupt_id": (self._pending_interrupt_meta.get(run_id) or {}).get(
+                            "interrupt_id"
+                        ),
+                        "answer": None,
+                    }
+                else:
+                    decision = "deny"
                 await self.manager.send_event(
                     conn_id,
-                    AgentEvent("error", {"error": "审批超时，已自动拒绝"}, run_id),
+                    AgentEvent("error", {"error": "等待用户响应超时，已安全拒绝"}, run_id),
                 )
+            except asyncio.CancelledError:
+                # cancel：fail-closed，不猜测答案
+                kind = (self._pending_interrupt_meta.get(run_id) or {}).get("kind")
+                if kind == "ask_user":
+                    decision = {
+                        "kind": "ask_user",
+                        "mode": (self._pending_interrupt_meta.get(run_id) or {}).get("mode"),
+                        "interrupt_id": (self._pending_interrupt_meta.get(run_id) or {}).get(
+                            "interrupt_id"
+                        ),
+                        "answer": None,
+                    }
+                else:
+                    decision = "deny"
+                self._pending_interrupt_meta.pop(run_id, None)
+                raise
+
+            self._pending_interrupt_meta.pop(run_id, None)
 
             async for event in self.chat_service.resume_chat_events(
                 session_id, decision, run_id=run_id

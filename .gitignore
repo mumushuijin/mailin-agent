@@ -53,11 +53,14 @@ coverage.xml
 backend/.langgraph_api/
 
 # ------------------------------------------------------------------------------
-# 运行时工作区（首次启动从 workspace_defaults 复制生成，属本地数据）
+# 运行时工作区与用户配置（首次启动从 defaults 复制/迁移生成，属本地数据）
 # ------------------------------------------------------------------------------
 backend/workspace/
 # 保留默认模板
 !backend/workspace_defaults/
+# 运行时 CONFIG.json 落在 app/config 包目录下，勿忽略整个包
+backend/app/config/CONFIG.json
+backend/app/config/CONFIG.json.*
 
 # SQLite / Checkpoint
 *.sqlite
@@ -135,3 +138,4 @@ temp/
 .docs/
 .agents/
 openspec/
+.repo/

@@ -2,9 +2,10 @@
 import { computed } from 'vue'
 import { Tag } from 'ant-design-vue'
 import { LoadingOutlined } from '@ant-design/icons-vue'
-import { renderMarkdown, formatMessageTime } from '@/utils/markdown'
+import { formatMessageTime } from '@/utils/markdown'
 import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDisplay'
 import MailinLogo from '@/components/MailinLogo.vue'
+import MarkdownContent from '@/components/MarkdownContent.vue'
 
 // 消息段类型
 interface TextSegment {
@@ -92,10 +93,9 @@ const hasVisibleContent = computed(() => {
         <template v-for="segment in message.segments" :key="segment.id">
           <!-- 文本段 -->
           <div v-if="segment.type === 'text' && segment.content" class="message-bubble">
-            <div
-              class="message-text"
-              v-html="renderMarkdown(segment.content)"
-            ></div>
+            <div class="message-text">
+              <MarkdownContent :content="segment.content" />
+            </div>
           </div>
           <!-- 工具调用段 - 只显示非隐藏的工具 -->
           <div
@@ -141,10 +141,9 @@ const hasVisibleContent = computed(() => {
       </template>
       <!-- 如果没有分段，显示普通内容（历史消息） -->
       <div v-else-if="message.content" class="message-bubble">
-        <div
-          class="message-text"
-          v-html="renderMarkdown(message.content)"
-        ></div>
+        <div class="message-text">
+          <MarkdownContent :content="message.content" />
+        </div>
       </div>
 
       <!-- 消息元信息 -->
@@ -226,54 +225,6 @@ const hasVisibleContent = computed(() => {
 .chat-message.user .message-text {
   background-color: var(--color-primary-light);
   border: 1px solid rgba(255, 92, 92, 0.2);
-}
-
-/* Markdown 样式 */
-.message-text :deep(p) {
-  margin: 0;
-}
-
-.message-text :deep(p + p) {
-  margin-top: 8px;
-}
-
-.message-text :deep(code) {
-  background-color: rgba(0, 0, 0, 0.05);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 13px;
-}
-
-.message-text :deep(pre) {
-  background-color: #1e1e1e;
-  color: #d4d4d4;
-  padding: 12px;
-  border-radius: 8px;
-  overflow-x: auto;
-  margin: 8px 0;
-}
-
-.message-text :deep(pre code) {
-  background-color: transparent;
-  padding: 0;
-}
-
-.message-text :deep(ul),
-.message-text :deep(ol) {
-  margin: 8px 0;
-  padding-left: 20px;
-}
-
-.message-text :deep(blockquote) {
-  border-left: 3px solid var(--color-primary);
-  padding-left: 12px;
-  margin: 8px 0;
-  color: var(--color-text-secondary);
-}
-
-.message-text :deep(a) {
-  color: var(--color-primary);
-  text-decoration: underline;
 }
 
 /* 消息元信息 */

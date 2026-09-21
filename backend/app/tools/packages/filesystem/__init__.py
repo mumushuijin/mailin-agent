@@ -33,6 +33,7 @@ _DISPLAY_NAMES = {
     "mkdir": "创建目录",
     "move_file": "移动文件",
     "delete_file": "删除文件",
+    "undo_file_change": "撤销文件变更",
 }
 
 _DISPLAY_ICONS = {
@@ -45,6 +46,7 @@ _DISPLAY_ICONS = {
     "mkdir": "📁",
     "move_file": "📦",
     "delete_file": "🗑️",
+    "undo_file_change": "↩️",
 }
 
 
@@ -60,6 +62,7 @@ class FilesystemPackage(ToolPackage):
             _card("mkdir", fs.mkdir),
             _card("move_file", fs.move_file, risk_level="moderate", requires_confirmation=True),
             _card("delete_file", fs.delete_file, risk_level="dangerous", requires_confirmation=True),
+            _card("undo_file_change", fs.undo_file_change, risk_level="moderate", requires_confirmation=True),
         ]
 
 

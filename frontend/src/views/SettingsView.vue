@@ -4,8 +4,11 @@ import { RouterLink, RouterView, useRoute } from 'vue-router'
 
 const route = useRoute()
 const activeTab = computed(() => {
+  if (route.path.includes('/markdown')) return 'markdown'
   if (route.path.includes('/memory')) return 'memory'
   if (route.path.includes('/skills')) return 'skills'
+  if (route.path.includes('/mcp')) return 'mcp'
+  if (route.path.includes('/config')) return 'config'
   return 'config'
 })
 </script>
@@ -17,6 +20,13 @@ const activeTab = computed(() => {
       <p>全局 · Agent 自有空间，不随项目工作区切换</p>
     </header>
     <nav class="settings-tabs" aria-label="设置分类">
+      <RouterLink
+        class="tab"
+        :class="{ active: activeTab === 'markdown' }"
+        to="/settings/markdown"
+      >
+        设定
+      </RouterLink>
       <RouterLink
         class="tab"
         :class="{ active: activeTab === 'config' }"
@@ -37,6 +47,13 @@ const activeTab = computed(() => {
         to="/settings/skills"
       >
         技能
+      </RouterLink>
+      <RouterLink
+        class="tab"
+        :class="{ active: activeTab === 'mcp' }"
+        to="/settings/mcp"
+      >
+        MCP
       </RouterLink>
     </nav>
     <div class="settings-body">
@@ -103,13 +120,15 @@ const activeTab = computed(() => {
 
 .settings-body :deep(.config-header),
 .settings-body :deep(.memory-header),
-.settings-body :deep(.skill-header) {
+.settings-body :deep(.skill-header),
+.settings-body :deep(.mcp-header) {
   display: none;
 }
 
 .settings-body :deep(.config-view),
 .settings-body :deep(.memory-view),
-.settings-body :deep(.skills-view) {
+.settings-body :deep(.skills-view),
+.settings-body :deep(.mcp-view) {
   padding-top: 16px;
 }
 </style>

@@ -5,8 +5,10 @@ const { performance } = require('node:perf_hooks')
 const LONG_HISTORY_COUNT = 2_000
 const INITIAL_PAGE_SIZE = 30
 const DENSE_EVENT_COUNT = 1_000
+const TODO_SNAPSHOT_COUNT = 1_000
 const LONG_HISTORY_BUDGET_MS = 80
 const DENSE_STREAM_BUDGET_MS = 50
+const TODO_SNAPSHOT_BUDGET_MS = 20
 
 function buildLongHistory(count = LONG_HISTORY_COUNT) {
   return Array.from({ length: count }, (_, index) => ({
@@ -57,6 +59,23 @@ async function applyDenseStreamFixture(count = DENSE_EVENT_COUNT) {
   return { flushes, contentLength: content.length }
 }
 
+function compactTechnicalEntity(value, maxLength = 140) {
+  const text = String(value)
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
+}
+
+function applyTodoSnapshots(count = TODO_SNAPSHOT_COUNT) {
+  let completed = 0
+  let total = 0
+
+  for (let index = 0; index < count; index += 1) {
+    total = 8
+    completed = Math.min(total, Math.floor(index / 125))
+  }
+
+  return { completed, total }
+}
+
 async function main() {
   const history = buildLongHistory()
   const historyStarted = performance.now()
@@ -81,6 +100,21 @@ async function main() {
     throw new Error(`Dense-stream fixture flushed too often: ${dense.flushes}`)
   }
 
+  const entityStarted = performance.now()
+  const longPath = compactTechnicalEntity(`D:/workspace/${'nested/'.repeat(40)}ChatView.vue`)
+  const longCommand = compactTechnicalEntity(`npm run ${'verify-'.repeat(40)}type-check`)
+  const entityMs = performance.now() - entityStarted
+  if (longPath.length > 140 || longCommand.length > 140) {
+    throw new Error('Technical entity fixture did not truncate long path or command')
+  }
+
+  const todoStarted = performance.now()
+  const todoSummary = applyTodoSnapshots()
+  const todoMs = performance.now() - todoStarted
+  if (todoSummary.completed !== 7 || todoSummary.total !== 8) {
+    throw new Error('Todo snapshot fixture did not converge to the latest progress')
+  }
+
   const report = {
     long_history: {
       count: LONG_HISTORY_COUNT,
@@ -96,6 +130,20 @@ async function main() {
       budget_ms: DENSE_STREAM_BUDGET_MS,
       passed: denseMs <= DENSE_STREAM_BUDGET_MS,
     },
+    technical_entities: {
+      path_length: longPath.length,
+      command_length: longCommand.length,
+      elapsed_ms: Number(entityMs.toFixed(2)),
+      passed: longPath.length <= 140 && longCommand.length <= 140,
+    },
+    todo_snapshots: {
+      snapshot_count: TODO_SNAPSHOT_COUNT,
+      completed: todoSummary.completed,
+      total: todoSummary.total,
+      elapsed_ms: Number(todoMs.toFixed(2)),
+      budget_ms: TODO_SNAPSHOT_BUDGET_MS,
+      passed: todoMs <= TODO_SNAPSHOT_BUDGET_MS,
+    },
   }
 
   const outputDir = path.join(__dirname, '..', '.vite')
@@ -106,7 +154,12 @@ async function main() {
     'utf8',
   )
 
-  if (!report.long_history.passed || !report.dense_stream.passed) {
+  if (
+    !report.long_history.passed
+    || !report.dense_stream.passed
+    || !report.technical_entities.passed
+    || !report.todo_snapshots.passed
+  ) {
     throw new Error(`Performance fixture budget failed: ${JSON.stringify(report)}`)
   }
 

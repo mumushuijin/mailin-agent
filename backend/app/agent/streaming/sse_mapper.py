@@ -133,12 +133,16 @@ async def stream_graph_events(
                         if isinstance(msg, ToolMessage):
                             display_name = msg.name or "tool"
                             if should_show_tool_in_ui(display_name):
+                                reason_code = (msg.additional_kwargs or {}).get("reason_code")
                                 yield _evt(
                                     "tool_finish",
                                     {
                                         "tool": display_name,
                                         "result": str(msg.content) if msg.content is not None else "",
                                         "tool_call_id": msg.tool_call_id,
+                                        "reason_code": (
+                                            str(reason_code) if reason_code is not None else None
+                                        ),
                                     },
                                     run_id,
                                 )
@@ -199,6 +203,13 @@ async def stream_graph_events(
                     emitted_step_start = False
 
         session_id = config.get("configurable", {}).get("thread_id")
+        # LangGraph 1.x：interrupt 时 astream_events 正常结束且不抛 GraphInterrupt。
+        # 若此时发 done，前端会注销 run callback，随后 WS 层发出的 interrupt 会丢失。
+        from app.agent.streaming.interrupts import has_pending_interrupt
+
+        if await has_pending_interrupt(graph, config):
+            return
+
         final_state = await graph.aget_state(config)
         values = dict(final_state.values) if final_state and final_state.values else {}
         messages = values.get("messages", [])
@@ -214,9 +225,17 @@ async def stream_graph_events(
         if session_token_stats:
             yield _evt("session_token_stats", session_token_stats, run_id)
         content = extract_final_content(messages) or full_content
-        yield _evt("done", {"content": content, "session_id": session_id}, run_id)
+        terminal_reason = values.get("terminal_reason")
+        done_data: dict = {"content": content, "session_id": session_id}
+        if terminal_reason:
+            done_data["terminal_reason"] = terminal_reason
+            # 兼容旧客户端：handoff 仍发 done，另带可区分字段
+            if terminal_reason == "handoff":
+                done_data["handoff"] = True
+        yield _evt("done", done_data, run_id)
 
     except GraphInterrupt:
+        # 兼容旧路径；1.x astream_events 通常不抛，见上方 pending-interrupt 检查
         return
     except TimeoutError:
         session_id = config.get("configurable", {}).get("thread_id")

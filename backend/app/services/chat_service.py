@@ -65,8 +65,13 @@ class ChatService:
         self.history_projection = HistoryProjectionStore(self.settings.workspace_path)
 
     def _max_steps(self) -> int:
+        from app.agent.iteration_budget import DEFAULT_MAX_STEPS, clamp_max_steps
+
         config = load_full_config(self.settings.workspace_path)
-        return config.get("agent", {}).get("max_steps", 24)
+        return clamp_max_steps(
+            config.get("agent", {}).get("max_steps"),
+            default=DEFAULT_MAX_STEPS,
+        )
 
     def _require_bound_session(self, session_id: str | None) -> str:
         sid, _project = require_bound_session(session_id)
@@ -493,6 +498,8 @@ class ChatService:
                     "error",
                     {
                         "error": "此操作需要在 WebSocket 连接下确认或回答，请重连后重试",
+                        "fail_closed": True,
+                        "reason_code": "sse_no_answer_channel",
                     },
                     run_id,
                 )
@@ -653,6 +660,7 @@ class ChatService:
                 if not should_show_tool_in_ui(display_name):
                     continue
                 content = str(msg.content) if msg.content is not None else ""
+                tool_reason_code = (msg.additional_kwargs or {}).get("reason_code")
                 tool_ref = None
                 tool_preview = None
                 tool_truncated = False
@@ -670,6 +678,9 @@ class ChatService:
                         tool_result_ref=tool_ref,
                         tool_result_preview=tool_preview,
                         tool_result_truncated=tool_truncated,
+                        tool_reason_code=(
+                            str(tool_reason_code) if tool_reason_code is not None else None
+                        ),
                     )
                 )
         return result

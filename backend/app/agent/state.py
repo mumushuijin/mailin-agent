@@ -20,3 +20,5 @@ class AgentState(TypedDict, total=False):
     # 运行时字段（每轮组装，不写 checkpoint 亦可）
     working_messages: list
     todos: list
+    # handoff_and_stop 等终态：tools 节点置位后路由直接 END
+    terminal_reason: str

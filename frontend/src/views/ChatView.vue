@@ -7,16 +7,33 @@ import { sessionApi, type ChatMessage as ApiChatMessage, type Session } from '@/
 import { chatApi, type ApiUsage, type ContextUsage } from '@/api/chat'
 import { chatWs } from '@/api/ws'
 import { configApi } from '@/api/config'
-import { renderMarkdown, formatMessageTime } from '@/utils/markdown'
-import { getToolConfig, formatToolArgs, formatToolResult, toolResultLooksLikeError, toolErrorPreview } from '@/utils/toolDisplay'
+import { formatMessageTime } from '@/utils/markdown'
+import {
+  getToolActionDisplay,
+  getToolConfig,
+  formatToolArgs,
+  formatToolResult,
+  toolErrorPreview,
+  toolResultLooksLikeError,
+  toolResultPreview,
+} from '@/utils/toolDisplay'
 import MailinLogo from '@/components/MailinLogo.vue'
+import MarkdownContent from '@/components/MarkdownContent.vue'
 import ToolApprovalModal from '@/components/ToolApprovalModal.vue'
 import AskUserModal from '@/components/AskUserModal.vue'
 import ContextUsageRing from '@/components/ContextUsageRing.vue'
 import { createChatStreamEventBatcher } from '@/composables/useChatStream'
 import { getLastWorkspacePath, openDirectory, pickDirectory, saveLastWorkspacePath } from '@/composables/useWorkspaceFolder'
 import { getLastSessionId, saveLastSessionId, useProjectNavigator } from '@/composables/useProjectNavigator'
-import type { ChatUiMessage, MessageSegment, PendingApproval, PendingAskUser, SessionTodoItem, ToolSegment } from '@/types/chat-ui'
+import type {
+  ChatUiMessage,
+  MessageSegment,
+  PendingApproval,
+  PendingAskUser,
+  RunProgressSummary,
+  SessionTodoItem,
+  ToolSegment,
+} from '@/types/chat-ui'
 
 const { refreshSessions, setCurrentSession, currentProjectPath } = useProjectNavigator()
 
@@ -48,6 +65,11 @@ const activeRunId = ref<string | null>(null)
 const historyNextCursor = ref<string | null>(null)
 const hasMoreHistory = ref(false)
 const wsConnectionState = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('idle')
+const runStartedAt = ref<number | null>(null)
+const runClockNow = ref(Date.now())
+const lastRunSummary = ref<RunProgressSummary | null>(null)
+const terminalRunStatus = ref<'done' | 'cancelled' | 'error' | 'handoff' | null>(null)
+let runTimer: ReturnType<typeof setInterval> | null = null
 
 // 工具审批（WebSocket interrupt）
 const pendingApproval = ref<PendingApproval | null>(null)
@@ -163,7 +185,7 @@ const shouldShowGroupThinking = (group: MessageGroup, groupIndex: number) => {
   return !hasGroupTextContent(group)
 }
 
-const thinkingLabel = computed(() => {
+const progressStageLabel = computed(() => {
   if (historyLoading.value) return '加载历史中…'
   if (wsConnectionState.value === 'connecting') return '连接中…'
   if (wsConnectionState.value === 'reconnecting') return '重连中…'
@@ -172,8 +194,9 @@ const thinkingLabel = computed(() => {
   if (activeStage.value === 'connecting') return '连接中…'
   if (activeStage.value === 'accepted') return '已接收，准备中…'
   if (activeStage.value === 'context_prepare') return '准备上下文中…'
-  if (activeStage.value === 'model_stream') return '思考中…'
-  if (activeStage.value === 'tool_batch') return '运行工具中…'
+  if (activeStage.value === 'thinking') return 'Agent 正在处理…'
+  if (activeStage.value === 'model_stream') return 'Agent 正在处理…'
+  if (activeStage.value === 'tool_batch') return '执行工具中…'
   if (activeStage.value === 'usage_snapshot') return '更新用量中…'
   if (activeStage.value === 'waiting_user') return '等待确认中…'
   if (activeStage.value === 'postprocess') return '收尾处理中…'
@@ -182,8 +205,96 @@ const thinkingLabel = computed(() => {
   if (lastGroup && hasGroupToolWithoutText(lastGroup)) {
     return '处理工具结果中…'
   }
-  return '思考中…'
+  return loading.value ? 'Agent 正在处理…' : '准备开始…'
 })
+
+const thinkingLabel = computed(() => progressStageLabel.value)
+
+const completedTodoCount = computed(() => (
+  sessionTodos.value.filter((item) => item.status === 'completed').length
+))
+
+const formatElapsed = (elapsedMs: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+
+  if (hours > 0) return `${hours}h ${minutes}m`
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
+const currentElapsedMs = computed(() => (
+  runStartedAt.value ? Math.max(0, runClockNow.value - runStartedAt.value) : 0
+))
+
+const runProgressSummary = computed<RunProgressSummary | null>(() => {
+  if (loading.value && runStartedAt.value) {
+    return {
+      visible: true,
+      active: true,
+      stageLabel: progressStageLabel.value,
+      elapsedLabel: formatElapsed(currentElapsedMs.value),
+      todoCompleted: completedTodoCount.value,
+      todoTotal: sessionTodos.value.length,
+    }
+  }
+  return lastRunSummary.value
+})
+
+const startRunClock = () => {
+  if (runTimer) clearInterval(runTimer)
+  runClockNow.value = Date.now()
+  runTimer = setInterval(() => {
+    runClockNow.value = Date.now()
+  }, 1000)
+}
+
+const stopRunClock = () => {
+  if (runTimer) {
+    clearInterval(runTimer)
+    runTimer = null
+  }
+}
+
+const markRunTerminal = (status: 'done' | 'cancelled' | 'error' | 'handoff') => {
+  terminalRunStatus.value = status
+}
+
+const finalizeRunSummary = (fallbackStatus: 'done' | 'cancelled' | 'error' | 'handoff' = 'done') => {
+  const status = terminalRunStatus.value || fallbackStatus
+  const elapsedMs = runStartedAt.value
+    ? Math.max(0, Date.now() - runStartedAt.value)
+    : currentElapsedMs.value
+
+  const label =
+    status === 'done'
+      ? '本轮完成'
+      : status === 'cancelled'
+        ? '本轮已取消'
+        : status === 'handoff'
+          ? '已交还用户'
+          : '本轮失败'
+  lastRunSummary.value = {
+    visible: true,
+    active: false,
+    stageLabel: label,
+    elapsedLabel: formatElapsed(elapsedMs),
+    todoCompleted: completedTodoCount.value,
+    todoTotal: sessionTodos.value.length,
+    terminalLabel:
+      status === 'done'
+        ? '已完成'
+        : status === 'cancelled'
+          ? '已取消'
+          : status === 'handoff'
+            ? '已交还'
+            : '执行失败',
+  }
+  stopRunClock()
+  runStartedAt.value = null
+}
 
 const saveCurrentSession = (sessionId: string) => {
   saveLastSessionId(sessionId)
@@ -363,6 +474,10 @@ const buildDisplayMessages = (
 const loadSessionHistory = async (sessionId: string) => {
   const seq = ++historyLoadSeq
   historyLoading.value = true
+  lastRunSummary.value = null
+  terminalRunStatus.value = null
+  stopRunClock()
+  runStartedAt.value = null
   messages.value = []
   contextUsage.value = null
   apiUsage.value = null
@@ -524,6 +639,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unsubConfig?.()
   unsubConnection?.()
+  stopRunClock()
 })
 
 watch(currentSessionId, (sid) => {
@@ -702,7 +818,7 @@ const isGroupWaiting = (group: MessageGroup): boolean => {
 const finalizeRunningToolSegments = (segments: MessageSegment[], cancelled = false) => {
   for (const seg of segments) {
     if (seg.type === 'tool' && seg.status === 'running') {
-      seg.status = 'done'
+      seg.status = cancelled ? 'cancelled' : 'done'
       if (!seg.result) seg.result = cancelled ? '（已取消）' : '（已结束）'
     }
   }
@@ -728,6 +844,7 @@ const stopGeneration = () => {
     abortController.value.abort()
     abortController.value = null
   }
+  markRunTerminal('cancelled')
   finalizeLastAssistantTools(true)
   loading.value = false
   pendingApproval.value = null
@@ -738,14 +855,40 @@ const stopGeneration = () => {
 
 const handleApproval = (decision: 'allow' | 'deny') => {
   if (!pendingApproval.value) return
-  chatApi.approveTool(pendingApproval.value.runId, decision)
+  chatApi.approveTool(pendingApproval.value.runId, decision, {
+    toolCallId: pendingApproval.value.toolCallId,
+    sessionId: currentSessionId.value || undefined,
+  })
   pendingApproval.value = null
 }
 
 const handleAskUser = (answer: string | string[]) => {
   if (!pendingAskUser.value) return
-  chatApi.answerAskUser(pendingAskUser.value.runId, answer)
+  const pending = pendingAskUser.value
+  chatApi.answerAskUser(pending.runId, answer, {
+    interruptId: pending.interruptId,
+    toolCallId: pending.toolCallId,
+    mode: pending.mode,
+    sessionId: currentSessionId.value || undefined,
+  })
   pendingAskUser.value = null
+}
+
+const handleHandoffAck = () => {
+  if (!pendingAskUser.value) return
+  const pending = pendingAskUser.value
+  chatApi.ackHandoff(pending.runId, {
+    interruptId: pending.interruptId,
+    toolCallId: pending.toolCallId,
+    sessionId: currentSessionId.value || undefined,
+  })
+  pendingAskUser.value = null
+}
+
+const requestUndo = (snapshotId: string) => {
+  if (loading.value) return
+  inputMessage.value = `请立即调用 undo_file_change，snapshot_id="${snapshotId}"，不要做其他操作。`
+  void sendMessage()
 }
 
 // 更新消息段（触发 Vue 响应性）
@@ -779,6 +922,10 @@ const sendMessage = async () => {
 
   messages.value.push(userMsg)
   inputMessage.value = ''
+  lastRunSummary.value = null
+  terminalRunStatus.value = null
+  runStartedAt.value = Date.now()
+  startRunClock()
   loading.value = true
   contextCompressing.value = false
   activeStage.value = chatWs.isConnected ? 'thinking' : 'connecting'
@@ -803,6 +950,7 @@ const sendMessage = async () => {
     saveCurrentSession,
     updateMessageSegments,
     finalizeRunningToolSegments,
+    markRunTerminal,
     scrollToBottom: () => { scrollToBottom() },
   }
   const batcher = createChatStreamEventBatcher(streamCtx)
@@ -826,14 +974,22 @@ const sendMessage = async () => {
     await scrollToBottom(false, true)
   } catch (error: unknown) {
     if (error instanceof Error && error.name === 'AbortError') {
+      markRunTerminal('cancelled')
       console.log('用户取消了请求')
     } else {
       console.error('发送消息失败:', error)
+      markRunTerminal('error')
       message.error('发送消息失败')
       messages.value.pop()
     }
   } finally {
     batcher.flush()
+    if (currentSessionId.value === startedSessionId) {
+      finalizeRunSummary('done')
+    } else {
+      stopRunClock()
+      runStartedAt.value = null
+    }
     loading.value = false
     abortController.value = null
     activeStage.value = null
@@ -941,6 +1097,22 @@ const openWorkspaceFolder = async () => {
           <span>{{ loadingMore ? '加载中...' : '加载更早的消息' }}</span>
         </div>
         <div
+          v-if="runProgressSummary"
+          :class="['run-progress', { active: runProgressSummary.active }]"
+          aria-live="polite"
+        >
+          <span class="run-progress-indicator" aria-hidden="true"></span>
+          <span class="run-progress-stage">{{ runProgressSummary.stageLabel }}</span>
+          <code class="inline-code">用时 {{ runProgressSummary.elapsedLabel }}</code>
+          <code
+            v-if="runProgressSummary.todoTotal > 0"
+            class="inline-code"
+          >{{ runProgressSummary.todoCompleted }}/{{ runProgressSummary.todoTotal }} 个任务完成</code>
+          <span v-if="runProgressSummary.terminalLabel" class="run-progress-terminal">
+            {{ runProgressSummary.terminalLabel }}
+          </span>
+        </div>
+        <div
           v-for="(group, groupIndex) in messageGroups"
           :key="groupIndex"
           v-show="group.role !== 'assistant' || hasGroupVisibleContent(group) || shouldShowGroupThinking(group, groupIndex)"
@@ -960,25 +1132,35 @@ const openWorkspaceFolder = async () => {
               <template v-if="msg.segments && msg.segments.length > 0">
                 <template v-for="segment in msg.segments" :key="segment.id">
                   <!-- 文本段 -->
-                  <div v-if="segment.type === 'text' && segment.content" class="message-bubble">
-                    <div
-                      class="message-text"
-                      v-html="renderMarkdown(segment.content)"
-                    ></div>
+                  <div v-if="segment.type === 'text' && segment.content" class="message-bubble agent-bubble">
+                    <div class="message-text">
+                      <MarkdownContent
+                        :content="segment.content"
+                        :streaming="loading && group.role === 'assistant' && isLastMessageGroup(groupIndex)"
+                      />
+                    </div>
                   </div>
                   <!-- 工具调用段 - 只显示非隐藏的工具 -->
                   <div
                     v-if="segment.type === 'tool' && !getToolConfig(segment.tool).hidden"
-                    :class="['tool-card', segment.status]"
+                    :class="['tool-card', 'system-action-node', segment.status]"
+                    data-origin="system"
                   >
                     <div
                       class="tool-header"
                       @click="segment.status !== 'running' && toggleToolCollapse(segment.id)"
                     >
-                      <span class="tool-icon">{{ getToolConfig(segment.tool).icon }}</span>
+                      <span class="tool-icon" aria-hidden="true">{{ getToolConfig(segment.tool).icon }}</span>
                       <span class="tool-name">
-                        <template v-if="!isToolExpanded(segment.id)">使用了</template>
-                        {{ getToolConfig(segment.tool).name }}
+                        <span class="tool-action-verb">
+                          {{ getToolActionDisplay(segment.tool, segment.args, segment.status).verb }}
+                          {{ getToolActionDisplay(segment.tool, segment.args, segment.status).name }}
+                        </span>
+                        <code
+                          v-if="getToolActionDisplay(segment.tool, segment.args, segment.status).target"
+                          class="inline-code tool-inline-entity"
+                          :title="getToolActionDisplay(segment.tool, segment.args, segment.status).target"
+                        >{{ getToolActionDisplay(segment.tool, segment.args, segment.status).target }}</code>
                       </span>
                       <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
                         <LoadingOutlined /> 执行中
@@ -987,6 +1169,8 @@ const openWorkspaceFolder = async () => {
                         <LoadingOutlined /> 载入中
                       </Tag>
                       <Tag v-else-if="segment.status === 'error' || toolResultLooksLikeError(segment.result)" color="error" class="tool-tag">失败</Tag>
+                      <Tag v-else-if="segment.status === 'policy_denied'" color="warning" class="tool-tag">策略拒绝</Tag>
+                      <Tag v-else-if="segment.status === 'cancelled'" color="warning" class="tool-tag">已取消</Tag>
                       <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
                       <span
                         v-if="segment.status !== 'running'"
@@ -996,19 +1180,42 @@ const openWorkspaceFolder = async () => {
                       </span>
                     </div>
                     <p
+                      v-if="!isToolExpanded(segment.id) && segment.result && !toolResultLooksLikeError(segment.result)"
+                      class="tool-result-summary"
+                    >
+                      <span class="system-label">系统返回</span>
+                      <span>{{ toolResultPreview(segment.result) }}</span>
+                    </p>
+                    <div
+                      v-if="segment.snapshotId && segment.status === 'done'"
+                      class="tool-undo-row"
+                    >
+                      <Button
+                        v-if="segment.undoStatus === 'available'"
+                        size="small"
+                        @click.stop="requestUndo(segment.snapshotId!)"
+                      >
+                        撤销此变更
+                      </Button>
+                      <span v-else-if="segment.undoStatus === 'conflict'" class="undo-status">无法撤销：目标已变化</span>
+                      <span v-else-if="segment.undoStatus === 'expired'" class="undo-status">快照已过期</span>
+                      <span v-else-if="segment.undoStatus === 'cross_session'" class="undo-status">跨会话拒绝</span>
+                      <span v-else-if="segment.undoStatus === 'unavailable'" class="undo-status">快照不可用</span>
+                    </div>
+                    <p
                       v-if="!isToolExpanded(segment.id) && toolResultLooksLikeError(segment.result)"
                       class="tool-error-preview"
-                    >{{ toolErrorPreview(segment.result) }}</p>
+                    ><span class="system-label">系统错误</span>{{ toolErrorPreview(segment.result) }}</p>
                     <!-- 展开后显示入参和结果 -->
                     <div v-if="isToolExpanded(segment.id)" class="tool-details">
                       <!-- 入参 -->
                       <div v-if="segment.args && Object.keys(segment.args).length > 0" class="tool-args">
-                        <div class="tool-detail-label">入参</div>
+                        <div class="tool-detail-label">工具输入</div>
                         <pre class="tool-detail-content">{{ formatToolArgs(segment.args) }}</pre>
                       </div>
                       <!-- 结果 -->
                       <div v-if="segment.result" class="tool-result-wrapper">
-                        <div class="tool-detail-label">{{ segment.toolResultTruncated ? '结果预览' : '结果' }}</div>
+                        <div class="tool-detail-label">{{ segment.toolResultTruncated ? '系统返回预览' : '系统返回' }}</div>
                         <pre class="tool-detail-content">{{ formatToolResult(segment.result) }}</pre>
                       </div>
                     </div>
@@ -1016,11 +1223,13 @@ const openWorkspaceFolder = async () => {
                 </template>
               </template>
               <!-- 如果没有分段，显示普通内容（历史消息） -->
-              <div v-else-if="msg.content" class="message-bubble">
-                <div
-                  class="message-text"
-                  v-html="renderMarkdown(msg.content)"
-                ></div>
+              <div v-else-if="msg.content" class="message-bubble agent-bubble">
+                <div class="message-text">
+                  <MarkdownContent
+                    :content="msg.content"
+                    :streaming="loading && group.role === 'assistant' && isLastMessageGroup(groupIndex)"
+                  />
+                </div>
               </div>
             </template>
 
@@ -1086,10 +1295,22 @@ const openWorkspaceFolder = async () => {
     </div>
 
     <ToolApprovalModal :pending="pendingApproval" @decide="handleApproval" />
-    <AskUserModal :pending="pendingAskUser" @answer="handleAskUser" />
+    <AskUserModal
+      :pending="pendingAskUser"
+      @answer="handleAskUser"
+      @handoff-ack="handleHandoffAck"
+    />
 
     <!-- 输入区域 -->
     <div class="chat-input-wrapper">
+      <div
+        v-if="sessionTodos.length && !runProgressSummary?.active"
+        class="todo-summary"
+        aria-live="polite"
+      >
+        <span>当前计划</span>
+        <code class="inline-code">{{ completedTodoCount }}/{{ sessionTodos.length }} 个任务完成</code>
+      </div>
       <ul v-if="sessionTodos.length" class="session-todos" aria-label="当前待办">
         <li
           v-for="item in sessionTodos"
@@ -1231,6 +1452,54 @@ const openWorkspaceFolder = async () => {
   border-color: var(--color-primary);
 }
 
+/* 当前回合的轻量进度上下文 */
+.run-progress {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: min(800px, 100%);
+  padding: 7px 12px;
+  margin-bottom: 4px;
+  color: var(--color-text-secondary);
+  background: color-mix(in srgb, var(--color-surface) 88%, var(--color-primary-light));
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.run-progress.active {
+  border-color: var(--color-primary-border);
+}
+
+.run-progress-indicator {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--color-text-secondary);
+}
+
+.run-progress.active .run-progress-indicator {
+  background: var(--color-primary);
+  animation: progress-pulse 1.4s ease-in-out infinite;
+}
+
+.run-progress-stage {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.run-progress-terminal {
+  color: var(--color-text-secondary);
+}
+
+@keyframes progress-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 /* 消息组样式 */
 .message-group {
   display: flex;
@@ -1288,6 +1557,10 @@ const openWorkspaceFolder = async () => {
   max-width: 100%;
 }
 
+.agent-bubble .message-text {
+  border-left: 2px solid color-mix(in srgb, var(--color-primary) 45%, transparent);
+}
+
 .message-text {
   padding: 10px 14px;
   border-radius: 12px;
@@ -1300,54 +1573,6 @@ const openWorkspaceFolder = async () => {
 .message-group.user .message-text {
   background-color: var(--color-primary-light);
   border: 1px solid var(--color-primary-border);
-}
-
-/* Markdown 样式 */
-.message-text :deep(p) {
-  margin: 0;
-}
-
-.message-text :deep(p + p) {
-  margin-top: 8px;
-}
-
-.message-text :deep(code) {
-  background-color: rgba(0, 0, 0, 0.05);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 13px;
-}
-
-.message-text :deep(pre) {
-  background-color: #1e1e1e;
-  color: #d4d4d4;
-  padding: 12px;
-  border-radius: 8px;
-  overflow-x: auto;
-  margin: 8px 0;
-}
-
-.message-text :deep(pre code) {
-  background-color: transparent;
-  padding: 0;
-}
-
-.message-text :deep(ul),
-.message-text :deep(ol) {
-  margin: 8px 0;
-  padding-left: 20px;
-}
-
-.message-text :deep(blockquote) {
-  border-left: 3px solid var(--color-primary);
-  padding-left: 12px;
-  margin: 8px 0;
-  color: var(--color-text-secondary);
-}
-
-.message-text :deep(a) {
-  color: var(--color-primary);
-  text-decoration: underline;
 }
 
 /* 组底部 */
@@ -1479,6 +1704,17 @@ const openWorkspaceFolder = async () => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.todo-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: 800px;
+  margin: 0 auto 8px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
 }
 
 .session-todo {
@@ -1626,6 +1862,10 @@ const openWorkspaceFolder = async () => {
   transition: all 0.2s ease;
 }
 
+.system-action-node {
+  box-shadow: none;
+}
+
 /* 执行中状态 - 龙虾红主题 */
 .tool-card.running {
   border-color: var(--color-primary);
@@ -1654,6 +1894,11 @@ const openWorkspaceFolder = async () => {
   color: var(--color-primary);
 }
 
+.tool-card.cancelled {
+  border-color: var(--color-border);
+  background: color-mix(in srgb, var(--color-surface) 88%, #f0ad4e);
+}
+
 .tool-header {
   display: flex;
   align-items: center;
@@ -1666,12 +1911,72 @@ const openWorkspaceFolder = async () => {
   opacity: 0.8;
 }
 
+.tool-name {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tool-action-verb {
+  white-space: nowrap;
+}
+
+.inline-code {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 5px;
+  color: var(--color-text);
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 4px;
+  font-family: ui-monospace, 'SF Mono', Monaco, 'Andale Mono', monospace;
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  vertical-align: baseline;
+}
+
+.tool-inline-entity {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-label {
+  margin-right: 6px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.tool-result-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  margin: 6px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.tool-undo-row {
+  margin-top: 6px;
+}
+
+.undo-status {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
 .tool-error-preview {
   margin: 6px 0 0;
   padding: 0 2px;
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-primary);
+  overflow-wrap: anywhere;
 }
 
 .tool-icon {

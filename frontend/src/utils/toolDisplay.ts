@@ -3,75 +3,81 @@ export interface ToolDisplayConfig {
   name: string         // 友好名称
   icon: string         // emoji 图标
   hidden?: boolean     // 是否隐藏
+  pastVerb?: string    // 完成态动词
+  runningVerb?: string // 执行中动词
+  objectKeys?: string[] // 优先展示的核心对象字段
 }
 
 export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayConfig> = {
   // 内置工具 - 隐藏
-  Thought: { name: '思考', icon: '💭', hidden: true },
-  Finish: { name: '完成', icon: '✅', hidden: true },
+  Thought: { name: '思考', icon: '💭', hidden: true, pastVerb: '已整理', runningVerb: '正在整理' },
+  Finish: { name: '完成', icon: '✅', hidden: true, pastVerb: '已完成', runningVerb: '正在完成' },
 
   // 桥接披露工具（内部流程，不在 UI 展示）
-  tool_search: { name: '搜索工具', icon: '🔍', hidden: true },
-  tool_describe: { name: '工具详情', icon: '📋', hidden: true },
-  tool_call: { name: '调用工具', icon: '🔧', hidden: true },
-  mcp_status: { name: 'MCP 状态', icon: '🔌', hidden: true },
+  tool_search: { name: '搜索工具', icon: '🔍', hidden: true, pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['query', 'name'] },
+  tool_describe: { name: '工具详情', icon: '📋', hidden: true, pastVerb: '已查看', runningVerb: '正在查看', objectKeys: ['name', 'tool'] },
+  tool_call: { name: '调用工具', icon: '🔧', hidden: true, pastVerb: '已调用', runningVerb: '正在调用', objectKeys: ['name', 'tool'] },
+  mcp_status: { name: 'MCP 状态', icon: '🔌', hidden: true, pastVerb: '已检查', runningVerb: '正在检查', objectKeys: ['name', 'server'] },
 
   // 文件操作工具
-  read_file: { name: '读取文件', icon: '📄' },
-  write_file: { name: '写入文件', icon: '✏️' },
-  replace_in_file: { name: '替换文本', icon: '📝' },
-  list_directory: { name: '列出目录', icon: '📂' },
-  search_files: { name: '搜索文件内容', icon: '🔍' },
-  glob_search: { name: 'Glob 搜索', icon: '🗂️' },
-  mkdir: { name: '创建目录', icon: '📁' },
-  move_file: { name: '移动文件', icon: '📦' },
-  delete_file: { name: '删除文件', icon: '🗑️' },
+  read_file: { name: '文件', icon: '📄', pastVerb: '已读取', runningVerb: '正在读取', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  write_file: { name: '文件', icon: '✏️', pastVerb: '已写入', runningVerb: '正在写入', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  replace_in_file: { name: '文件', icon: '📝', pastVerb: '已修改', runningVerb: '正在修改', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  list_directory: { name: '目录', icon: '📂', pastVerb: '已列出', runningVerb: '正在列出', objectKeys: ['path', 'directory', 'dir'] },
+  search_files: { name: '文件内容', icon: '🔍', pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['query', 'pattern', 'path'] },
+  glob_search: { name: '文件', icon: '🗂️', pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['pattern', 'path', 'query'] },
+  mkdir: { name: '目录', icon: '📁', pastVerb: '已创建', runningVerb: '正在创建', objectKeys: ['path', 'directory', 'dir'] },
+  move_file: { name: '文件', icon: '📦', pastVerb: '已移动', runningVerb: '正在移动', objectKeys: ['source', 'src', 'destination', 'dest', 'path'] },
+  delete_file: { name: '文件', icon: '🗑️', pastVerb: '已删除', runningVerb: '正在删除', objectKeys: ['path', 'file_path', 'file', 'filename'] },
   // 旧名称兼容
-  Read: { name: '读取文件', icon: '📄' },
-  Write: { name: '写入文件', icon: '✏️' },
-  Edit: { name: '编辑文件', icon: '📝' },
-  MultiEdit: { name: '批量编辑', icon: '📝' },
+  Read: { name: '文件', icon: '📄', pastVerb: '已读取', runningVerb: '正在读取', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  Write: { name: '文件', icon: '✏️', pastVerb: '已写入', runningVerb: '正在写入', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  Edit: { name: '文件', icon: '📝', pastVerb: '已修改', runningVerb: '正在修改', objectKeys: ['path', 'file_path', 'file', 'filename'] },
+  MultiEdit: { name: '文件', icon: '📝', pastVerb: '已批量修改', runningVerb: '正在批量修改', objectKeys: ['path', 'file_path', 'file', 'filename'] },
 
-  run_shell: { name: 'Shell 命令', icon: '💻' },
-  process: { name: '进程控制', icon: '📟' },
-  todo: { name: '待办', icon: '✅' },
-  ask_user: { name: '询问用户', icon: '❓' },
+  run_shell: { name: '命令', icon: '💻', pastVerb: '已运行', runningVerb: '正在运行', objectKeys: ['command', 'cmd', 'script'] },
+  process: { name: '进程', icon: '📟', pastVerb: '已处理', runningVerb: '正在处理', objectKeys: ['action', 'command', 'name'] },
+  todo: { name: '计划', icon: '✅', pastVerb: '已更新', runningVerb: '正在更新', objectKeys: ['content', 'title', 'name'] },
+  ask_user: { name: '问题', icon: '❓', pastVerb: '已询问', runningVerb: '正在询问', objectKeys: ['prompt', 'question'] },
 
   // 计算工具
-  python_calculator: { name: '计算器', icon: '🔢' },
+  python_calculator: { name: '计算', icon: '🔢', pastVerb: '已计算', runningVerb: '正在计算', objectKeys: ['expression', 'query'] },
 
   // 日期时间
-  get_current_time: { name: '当前时间', icon: '🕐' },
+  get_current_time: { name: '时间', icon: '🕐', pastVerb: '已获取', runningVerb: '正在获取', objectKeys: ['timezone', 'location'] },
 
   // 记忆工具（麦林自定义）
-  memory: { name: '记忆操作', icon: '🧠' },
-  memory_search: { name: '搜索记忆', icon: '🔍' },
-  memory_get: { name: '读取记忆', icon: '📖' },
-  memory_add: { name: '添加记忆', icon: '📝' },
-  memory_update_longterm: { name: '更新长期记忆', icon: '📚' },
-  memory_list: { name: '列出记忆文件', icon: '📋' },
-  memory_cleanup: { name: '清理过期记忆', icon: '🧹' },
+  memory: { name: '记忆', icon: '🧠', pastVerb: '已处理', runningVerb: '正在处理', objectKeys: ['path', 'query', 'content'] },
+  memory_search: { name: '记忆', icon: '🔍', pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['query'] },
+  memory_get: { name: '记忆', icon: '📖', pastVerb: '已读取', runningVerb: '正在读取', objectKeys: ['path', 'name'] },
+  memory_add: { name: '记忆', icon: '📝', pastVerb: '已添加', runningVerb: '正在添加', objectKeys: ['content', 'path'] },
+  memory_update_longterm: { name: '记忆', icon: '📚', pastVerb: '已更新', runningVerb: '正在更新', objectKeys: ['content', 'path'] },
+  memory_list: { name: '记忆文件', icon: '📋', pastVerb: '已列出', runningVerb: '正在列出', objectKeys: ['path'] },
+  memory_cleanup: { name: '记忆', icon: '🧹', pastVerb: '已清理', runningVerb: '正在清理', objectKeys: ['path'] },
 
   // 任务工具
-  Task: { name: '子任务', icon: '📋' },
+  Task: { name: '子任务', icon: '📋', pastVerb: '已完成', runningVerb: '正在执行', objectKeys: ['prompt', 'name', 'title'] },
 
   // 命令执行工具
-  execute_command: { name: '执行命令', icon: '💻' },
-  exec_run: { name: '执行命令', icon: '💻' },
-  exec_allowed_commands: { name: '查看允许的命令', icon: '📋' },
-  exec_dangerous_patterns: { name: '查看危险命令', icon: '⚠️' },
+  execute_command: { name: '命令', icon: '💻', pastVerb: '已运行', runningVerb: '正在运行', objectKeys: ['command', 'cmd', 'script'] },
+  exec_run: { name: '命令', icon: '💻', pastVerb: '已运行', runningVerb: '正在运行', objectKeys: ['command', 'cmd', 'script'] },
+  exec_allowed_commands: { name: '命令规则', icon: '📋', pastVerb: '已查看', runningVerb: '正在查看', objectKeys: ['query', 'name'] },
+  exec_dangerous_patterns: { name: '危险规则', icon: '⚠️', pastVerb: '已查看', runningVerb: '正在查看', objectKeys: ['query', 'name'] },
 
   // 网络工具
-  web_search: { name: '网络搜索', icon: '🌐' },
-  search_web: { name: '网络搜索', icon: '🌐' },
-  web_fetch: { name: '获取网页', icon: '📡' },
-  fetch_url: { name: '获取网页', icon: '📡' },
+  web_search: { name: '网页', icon: '🌐', pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['query'] },
+  search_web: { name: '网页', icon: '🌐', pastVerb: '已搜索', runningVerb: '正在搜索', objectKeys: ['query'] },
+  web_fetch: { name: '网页', icon: '📡', pastVerb: '已获取', runningVerb: '正在获取', objectKeys: ['url'] },
+  fetch_url: { name: '网页', icon: '📡', pastVerb: '已获取', runningVerb: '正在获取', objectKeys: ['url'] },
 }
 
 // 默认配置（未知工具）
 export const DEFAULT_TOOL_CONFIG: ToolDisplayConfig = {
   name: '工具',
   icon: '🔧',
+  pastVerb: '已执行',
+  runningVerb: '正在执行',
+  objectKeys: ['path', 'command', 'cmd', 'query', 'name', 'title'],
 }
 
 // 解析 MCP 工具名：mcp_{server}_{tool} → 友好展示
@@ -101,6 +107,79 @@ export function getToolConfig(toolName: string): ToolDisplayConfig {
     return parseMcpToolName(toolName)
   }
   return DEFAULT_TOOL_CONFIG
+}
+
+export interface ToolActionDisplay {
+  verb: string
+  name: string
+  target?: string
+  targetKind?: 'path' | 'command' | 'value'
+}
+
+type ToolActionStatus = 'running' | 'done' | 'error' | 'cancelled' | 'policy_denied'
+
+const COMMAND_KEYS = new Set(['command', 'cmd', 'script', 'shell'])
+const PATH_KEYS = new Set(['path', 'file_path', 'file', 'filename', 'directory', 'dir', 'source', 'src', 'destination', 'dest'])
+
+const stringifyTarget = (value: unknown): string => {
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+export function getToolActionDisplay(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  status: ToolActionStatus,
+): ToolActionDisplay {
+  const config = getToolConfig(toolName)
+  const source = args || {}
+  const keys = config.objectKeys || []
+  let targetKey = ''
+  let target = ''
+
+  for (const key of keys) {
+    const candidate = stringifyTarget(source[key])
+    if (candidate) {
+      targetKey = key
+      target = candidate
+      break
+    }
+  }
+
+  if (!target) {
+    for (const [key, value] of Object.entries(source)) {
+      const candidate = stringifyTarget(value)
+      if (candidate) {
+        targetKey = key
+        target = candidate
+        break
+      }
+    }
+  }
+
+  if (target.length > 140) {
+    target = `${target.slice(0, 137)}...`
+  }
+
+  const targetKind = COMMAND_KEYS.has(targetKey)
+    ? 'command'
+    : PATH_KEYS.has(targetKey)
+      ? 'path'
+      : target
+        ? 'value'
+        : undefined
+
+  const verb = status === 'running'
+    ? (config.runningVerb || '正在执行')
+    : (config.pastVerb || '已执行')
+
+  return {
+    verb,
+    name: config.name,
+    target: target || undefined,
+    targetKind,
+  }
 }
 
 // 格式化工具参数显示
@@ -162,4 +241,10 @@ export function toolErrorPreview(result?: string): string {
   }
   const firstLine = text.split('\n')[0] || text
   return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
+}
+
+export function toolResultPreview(result?: string): string {
+  if (!result?.trim()) return ''
+  const firstLine = result.trim().split('\n')[0] || result
+  return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine
 }

@@ -95,8 +95,16 @@ export interface StreamEvent {
   run_id?: string
   partial?: boolean
   cancelled?: boolean
+  handoff?: boolean
+  terminal_reason?: string
+  fail_closed?: boolean
+  reason_code?: string
   reason?: string
   tool_call_id?: string
+  interrupt_id?: string
+  mode?: string
+  terminal_on_ack?: boolean
+  preview?: Record<string, unknown>
   kind?: string
   prompt?: string
   options?: string[]
@@ -237,10 +245,15 @@ export const chatApi = {
                     tool: parsed.tool,
                     args: parsed.args,
                     reason: parsed.reason,
+                    reason_code: parsed.reason_code,
                     tool_call_id: parsed.tool_call_id,
+                    interrupt_id: parsed.interrupt_id,
+                    mode: parsed.mode,
+                    terminal_on_ack: Boolean(parsed.terminal_on_ack),
                     prompt: parsed.prompt,
                     options: Array.isArray(parsed.options) ? parsed.options : [],
                     allow_multiple: Boolean(parsed.allow_multiple),
+                    preview: parsed.preview,
                     run_id: runId,
                   })
                 } else if (currentEvent === 'todo') {
@@ -309,10 +322,24 @@ export const chatApi = {
   },
 
   // 工具审批 / 问人
-  approveTool: (runId: string, decision: 'allow' | 'deny') => {
-    chatWs.approve(runId, decision)
+  approveTool: (
+    runId: string,
+    decision: 'allow' | 'deny',
+    opts?: { toolCallId?: string; sessionId?: string },
+  ) => {
+    chatWs.approve(runId, decision, opts)
   },
-  answerAskUser: (runId: string, answer: string | string[]) => {
-    chatWs.answerAskUser(runId, answer)
+  answerAskUser: (
+    runId: string,
+    answer: string | string[],
+    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string },
+  ) => {
+    chatWs.answerAskUser(runId, answer, opts)
+  },
+  ackHandoff: (
+    runId: string,
+    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string },
+  ) => {
+    chatWs.ackHandoff(runId, opts)
   },
 }

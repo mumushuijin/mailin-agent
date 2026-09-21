@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from app.maintenance.types import MaintenanceResult
+from app.tools.mcp.lifecycle import ensure_mcp_connected
 from app.tools.mcp.status import build_mcp_status_payload
 
 _last_health_snapshot: str | None = None
@@ -12,6 +13,8 @@ def check_mcp_health() -> MaintenanceResult | None:
     """检测 MCP 连接状态，仅在状态变化时返回需通知的结果。"""
     global _last_health_snapshot
 
+    # 健康检查是显式 discovery 入口；mcp_status 本身只读取快照。
+    ensure_mcp_connected(blocking=False)
     payload = build_mcp_status_payload()
     servers = payload.get("servers") or []
     if not payload.get("configured_servers"):

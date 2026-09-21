@@ -61,25 +61,26 @@ DEFAULT_CONTEXT_CONFIG = {
 
 def load_context_config(workspace: Path | None = None) -> dict:
     workspace = workspace or get_settings().workspace_path
-    config_path = workspace / "CONFIG.json"
-    if not config_path.exists():
-        return dict(DEFAULT_CONTEXT_CONFIG)
     try:
-        full = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        from app.tools.registry import load_full_config
+
+        full = load_full_config(workspace)
+    except Exception:
         return dict(DEFAULT_CONTEXT_CONFIG)
     ctx = full.get("context", {})
+    if not isinstance(ctx, dict):
+        return dict(DEFAULT_CONTEXT_CONFIG)
     merged = dict(DEFAULT_CONTEXT_CONFIG)
-    merged.update({k: v for k, v in ctx.items() if k != "budget" and k != "bootstrap"})
-    if "budget" in ctx:
+    merged.update({k: v for k, v in ctx.items() if k != "budget" and k != "bootstrap" and k != "memory"})
+    if "budget" in ctx and isinstance(ctx["budget"], dict):
         merged["budget"] = {**DEFAULT_CONTEXT_CONFIG["budget"], **ctx["budget"]}
-    if "bootstrap" in ctx:
+    if "bootstrap" in ctx and isinstance(ctx["bootstrap"], dict):
         merged["bootstrap"] = {**DEFAULT_CONTEXT_CONFIG["bootstrap"], **ctx["bootstrap"]}
-    if "memory" in ctx:
+    if "memory" in ctx and isinstance(ctx["memory"], dict):
         mem = {**DEFAULT_CONTEXT_CONFIG["memory"], **ctx["memory"]}
-        if "hot" in ctx.get("memory", {}):
+        if "hot" in ctx["memory"] and isinstance(ctx["memory"]["hot"], dict):
             mem["hot"] = {**DEFAULT_CONTEXT_CONFIG["memory"]["hot"], **ctx["memory"]["hot"]}
-        if "warm" in ctx.get("memory", {}):
+        if "warm" in ctx["memory"] and isinstance(ctx["memory"]["warm"], dict):
             mem["warm"] = {**DEFAULT_CONTEXT_CONFIG["memory"]["warm"], **ctx["memory"]["warm"]}
         merged["memory"] = mem
     return merged

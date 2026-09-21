@@ -7,11 +7,18 @@ import threading
 import time
 
 from app.tools.mcp.bridge import get_mcp_cards, set_mcp_cards
-from app.tools.mcp.config import load_mcp_server_configs
+from app.tools.mcp.config import get_mcp_config_revision, load_mcp_catalog, load_mcp_server_configs
 from app.tools.mcp.discovery import build_cards_for_server
 from app.tools.mcp.loop import ensure_mcp_loop, run_on_mcp_loop, stop_mcp_loop
 from app.tools.mcp.server_task import MCPServerTask
-from app.tools.mcp.types import McpServerStatus
+from app.tools.mcp.types import (
+    McpCatalog,
+    McpManagementState,
+    McpServerConfig,
+    McpServerDefinition,
+    McpServerStatus,
+    McpStatusSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,29 +41,222 @@ _discover_running = False
 _MAX_CONNECT_ATTEMPTS = 3
 _DISCOVERY_READY_CAP_SEC = 10.0
 MCP_STATUS_CACHE_TTL_SECONDS = 5.0
-_mcp_status_cache: list[McpServerStatus] | None = None
-_mcp_status_cache_at = 0.0
+_mcp_status_snapshot: McpStatusSnapshot | None = None
+_applied_config_revision: int = 0
 
 
 def _invalidate_mcp_status_cache_locked() -> None:
-    global _mcp_status_cache, _mcp_status_cache_at
-    _mcp_status_cache = None
-    _mcp_status_cache_at = 0.0
+    global _mcp_status_snapshot
+    if _mcp_status_snapshot is not None:
+        _mcp_status_snapshot.stale = True
 
 
 def clear_mcp_status_cache() -> None:
+    global _mcp_status_snapshot
+    with _lock:
+        _mcp_status_snapshot = None
+
+
+def mark_mcp_config_stale(*, reason: str = "config") -> None:
+    """配置变更后标记快照过期，不隐式触发 discovery。"""
     with _lock:
         _invalidate_mcp_status_cache_locked()
+    logger.debug("MCP config marked stale: %s", reason)
+
+
+def get_applied_config_revision() -> int:
+    with _lock:
+        return _applied_config_revision
+
+
+def _set_applied_revision(revision: int) -> None:
+    global _applied_config_revision
+    with _lock:
+        _applied_config_revision = int(revision)
 
 
 def _clear_tools_cache_quietly() -> None:
-    clear_mcp_status_cache()
+    with _lock:
+        _invalidate_mcp_status_cache_locked()
     try:
         from app.tools.registry import clear_tools_cache
 
         clear_tools_cache()
     except Exception:
         pass
+
+
+def resolve_management_state(
+    definition: McpServerDefinition | None,
+    status: McpServerStatus | None,
+    snapshot: McpStatusSnapshot | None = None,
+) -> McpManagementState:
+    """将配置与运行时快照映射为管理状态。"""
+    if definition is not None and not definition.enabled:
+        return "disabled"
+    if definition is not None and definition.validation_errors:
+        if not definition.command and not definition.url:
+            return "not_configured"
+        return "error"
+    if definition is not None and not definition.can_connect:
+        return "not_configured"
+
+    config_revision = snapshot.config_revision if snapshot else get_mcp_config_revision()
+    applied = snapshot.applied_revision if snapshot else get_applied_config_revision()
+    if snapshot is not None and (snapshot.stale or config_revision != applied):
+        # 配置已变更但尚未完成 refresh：优先 stale，除非正在 connecting
+        if status is not None and status.state == "connecting":
+            return "connecting"
+        if not _MCP_SDK_AVAILABLE:
+            return "error"
+        return "stale"
+
+    if not _MCP_SDK_AVAILABLE:
+        return "error"
+
+    if status is None:
+        return "error"
+
+    if status.state == "connecting":
+        return "connecting"
+    if status.connected and status.tool_count > 0:
+        return "ready"
+    if status.connected and status.tool_count == 0:
+        return "degraded"
+    if status.error:
+        return "error"
+    return "error"
+
+
+def close_mcp_server(name: str) -> None:
+    """关闭单个 Server 连接并移除其 ToolCard。"""
+    with _lock:
+        server = _servers.pop(name, None)
+        _connect_failures.pop(name, None)
+        _server_errors.pop(name, None)
+    if server is not None:
+
+        async def _shutdown() -> None:
+            await server.shutdown()
+
+        try:
+            run_on_mcp_loop(_shutdown(), timeout=15)
+        except Exception as exc:
+            logger.debug("MCP server '%s' close 异常: %s", name, exc)
+
+    remaining = [c for c in get_mcp_cards() if c.package != f"mcp-{name}"]
+    set_mcp_cards(remaining)
+    _clear_tools_cache_quietly()
+    _refresh_mcp_status_snapshot(source="close")
+
+
+def test_mcp_server_connection(config: McpServerConfig) -> dict:
+    """有界临时连接测试；成功也不替换正式运行时。"""
+    if not _MCP_SDK_AVAILABLE:
+        return {
+            "ok": False,
+            "state": "error",
+            "tool_count": 0,
+            "tool_names": [],
+            "error": "未安装 mcp 包，请执行: uv pip install -e '.[mcp]'",
+            "error_code": "mcp_extra_missing",
+        }
+
+    ensure_mcp_loop()
+
+    async def _test() -> dict:
+        server = MCPServerTask(f"__test__{config.name}", config, max_reconnect_attempts=1)
+        try:
+            await server.start()
+            ready_timeout = min(config.connect_timeout, _DISCOVERY_READY_CAP_SEC)
+            ready = await server.wait_ready(ready_timeout)
+            if not ready:
+                err = server.error or f"连接超时（{ready_timeout}s）"
+                return {
+                    "ok": False,
+                    "state": "error",
+                    "tool_count": 0,
+                    "tool_names": [],
+                    "error": err,
+                    "error_code": "connect_timeout",
+                }
+            names = [str(getattr(t, "name", "")) for t in server.tools if getattr(t, "name", None)]
+            names = [n for n in names if n]
+            state: McpManagementState = "ready" if names else "degraded"
+            return {
+                "ok": True,
+                "state": state,
+                "tool_count": len(names),
+                "tool_names": names,
+                "error": None,
+                "error_code": None,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "state": "error",
+                "tool_count": 0,
+                "tool_names": [],
+                "error": str(exc),
+                "error_code": "protocol_error",
+            }
+        finally:
+            try:
+                await server.shutdown()
+            except Exception:
+                pass
+
+    try:
+        return run_on_mcp_loop(_test(), timeout=min(90.0, max(15.0, config.connect_timeout + 5)))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "state": "error",
+            "tool_count": 0,
+            "tool_names": [],
+            "error": str(exc),
+            "error_code": "test_failed",
+        }
+
+
+def refresh_mcp_servers() -> dict[str, dict]:
+    """基于已保存配置重建启用 Server；逐 Server 返回结果。"""
+    _reset_connect_failures()
+    reload_mcp_servers()
+    catalog = load_mcp_catalog()
+    _set_applied_revision(catalog.revision)
+    snapshot = _refresh_mcp_status_snapshot(source="refresh")
+    by_id = {s.name: s for s in snapshot.statuses}
+    results: dict[str, dict] = {}
+    for server_id, definition in catalog.servers.items():
+        status = by_id.get(server_id)
+        if not definition.enabled:
+            results[server_id] = {
+                "ok": True,
+                "state": "disabled",
+                "tool_count": 0,
+                "error": None,
+                "error_code": None,
+            }
+            continue
+        if not definition.can_connect:
+            results[server_id] = {
+                "ok": False,
+                "state": "error",
+                "tool_count": 0,
+                "error": "; ".join(definition.validation_errors) or "不可连接",
+                "error_code": "validation_error",
+            }
+            continue
+        ok = bool(status and status.connected)
+        results[server_id] = {
+            "ok": ok,
+            "state": resolve_management_state(definition, status, snapshot),
+            "tool_count": status.tool_count if status else 0,
+            "error": None if ok else (status.error if status else "未连接"),
+            "error_code": None if ok else (status.error_code if status else "not_connected"),
+        }
+    return results
 
 
 def get_mcp_server(name: str) -> MCPServerTask | None:
@@ -186,12 +386,14 @@ def discover_mcp_servers() -> list[str]:
         logger.warning("未安装 mcp 包，跳过 MCP 发现。请执行: uv pip install -e '.[mcp]'")
         set_mcp_cards([])
         _clear_tools_cache_quietly()
+        _refresh_mcp_status_snapshot(source="discovery")
         return []
 
     configs = load_mcp_server_configs()
     if not configs:
         set_mcp_cards([])
         _clear_tools_cache_quietly()
+        _refresh_mcp_status_snapshot(source="discovery")
         return []
 
     with _discover_lock:
@@ -288,6 +490,11 @@ def _discover_mcp_servers_locked(configs: dict) -> list[str]:
 
         set_mcp_cards(all_cards)
         _clear_tools_cache_quietly()
+        try:
+            _set_applied_revision(load_mcp_catalog().revision)
+        except Exception:
+            pass
+        _refresh_mcp_status_snapshot(source="discovery")
         return registered_names
 
     pending = len(_servers_pending_connect(configs))
@@ -350,43 +557,80 @@ def shutdown_mcp_servers() -> None:
     set_mcp_cards([])
     stop_mcp_loop()
     _clear_tools_cache_quietly()
+    _refresh_mcp_status_snapshot(source="shutdown")
 
 
-def get_mcp_status() -> list[McpServerStatus]:
-    """返回各 Server 连接状态（非阻塞；已放弃的 Server 不再重试）。"""
-    global _mcp_status_cache, _mcp_status_cache_at
-    now = time.monotonic()
-    with _lock:
-        if _mcp_status_cache is not None and now - _mcp_status_cache_at <= MCP_STATUS_CACHE_TTL_SECONDS:
-            return copy.deepcopy(_mcp_status_cache)
-
-    ensure_mcp_connected(blocking=False)
-    configs = load_mcp_server_configs()
+def _build_mcp_statuses(catalog: McpCatalog | None = None) -> list[McpServerStatus]:
+    """从已提交的本地运行时状态构建快照，不触发任何连接动作。"""
+    catalog = catalog if catalog is not None else load_mcp_catalog()
     cards = get_mcp_cards()
     by_package: dict[str, list[str]] = {}
     for card in cards:
         by_package.setdefault(card.package, []).append(card.name)
 
     statuses: list[McpServerStatus] = []
+    discovering = _discovery_is_running()
     with _lock:
         errors = dict(_server_errors)
         servers_snapshot = dict(_servers)
+        applied = _applied_config_revision
 
-    for name, cfg in configs.items():
+    config_revision = catalog.revision
+    connectable_ids = {
+        sid for sid, d in catalog.servers.items() if d.enabled and d.can_connect
+    }
+    for name, definition in catalog.servers.items():
+        cfg = definition.to_runtime_config()
         pkg = f"mcp-{name}"
         tool_names = by_package.get(pkg, [])
         server = servers_snapshot.get(name)
-        is_connected = _server_is_live(server) and bool(tool_names)
+        live = _server_is_live(server)
+        is_connected = live and bool(tool_names)
         error = None if is_connected else errors.get(name)
-        if not is_connected and not error:
-            if server_connect_gave_up(name):
+        error_code = None
+        if not definition.enabled:
+            error = None
+            error_code = "disabled"
+        elif definition.validation_errors:
+            error = "; ".join(definition.validation_errors)
+            error_code = "validation_error"
+        elif not _MCP_SDK_AVAILABLE:
+            error = "未安装 mcp 包"
+            error_code = "mcp_extra_missing"
+        elif not is_connected and not error:
+            if discovering and name in connectable_ids:
+                error = None
+                error_code = "connecting"
+            elif server_connect_gave_up(name):
                 error = errors.get(name) or f"连接失败，已重试 {_MAX_CONNECT_ATTEMPTS} 次并暂停"
+                error_code = "connect_gave_up"
             elif server is None:
                 error = "未连接（启动时未发现，正在重试或请检查网络/URL）"
-            elif not _server_is_live(server):
+                error_code = "not_connected"
+            elif not live:
                 error = server.error or "会话已断开"
+                error_code = "disconnected"
             elif not tool_names:
                 error = "已连接但未注册工具"
+                error_code = "no_tools"
+
+        if not definition.enabled:
+            state: McpManagementState = "disabled"
+        elif definition.validation_errors:
+            state = "not_configured" if not (definition.command or definition.url) else "error"
+        elif not _MCP_SDK_AVAILABLE:
+            state = "error"
+        elif discovering and definition.can_connect and definition.enabled and not is_connected:
+            state = "connecting"
+        elif config_revision != applied:
+            state = "stale"
+        elif is_connected and tool_names:
+            state = "ready"
+        elif live and not tool_names:
+            state = "degraded"
+        else:
+            state = "error"
+
         statuses.append(
             McpServerStatus(
                 name=name,
@@ -396,12 +640,63 @@ def get_mcp_status() -> list[McpServerStatus]:
                 tool_names=tool_names,
                 error=error,
                 supports_parallel_tool_calls=cfg.supports_parallel_tool_calls,
+                enabled=definition.enabled,
+                state=state,
+                error_code=error_code,
+                display_name=definition.display_name,
+                normalized_transport=definition.connection_type,
+                config_revision=config_revision,
+                can_connect=definition.can_connect,
             )
         )
-    with _lock:
-        _mcp_status_cache = copy.deepcopy(statuses)
-        _mcp_status_cache_at = time.monotonic()
     return statuses
+
+
+def _discovery_is_running() -> bool:
+    with _discover_lock:
+        return _discover_running
+
+
+def _refresh_mcp_status_snapshot(*, source: str = "runtime") -> McpStatusSnapshot:
+    global _mcp_status_snapshot
+    catalog = load_mcp_catalog()
+    statuses = _build_mcp_statuses(catalog)
+    applied = get_applied_config_revision()
+    stale = catalog.revision != applied
+    snapshot = McpStatusSnapshot(
+        statuses=copy.deepcopy(statuses),
+        captured_at=time.time(),
+        source=source,
+        stale=stale,
+        config_revision=catalog.revision,
+        applied_revision=applied,
+        captured_monotonic=time.monotonic(),
+    )
+    with _lock:
+        _mcp_status_snapshot = snapshot
+        return copy.deepcopy(snapshot)
+
+
+def get_mcp_status_snapshot(*, force_refresh: bool = False) -> McpStatusSnapshot:
+    """读取最近一次 MCP 状态快照，不启动 discovery 或重连。"""
+    now = time.monotonic()
+    with _lock:
+        snapshot = copy.deepcopy(_mcp_status_snapshot)
+
+    if snapshot is not None:
+        age = now - snapshot.captured_monotonic
+        if not force_refresh and age <= MCP_STATUS_CACHE_TTL_SECONDS and not snapshot.stale:
+            return snapshot
+        if _discovery_is_running() and not force_refresh:
+            snapshot.stale = True
+            return snapshot
+
+    return _refresh_mcp_status_snapshot(source="local")
+
+
+def get_mcp_status() -> list[McpServerStatus]:
+    """返回各 Server 的最近已知连接状态，不触发连接动作。"""
+    return get_mcp_status_snapshot().statuses
 
 
 # 不在 import 时自动连接：避免 uvicorn reload 父子进程重复 discover 卡住启动。

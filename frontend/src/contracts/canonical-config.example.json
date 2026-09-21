@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "config": {
+    "agent": {
+      "model": "qwen-plus",
+      "temperature": 0.7,
+      "max_steps": 48,
+      "graph_version": "0.1.0-mvp"
+    },
+    "tools": {
+      "enforcement_mode": "enforce",
+      "filesystem": true,
+      "shell": true,
+      "memory": true,
+      "session": true,
+      "skills": true,
+      "calculator": true,
+      "datetime": true,
+      "web_search": false,
+      "mcp": true,
+      "tool_search": true
+    },
+    "middleware": {},
+    "skills": {
+      "global_roots": [
+        "skills"
+      ],
+      "project_enabled": true,
+      "catalog_max_items": 80,
+      "catalog_max_chars": 12000,
+      "cache_ttl_seconds": 5,
+      "disabled": []
+    },
+    "telemetry": {
+      "langsmith_enabled": false,
+      "sample_rate": 0.01
+    },
+    "context": {
+      "max_tokens": 128000,
+      "compress_threshold_ratio": 0.75,
+      "bootstrap": {
+        "single_file_max_chars": 20000,
+        "total_max_chars": 150000
+      },
+      "tool_result_max_tokens": 4000,
+      "tool_summary_max_chars": 500,
+      "budget": {
+        "bootstrap": 0.18,
+        "skills": 0.04,
+        "summary": 0.12,
+        "recent_turns": 0.28,
+        "tool_results": 0.25,
+        "current_message": 0.05,
+        "reserved": 0.08
+      },
+      "recent_turn_pairs": 5,
+      "recent_tail_max_tokens": 20000,
+      "summary_max_chars": 3000,
+      "summary_chunk_max_chars": 12000,
+      "max_compression_attempts": 3,
+      "memory": {
+        "daily_sediment_every_turns": 5,
+        "longterm_consolidate_interval_hours": 24,
+        "longterm_consolidate_days": 7,
+        "hot": {
+          "memory_char_limit": 3000,
+          "user_char_limit": 1500,
+          "section_char_limit": 800,
+          "consolidate_interval_hours": 24,
+          "max_candidates_per_run": 20,
+          "arbiter_batch_by_section": true,
+          "empty_section_placeholder": "（空）",
+          "misc_compact_every": 5
+        },
+        "warm": {
+          "nudge_every_user_turns": 5,
+          "daily_file_max_chars": 8000
+        }
+      }
+    }
+  },
+  "mcp": {
+    "version": 1,
+    "revision": 0,
+    "servers": {}
+  }
+}

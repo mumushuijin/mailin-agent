@@ -81,10 +81,19 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
         session_id: data.session_id as string,
         partial: Boolean(data.partial),
         cancelled: Boolean(data.cancelled),
+        handoff: Boolean(data.handoff),
+        terminal_reason: data.terminal_reason as string | undefined,
         ...base,
       }
     case 'error':
-      return { type: 'error', error: data.error as string, cancelled: Boolean(data.cancelled), ...base }
+      return {
+        type: 'error',
+        error: data.error as string,
+        cancelled: Boolean(data.cancelled),
+        fail_closed: Boolean(data.fail_closed),
+        reason_code: data.reason_code as string | undefined,
+        ...base,
+      }
     case 'interrupt':
       return {
         type: 'interrupt',
@@ -92,10 +101,15 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
         tool: data.tool as string,
         args: data.args as Record<string, unknown>,
         reason: data.reason as string,
+        reason_code: data.reason_code as string | undefined,
         tool_call_id: data.tool_call_id as string,
+        interrupt_id: data.interrupt_id as string | undefined,
+        mode: data.mode as string | undefined,
+        terminal_on_ack: Boolean(data.terminal_on_ack),
         prompt: data.prompt as string | undefined,
         options: Array.isArray(data.options) ? (data.options as string[]) : [],
         allow_multiple: Boolean(data.allow_multiple),
+        preview: (data.preview as Record<string, unknown> | undefined) || undefined,
         ...base,
       }
     case 'todo':
@@ -133,6 +147,9 @@ class ChatWebSocket {
   private currentRunId: string | null = null
   private runResolvers = new Map<string, { resolve: (v: ChatResponse) => void; reject: (e: Error) => void }>()
   private runCallbacks = new Map<string, StreamCallback>()
+  /** 已进入 interrupt 等待的 run：抑制抢先到达的 done，避免注销 callback */
+  private pendingInterruptRuns = new Set<string>()
+  private deferredDoneTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private backgroundHandlers = new Set<BackgroundHandler>()
   private configHandlers = new Set<ConfigUpdatedHandler>()
   private connectionHandlers = new Set<ConnectionHandler>()
@@ -243,27 +260,71 @@ class ChatWebSocket {
     }
 
     const runId = msg.run_id
-    if (runId) {
+    if (!runId) return
+
+    if (event.type === 'interrupt') {
+      this.pendingInterruptRuns.add(runId)
+      this.clearDeferredDone(runId)
       const cb = this.runCallbacks.get(runId)
       if (cb) cb(event)
-
-      if (event.type === 'done' || event.type === 'error') {
-        const resolver = this.runResolvers.get(runId)
-        if (resolver) {
-          if (event.type === 'error' && !event.error?.includes('已取消')) {
-            resolver.reject(new Error(event.error || '未知错误'))
-          } else {
-            resolver.resolve({
-              content: event.content || '',
-              session_id: event.session_id ?? null,
-            })
-          }
-          this.runResolvers.delete(runId)
-          this.runCallbacks.delete(runId)
-          if (this.currentRunId === runId) this.currentRunId = null
-        }
-      }
+      return
     }
+
+    if (event.type === 'done') {
+      // LangGraph 1.x 可能在 interrupt 前误发 done；短暂延迟，若随后收到 interrupt 则丢弃该 done
+      this.clearDeferredDone(runId)
+      const timer = setTimeout(() => {
+        this.deferredDoneTimers.delete(runId)
+        if (this.pendingInterruptRuns.has(runId)) return
+        this.deliverAndSettle(runId, event)
+      }, 50)
+      this.deferredDoneTimers.set(runId, timer)
+      return
+    }
+
+    const cb = this.runCallbacks.get(runId)
+    if (cb) cb(event)
+
+    if (event.type === 'error') {
+      this.pendingInterruptRuns.delete(runId)
+      this.clearDeferredDone(runId)
+      this.settleRun(runId, event)
+    }
+  }
+
+  private clearDeferredDone(runId: string) {
+    const timer = this.deferredDoneTimers.get(runId)
+    if (timer) {
+      clearTimeout(timer)
+      this.deferredDoneTimers.delete(runId)
+    }
+  }
+
+  private deliverAndSettle(runId: string, event: StreamEvent) {
+    const cb = this.runCallbacks.get(runId)
+    if (cb) cb(event)
+    this.settleRun(runId, event)
+  }
+
+  private settleRun(runId: string, event: StreamEvent) {
+    const resolver = this.runResolvers.get(runId)
+    if (!resolver) return
+    if (event.type === 'error' && !event.error?.includes('已取消')) {
+      resolver.reject(new Error(event.error || '未知错误'))
+    } else {
+      resolver.resolve({
+        content: event.content || '',
+        session_id: event.session_id ?? null,
+      })
+    }
+    this.runResolvers.delete(runId)
+    this.runCallbacks.delete(runId)
+    this.pendingInterruptRuns.delete(runId)
+    if (this.currentRunId === runId) this.currentRunId = null
+  }
+
+  private releaseInterruptWait(runId: string) {
+    this.pendingInterruptRuns.delete(runId)
   }
 
   private startHeartbeat() {
@@ -324,16 +385,55 @@ class ChatWebSocket {
 
   cancel() {
     if (this.currentRunId) {
+      this.releaseInterruptWait(this.currentRunId)
+      this.clearDeferredDone(this.currentRunId)
       this.send({ op: 'chat.cancel', run_id: this.currentRunId })
     }
   }
 
-  approve(runId: string, decision: 'allow' | 'deny') {
-    this.send({ op: 'approve', run_id: runId, decision })
+  approve(runId: string, decision: 'allow' | 'deny', opts?: { toolCallId?: string; sessionId?: string }) {
+    this.releaseInterruptWait(runId)
+    this.send({
+      op: 'approve',
+      run_id: runId,
+      decision,
+      tool_call_id: opts?.toolCallId,
+      session_id: opts?.sessionId,
+    })
   }
 
-  answerAskUser(runId: string, answer: string | string[]) {
-    this.send({ op: 'approve', run_id: runId, kind: 'ask_user', answer })
+  answerAskUser(
+    runId: string,
+    answer: string | string[],
+    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string },
+  ) {
+    this.releaseInterruptWait(runId)
+    this.send({
+      op: 'approve',
+      run_id: runId,
+      kind: 'ask_user',
+      answer,
+      interrupt_id: opts?.interruptId,
+      tool_call_id: opts?.toolCallId,
+      mode: opts?.mode || 'answer_and_continue',
+      session_id: opts?.sessionId,
+    })
+  }
+
+  ackHandoff(
+    runId: string,
+    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string },
+  ) {
+    this.releaseInterruptWait(runId)
+    this.send({
+      op: 'approve',
+      run_id: runId,
+      kind: 'ask_user',
+      mode: 'handoff_and_stop',
+      interrupt_id: opts?.interruptId,
+      tool_call_id: opts?.toolCallId,
+      session_id: opts?.sessionId,
+    })
   }
 
   disconnect() {

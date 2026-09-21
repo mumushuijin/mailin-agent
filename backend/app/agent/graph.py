@@ -28,8 +28,14 @@ def build_graph():
     builder.add_edge(START, "agent")
     if tools:
         builder.add_node("tools", call_tools)
+
+        def after_tools(state: AgentState) -> str:
+            if state.get("terminal_reason") == "handoff":
+                return END
+            return "agent"
+
         builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-        builder.add_edge("tools", "agent")
+        builder.add_conditional_edges("tools", after_tools, {"agent": "agent", END: END})
     else:
         builder.add_edge("agent", END)
     return builder.compile(checkpointer=_resolve_checkpointer())
@@ -60,4 +66,5 @@ def make_initial_state(message: str, max_steps: int) -> dict:
         "session_token_stats": {},
         "last_invoke_ledger_len": 0,
         "todos": [],
+        "terminal_reason": "",
     }

@@ -31,11 +31,22 @@ def _tool_switch_enabled(value, *, default: bool = True) -> bool:
 
 
 def load_full_config(workspace: Path | None = None) -> dict:
-    workspace = workspace or get_settings().workspace_path
-    path = workspace / "CONFIG.json"
+    """读取 CONFIG.json 并投影为运行时有效顶层视图（兼容旧格式与规范根）。"""
+    from app.config import normalize_config_document, project_effective_runtime_config
+    from app.storage.workspace import config_file_path
+
+    _ = workspace  # 兼容旧签名；CONFIG 已迁出 workspace
+    path = config_file_path()
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized = normalize_config_document(raw)
+    return project_effective_runtime_config(normalized.document, raw=raw)
 
 
 class ToolRegistry:
@@ -52,7 +63,10 @@ class ToolRegistry:
         tools_cfg = self.config.get("tools", {})
         if package.info.config_key == "mcp":
             if "mcp" in tools_cfg:
-                return bool(tools_cfg["mcp"])
+                return _tool_switch_enabled(tools_cfg["mcp"], default=True)
+            mcp_domain = self.config.get("mcp")
+            if isinstance(mcp_domain, dict) and isinstance(mcp_domain.get("servers"), dict):
+                return bool(mcp_domain["servers"])
             return bool(self.config.get("mcp_servers"))
         value = tools_cfg.get(package.info.config_key)
         if value is None:

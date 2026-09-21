@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any, Callable
 
 from app.tools.card import ToolCard, make_card
@@ -62,17 +63,21 @@ def mcp_tool_to_card(
 
 _mcp_cards: list[ToolCard] = []
 _mcp_card_by_name: dict[str, ToolCard] = {}
+_mcp_cards_lock = threading.RLock()
 
 
 def set_mcp_cards(cards: list[ToolCard]) -> None:
     global _mcp_cards, _mcp_card_by_name
-    _mcp_cards = list(cards)
-    _mcp_card_by_name = {c.name: c for c in cards}
+    with _mcp_cards_lock:
+        _mcp_cards = list(cards)
+        _mcp_card_by_name = {c.name: c for c in cards}
 
 
 def get_mcp_cards() -> list[ToolCard]:
-    return list(_mcp_cards)
+    with _mcp_cards_lock:
+        return list(_mcp_cards)
 
 
 def get_mcp_card(name: str) -> ToolCard | None:
-    return _mcp_card_by_name.get(name)
+    with _mcp_cards_lock:
+        return _mcp_card_by_name.get(name)

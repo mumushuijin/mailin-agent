@@ -94,7 +94,13 @@ async def trace_middleware(request: Request, call_next):
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    body: dict = {"detail": exc.message}
+    if getattr(exc, "code", None):
+        body["code"] = exc.code
+    payload = getattr(exc, "payload", None) or {}
+    if payload:
+        body.update(payload)
+    return JSONResponse(status_code=exc.status_code, content=body)
 
 
 @app.get("/health")

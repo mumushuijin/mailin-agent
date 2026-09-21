@@ -1,6 +1,17 @@
 from fastapi import APIRouter, Query
 
-from app.schemas.config import AgentInfo, ConfigFile, ConfigUpdate, ConfigUpdateResponse, ResetResponse
+from app.schemas.config import (
+    AgentInfo,
+    ConfigFile,
+    ConfigModuleUpdateRequest,
+    ConfigModuleUpdateResponse,
+    ConfigModuleValidateRequest,
+    ConfigModuleValidateResponse,
+    ConfigModulesResponse,
+    ConfigUpdate,
+    ConfigUpdateResponse,
+    ResetResponse,
+)
 from app.services.config_service import ConfigService
 
 router = APIRouter()
@@ -15,6 +26,26 @@ async def list_configs() -> dict:
 @router.get("/agent/info", response_model=AgentInfo)
 async def get_agent_info():
     return config_service.get_agent_info()
+
+
+@router.get("/modules", response_model=ConfigModulesResponse)
+async def list_modules():
+    return config_service.list_modules()
+
+
+@router.post("/modules/{module}/validate", response_model=ConfigModuleValidateResponse)
+async def validate_module(module: str, body: ConfigModuleValidateRequest):
+    return config_service.validate_module(module, value=body.value, text=body.text)
+
+
+@router.put("/modules/{module}", response_model=ConfigModuleUpdateResponse)
+async def update_module(module: str, body: ConfigModuleUpdateRequest):
+    return config_service.update_module(
+        module,
+        base_revision=body.base_revision,
+        value=body.value,
+        text=body.text,
+    )
 
 
 @router.get("/{name}", response_model=ConfigFile)

@@ -1,150 +1,283 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
-import { Card, List, Input, Button, message, Empty, Tag, Modal, Checkbox } from 'ant-design-vue'
-import { configApi, type ConfigFile } from '@/api/config'
-import { SaveOutlined, FileTextOutlined, ReloadOutlined } from '@ant-design/icons-vue'
+import { computed, onMounted, ref } from 'vue'
+import { Card, List, Empty, Tag, Modal, message } from 'ant-design-vue'
+import { SettingOutlined } from '@ant-design/icons-vue'
+import {
+  configApi,
+  type ConfigFieldError,
+  type ConfigModuleSummary,
+} from '@/api/config'
+import { clonePlainJson } from '@/config/clonePlain'
+import { isUserVisibleModuleKey } from '@/contracts/configModules'
+import {
+  canSubmitDraft,
+  createJsonDraft,
+  draftClientErrors,
+  formatJson,
+  markDraftSaved,
+  parseJsonText,
+  reloadDraftFromServer,
+  restoreLastValid,
+  updateDraftText,
+  type JsonDraftState,
+} from '@/config/jsonDraft'
+import { parseConfigApiError } from '@/config/apiErrors'
+import JsonModuleEditor from '@/components/JsonModuleEditor.vue'
+import { useUnsavedDraftGuard } from '@/composables/useUnsavedDraftGuard'
 
-const router = useRouter()
-
-const configs = ref<string[]>([])
-const selectedConfig = ref<ConfigFile | null>(null)
-const editingContent = ref('')
+const modules = ref<ConfigModuleSummary[]>([])
+const revision = ref(0)
+const globalWarnings = ref<string[]>([])
+const selectedKey = ref<string | null>(null)
 const loading = ref(false)
 const saving = ref(false)
-const resetting = ref(false)
-const showResetModal = ref(false)
-const resetOptions = ref({
-  reset_sessions: true,
-  reset_memory: true,
-  reset_global_config: false,
-})
+const draft = ref<JsonDraftState>(createJsonDraft({}))
+const serverErrors = ref<ConfigFieldError[]>([])
+const conflictMessage = ref<string | null>(null)
+const conflictCurrent = ref<Record<string, unknown> | null>(null)
 
-const configDescriptions: Record<string, string> = {
-  CONFIG: '全局配置',
-  USER: '用户信息',
-  SOUL: '人格模板',
-  MEMORY: '长期记忆',
-  HEARTBEAT: '心跳任务',
-}
+const dirty = computed(() => draft.value.dirty)
+useUnsavedDraftGuard(dirty, '配置模块有未保存的草稿，确定离开吗？')
 
-// 获取配置文件的后缀
-const getConfigExtension = (name: string): string => {
-  return name === 'CONFIG' ? '.json' : '.md'
-}
+const selectedModule = computed(
+  () => modules.value.find((m) => m.key === selectedKey.value) || null,
+)
 
-const loadConfigs = async () => {
+const editorErrors = computed(() => [
+  ...draftClientErrors(draft.value),
+  ...serverErrors.value,
+])
+
+const loadModules = async (preferKey?: string | null) => {
   loading.value = true
   try {
-    const res = await configApi.list()
-    configs.value = res.configs
+    const res = await configApi.listModules()
+    modules.value = res.modules.filter((m) => isUserVisibleModuleKey(m.key))
+    revision.value = res.revision
+    globalWarnings.value = res.warnings || []
+    const nextKey =
+      preferKey && modules.value.some((m) => m.key === preferKey)
+        ? preferKey
+        : selectedKey.value && modules.value.some((m) => m.key === selectedKey.value)
+          ? selectedKey.value
+          : modules.value[0]?.key || null
+    if (nextKey) {
+      await selectModule(nextKey, { force: true, keepDraft: false })
+    } else {
+      selectedKey.value = null
+    }
   } catch (error) {
-    message.error('加载配置列表失败')
+    message.error(parseConfigApiError(error).message || '加载配置模块失败')
   } finally {
     loading.value = false
   }
 }
 
-const selectConfig = async (name: string) => {
-  try {
-    const res = await configApi.get(name)
-    selectedConfig.value = res
-    editingContent.value = res.content
-  } catch (error) {
-    message.error('加载配置失败')
+const applyModuleValue = (mod: ConfigModuleSummary) => {
+  const plain = clonePlainJson(mod.value || {})
+  draft.value = createJsonDraft(plain)
+  serverErrors.value = [...(mod.errors || [])]
+  conflictMessage.value = null
+  conflictCurrent.value = null
+}
+
+const selectModule = async (
+  key: string,
+  options: { force?: boolean; keepDraft?: boolean } = {},
+) => {
+  if (!options.force && key === selectedKey.value) return
+  if (!options.force && dirty.value) {
+    const ok = await new Promise<boolean>((resolve) => {
+      Modal.confirm({
+        title: '未保存的草稿',
+        content: '当前模块有未保存草稿，切换将丢失本地修改（不会提交到其他模块）。',
+        okText: '切换',
+        cancelText: '取消',
+        onOk: () => resolve(true),
+        onCancel: () => resolve(false),
+      })
+    })
+    if (!ok) return
+  }
+  const mod = modules.value.find((m) => m.key === key)
+  if (!mod) return
+  selectedKey.value = key
+  if (options.keepDraft && dirty.value) {
+    draft.value = reloadDraftFromServer(draft.value, mod.value || {}, true)
+  } else {
+    applyModuleValue(mod)
   }
 }
 
-const saveConfig = async () => {
-  if (!selectedConfig.value) return
+const onTextChange = (text: string) => {
+  const key = selectedKey.value
+  serverErrors.value = []
+  conflictMessage.value = null
+  if (key && isUserVisibleModuleKey(key)) {
+    draft.value = updateDraftText(draft.value, text, key)
+  } else {
+    draft.value = updateDraftText(draft.value, text)
+  }
+}
+
+const formatDraft = () => {
+  const parsed = parseJsonText(draft.value.text)
+  if (!parsed.ok) {
+    message.error(parsed.error.message)
+    return
+  }
+  draft.value = updateDraftText(
+    draft.value,
+    formatJson(parsed.value),
+    selectedKey.value && isUserVisibleModuleKey(selectedKey.value)
+      ? selectedKey.value
+      : undefined,
+  )
+}
+
+const restoreDraft = () => {
+  draft.value = restoreLastValid(draft.value)
+  serverErrors.value = []
+  conflictMessage.value = null
+  message.success('已恢复最近有效版本')
+}
+
+const reloadSelected = async () => {
+  if (!selectedKey.value) return
+  try {
+    const res = await configApi.listModules()
+    modules.value = res.modules.filter((m) => isUserVisibleModuleKey(m.key))
+    revision.value = res.revision
+    const mod = modules.value.find((m) => m.key === selectedKey.value)
+    if (!mod) {
+      message.warning('模块已不存在')
+      return
+    }
+    if (dirty.value) {
+      Modal.confirm({
+        title: '重新加载',
+        content: '用服务端版本覆盖本地草稿，还是仅刷新基线并保留草稿？',
+        okText: '覆盖本地',
+        cancelText: '保留草稿',
+        onOk: () => applyModuleValue(mod),
+        onCancel: () => {
+          draft.value = reloadDraftFromServer(draft.value, mod.value || {}, true)
+          message.info('已刷新服务端基线，本地草稿仍保留')
+        },
+      })
+    } else {
+      applyModuleValue(mod)
+      message.success('已重新加载')
+    }
+  } catch (error) {
+    message.error(parseConfigApiError(error).message)
+  }
+}
+
+const mergeConflict = () => {
+  if (!conflictCurrent.value) {
+    message.warning('没有可合并的服务端内容')
+    return
+  }
+  // 保留本地草稿文本，只更新 lastValid 基线与 revision 感知
+  draft.value = reloadDraftFromServer(draft.value, conflictCurrent.value, true)
+  conflictMessage.value =
+    '已载入服务端最新版本作为合并基线。请检查本地草稿后再次保存（将使用最新 revision）。'
+  conflictCurrent.value = null
+}
+
+const saveModule = async () => {
+  const key = selectedKey.value
+  if (!key) return
+  if (!canSubmitDraft(draft.value)) {
+    message.error('请先修复 JSON 语法或类型错误')
+    return
+  }
+  const parsed = parseJsonText(draft.value.text)
+  if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || Array.isArray(parsed.value)) {
+    message.error('模块值必须是 JSON 对象')
+    return
+  }
 
   saving.value = true
+  serverErrors.value = []
+  conflictMessage.value = null
   try {
-    await configApi.update(selectedConfig.value.name, editingContent.value)
-    message.success('保存成功')
-  } catch (error: any) {
-    // 透传后端错误信息
-    const errorMsg = error?.response?.data?.detail || error?.message || '保存失败'
-    message.error(errorMsg)
+    // 只提交当前目标模块
+    const res = await configApi.updateModule(key, {
+      base_revision: revision.value,
+      value: parsed.value as Record<string, unknown>,
+    })
+    revision.value = res.revision
+    draft.value = markDraftSaved(draft.value, res.value)
+    const listing = await configApi.listModules()
+    modules.value = listing.modules.filter((m) => isUserVisibleModuleKey(m.key))
+    revision.value = listing.revision
+    message.success(`已保存模块 ${key}`)
+  } catch (error) {
+    const parsedErr = parseConfigApiError(error)
+    if (parsedErr.kind === 'conflict') {
+      conflictMessage.value = parsedErr.message
+      conflictCurrent.value = parsedErr.current ?? null
+      if (typeof parsedErr.revision === 'number') {
+        revision.value = parsedErr.revision
+      }
+      message.warning('版本冲突：本地草稿已保留，请重新加载或合并后保存')
+    } else if (parsedErr.kind === 'validation') {
+      serverErrors.value = parsedErr.errors
+      message.error(parsedErr.message)
+    } else {
+      message.error(parsedErr.message || '保存失败')
+    }
   } finally {
     saving.value = false
   }
 }
 
-const confirmReset = () => {
-  // 重置选项为默认值
-  resetOptions.value = {
-    reset_sessions: true,
-    reset_memory: true,
-    reset_global_config: false,
-  }
-  showResetModal.value = true
-}
-
-const handleReset = async () => {
-  resetting.value = true
-  try {
-    const res = await configApi.reset(resetOptions.value)
-    message.success(res.message)
-    showResetModal.value = false
-    selectedConfig.value = null
-    editingContent.value = ''
-
-    // 如果清除了会话历史，也要清除 localStorage 中的上次会话 ID
-    if (resetOptions.value.reset_sessions) {
-      localStorage.removeItem('mailin.lastSessionId')
-    }
-
-    await loadConfigs()
-
-    // 导航到聊天页面并传递刷新参数，让 ChatView 重新获取 agent 信息
-    router.push({ name: 'chat', query: { refresh: Date.now().toString() } })
-  } catch (error) {
-    message.error('重置失败')
-  } finally {
-    resetting.value = false
-  }
-}
-
 onMounted(() => {
-  loadConfigs()
+  loadModules()
 })
 </script>
 
 <template>
-  <div class="config-view">
+  <div class="config-view config-modules-view">
     <div class="config-header">
-      <h1>配置管理</h1>
-      <p>管理 Agent 的配置文件和身份信息</p>
+      <h1>配置</h1>
+      <p>编辑 Agent / 工具等用户配置（系统内部模块不在此展示）</p>
+    </div>
+
+    <div v-if="globalWarnings.length" class="global-warnings">
+      <div v-for="(w, i) in globalWarnings" :key="i" class="warn-item">{{ w }}</div>
     </div>
 
     <div class="config-content">
-      <!-- 配置列表 -->
       <div class="config-list">
         <Card :loading="loading" class="list-card">
           <template #title>
-            <FileTextOutlined /> 配置文件
+            <SettingOutlined /> 配置模块
           </template>
           <template #extra>
-            <button
-              class="reset-btn"
-              @click="confirmReset"
-              title="重置为初始模板"
-            >
-              <ReloadOutlined /> 初始化
-            </button>
+            <span class="revision-hint">revision {{ revision }}</span>
           </template>
-          <List :data-source="configs" :locale="{ emptyText: '暂无配置文件' }">
+          <Empty
+            v-if="!loading && modules.length === 0"
+            description="暂无配置模块"
+          />
+          <List v-else :data-source="modules">
             <template #renderItem="{ item }">
               <List.Item
-                @click="selectConfig(item)"
-                :class="['config-item', { active: selectedConfig?.name === item }]"
+                :class="['config-item', { active: selectedKey === item.key }]"
+                @click="selectModule(item.key)"
               >
                 <div class="config-item-content">
-                  <span class="config-name">{{ item }}</span>
-                  <Tag color="error" v-if="configDescriptions[item]">
-                    {{ configDescriptions[item] }}
-                  </Tag>
+                  <div class="config-title-row">
+                    <span class="config-name">{{ item.display_name || item.key }}</span>
+                    <Tag v-if="item.has_draft_error" color="error" size="small">错误</Tag>
+                    <Tag v-else-if="selectedKey === item.key && dirty" color="orange" size="small">
+                      草稿
+                    </Tag>
+                  </div>
+                  <div class="config-summary">{{ item.key }} · {{ item.source }}</div>
                 </div>
               </List.Item>
             </template>
@@ -152,74 +285,32 @@ onMounted(() => {
         </Card>
       </div>
 
-      <!-- 编辑区域 -->
       <div class="config-editor">
-        <Card v-if="selectedConfig" class="editor-card">
-          <template #title>
-            <span>{{ selectedConfig.name }}</span>
-            <Tag color="green" style="margin-left: 8px">{{ getConfigExtension(selectedConfig.name) }}</Tag>
-          </template>
-          <template #extra>
-            <Button
-              type="primary"
-              :loading="saving"
-              @click="saveConfig"
-            >
-              <SaveOutlined /> 保存
-            </Button>
-          </template>
-          <Input.TextArea
-            v-model:value="editingContent"
-            :auto-size="{ minRows: 18, maxRows: 30 }"
-            class="editor-textarea"
+        <Card v-if="selectedModule" class="editor-card">
+          <JsonModuleEditor
+            :title="selectedModule.display_name || selectedModule.key"
+            :subtitle="`模块键 ${selectedModule.key}`"
+            :text="draft.text"
+            :loading="loading"
+            :saving="saving"
+            :dirty="dirty"
+            :revision="revision"
+            :errors="editorErrors"
+            :warnings="selectedModule.warnings"
+            :conflict-message="conflictMessage"
+            @update:text="onTextChange"
+            @save="saveModule"
+            @format="formatDraft"
+            @restore="restoreDraft"
+            @reload="reloadSelected"
+            @merge="mergeConflict"
           />
         </Card>
-
         <Card v-else class="empty-card">
-          <Empty
-            description="请从左侧选择一个配置文件"
-            :image-style="{ height: '80px' }"
-          />
+          <Empty description="请从左侧选择一个配置模块" :image-style="{ height: '80px' }" />
         </Card>
       </div>
     </div>
-
-    <!-- 重置确认弹窗 -->
-    <Modal
-      v-model:open="showResetModal"
-      title="确认初始化"
-      :confirm-loading="resetting"
-      @ok="handleReset"
-      okText="确认初始化"
-      cancelText="取消"
-      okType="danger"
-    >
-      <div class="reset-warning">
-        <p style="color: var(--color-danger); font-weight: 500;">⚠️ 警告：此操作不可撤销！</p>
-        <p>初始化将把所有配置文件恢复为默认模板，包括：</p>
-        <ul>
-          <li>SOUL.md - 人格与身份</li>
-          <li>USER.md - 用户信息</li>
-          <li>MEMORY.md - 长期记忆</li>
-          <li>HEARTBEAT.md - 心跳任务</li>
-        </ul>
-
-        <div class="reset-options">
-          <p style="font-weight: 500; margin-bottom: 8px;">额外清除选项：</p>
-          <Checkbox v-model:checked="resetOptions.reset_sessions">
-            清除所有会话历史
-          </Checkbox>
-          <Checkbox v-model:checked="resetOptions.reset_memory">
-            清除每日记忆文件
-          </Checkbox>
-          <Checkbox v-model:checked="resetOptions.reset_global_config">
-            重置全局配置（LLM、Agent 设置等）
-          </Checkbox>
-        </div>
-
-        <p style="margin-top: 16px;">您确定要继续吗？</p>
-      </div>
-    </Modal>
   </div>
 </template>
 
@@ -235,7 +326,7 @@ onMounted(() => {
 
 .config-header {
   flex-shrink: 0;
-  margin-bottom: 24px;
+  margin-bottom: 16px;
 }
 
 .config-header h1 {
@@ -247,6 +338,18 @@ onMounted(() => {
 .config-header p {
   margin: 0;
   color: #999;
+}
+
+.global-warnings {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-warning, #d48806) 12%, transparent);
+  border-radius: 8px;
+}
+
+.warn-item {
+  font-size: 13px;
 }
 
 .config-content {
@@ -277,6 +380,11 @@ onMounted(() => {
   overflow-y: auto;
 }
 
+.revision-hint {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
 .config-item {
   cursor: pointer;
   padding: 12px 16px;
@@ -297,10 +405,22 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
+}
+
+.config-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .config-name {
   font-weight: 500;
+}
+
+.config-summary {
+  color: var(--color-text-secondary);
+  font-size: 12px;
 }
 
 .config-editor {
@@ -317,24 +437,11 @@ onMounted(() => {
   overflow: hidden;
 }
 
-.editor-card :deep(.ant-card-head) {
-  flex-shrink: 0;
-}
-
 .editor-card :deep(.ant-card-body) {
   flex: 1;
-  overflow: hidden;
+  overflow: auto;
   display: flex;
   flex-direction: column;
-}
-
-.editor-textarea {
-  flex: 1;
-  width: 100%;
-  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  resize: none;
 }
 
 .empty-card {
@@ -342,48 +449,5 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-/* 初始化按钮 */
-.reset-btn {
-  padding: 4px 12px;
-  font-size: 13px;
-  border: none;
-  border-radius: 6px;
-  background: var(--color-danger);
-  color: #fff;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.reset-btn:hover {
-  background: var(--color-danger-hover);
-}
-
-.reset-warning {
-  padding: 8px 0;
-}
-
-.reset-warning ul {
-  margin: 12px 0;
-  padding-left: 24px;
-}
-
-.reset-warning li {
-  margin: 4px 0;
-  color: #666;
-}
-
-.reset-options {
-  margin-top: 16px;
-  padding: 12px;
-  background: #fafafa;
-  border-radius: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
 }
 </style>

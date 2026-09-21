@@ -19,7 +19,12 @@ def todo(action: str, content: str = "", item_id: str = "", status: str = "") ->
     return message
 
 
-def ask_user(question: str, options: list[str] | None = None, allow_multiple: bool = False) -> str:
+def ask_user(
+    question: str,
+    options: list[str] | None = None,
+    allow_multiple: bool = False,
+    mode: str = "answer_and_continue",
+) -> str:
     """占位：真正的提问在 call_tools 图线程里 interrupt，不应执行到这里。"""
-    del question, options, allow_multiple
+    del question, options, allow_multiple, mode
     return "未获得用户回答。"

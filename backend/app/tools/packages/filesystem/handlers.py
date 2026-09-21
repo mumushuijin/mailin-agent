@@ -10,7 +10,14 @@ from app.context.budget import estimate_tokens
 from app.context.tool_cache import is_tool_results_path
 from app.core.settings import get_settings
 from app.storage.workspace import assert_not_agent_space, _resolve_safe_path, normalize_workspace_path
-from app.tools.runtime import get_project_workspace
+from app.tools.packages.filesystem.snapshots import (
+    SnapshotStore,
+    atomic_write_text,
+    is_snapshot_sidecar_path,
+    load_snapshot_config,
+    restore_from_snapshot,
+)
+from app.tools.runtime import get_project_workspace, tool_session_id
 
 _MAX_LIST_ENTRIES = 200
 _MAX_SEARCH_RESULTS = 30
@@ -38,6 +45,31 @@ def _safe_path(relative: str, *, for_write: bool = False) -> Path:
 
 def _rel_path(path: Path) -> str:
     return str(path.resolve().relative_to(_workspace_root().resolve()))
+
+
+def _skip_sidecar(path: Path) -> bool:
+    try:
+        return is_snapshot_sidecar_path(path, _workspace_root())
+    except Exception:
+        return False
+
+
+def _require_snapshot_or_error(store: SnapshotStore, meta_factory) -> tuple[object | None, str | None]:
+    """创建 pre-change snapshot；失败返回错误字符串。"""
+    cfg = load_snapshot_config()
+    if not cfg.enabled:
+        return None, None
+    try:
+        meta = meta_factory()
+        return meta, None
+    except Exception as exc:
+        return None, f"快照创建失败，已拒绝变更: {exc}"
+
+
+def _format_mutation_result(message: str, snapshot_id: str | None) -> str:
+    if not snapshot_id:
+        return message
+    return f"{message}\n[snapshot_id={snapshot_id}] [undo=undo_file_change]"
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
@@ -135,6 +167,8 @@ def read_file(file_path: str, offset: int = 1, limit: int | None = None) -> str:
         path = _safe_path(file_path)
     except ValueError as e:
         return str(e)
+    if _skip_sidecar(path):
+        return "禁止读取 snapshot sidecar"
     if not path.exists():
         return f"文件不存在: {file_path}"
     if path.is_dir():
@@ -180,28 +214,67 @@ def write_file(file_path: str, content: str) -> str:
     """向工作区内写入文件（覆盖）。
 
     路径必须为相对路径。HTML/JS/CSS 等产物文件的裸文件名会自动写入 `.mailin/artifacts/`。
-    会自动创建父目录。仅允许写入工作区沙箱内。
+    会自动创建父目录。仅允许写入工作区沙箱内。启用快照时先落盘 snapshot，再原子写入。
     """
     try:
         path = _safe_path(file_path, for_write=True)
     except ValueError as e:
         return str(e)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    rel = _rel_path(path)
-    return f"已写入: {rel}"
+    if _skip_sidecar(path):
+        return "禁止写入 snapshot sidecar"
+
+    rel = _rel_path(path) if path.exists() else None
+    try:
+        store = SnapshotStore()
+    except ValueError as e:
+        return str(e)
+
+    existed = path.exists() and path.is_file()
+    op = "write" if existed else "create"
+    # 解析最终相对路径（含 artifacts 重定向）
+    target_rel = str(path.resolve().relative_to(_workspace_root().resolve()))
+
+    meta, err = _require_snapshot_or_error(
+        store,
+        lambda: store.create_pre_change_snapshot(
+            operation=op,  # type: ignore[arg-type]
+            target=path,
+            target_rel=target_rel,
+            session_id=tool_session_id.get(),
+        ),
+    )
+    if err:
+        return err
+
+    try:
+        atomic_write_text(path, content)
+    except OSError as e:
+        return f"写入失败: {e}"
+
+    snapshot_id = None
+    if meta is not None:
+        meta = store.finalize_post_fingerprint(meta, path)  # type: ignore[arg-type]
+        snapshot_id = meta.snapshot_id
+        try:
+            store.cleanup()
+        except Exception:
+            pass
+
+    return _format_mutation_result(f"已写入: {target_rel}", snapshot_id)
 
 
 def replace_in_file(file_path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     """替换工作区文件中的文本片段。
 
     路径必须为相对路径。默认仅替换首次匹配；replace_all=true 时替换全部匹配。
-    未找到 old_text 时返回错误，不会修改文件。
+    未找到 old_text 时返回错误，不会修改文件。启用快照时先 snapshot 再原子写入。
     """
     try:
         path = _safe_path(file_path)
     except ValueError as e:
         return str(e)
+    if _skip_sidecar(path):
+        return "禁止修改 snapshot sidecar"
     if not path.exists():
         return f"文件不存在: {file_path}"
     if path.is_dir():
@@ -215,8 +288,39 @@ def replace_in_file(file_path: str, old_text: str, new_text: str, replace_all: b
     else:
         updated = content.replace(old_text, new_text, 1)
         count = 1
-    path.write_text(updated, encoding="utf-8")
-    return f"已编辑: {file_path}（替换 {count} 处）"
+
+    try:
+        store = SnapshotStore()
+    except ValueError as e:
+        return str(e)
+    target_rel = _rel_path(path)
+    meta, err = _require_snapshot_or_error(
+        store,
+        lambda: store.create_pre_change_snapshot(
+            operation="replace",
+            target=path,
+            target_rel=target_rel,
+            session_id=tool_session_id.get(),
+        ),
+    )
+    if err:
+        return err
+
+    try:
+        atomic_write_text(path, updated)
+    except OSError as e:
+        return f"写入失败: {e}"
+
+    snapshot_id = None
+    if meta is not None:
+        meta = store.finalize_post_fingerprint(meta, path)  # type: ignore[arg-type]
+        snapshot_id = meta.snapshot_id
+        try:
+            store.cleanup()
+        except Exception:
+            pass
+
+    return _format_mutation_result(f"已编辑: {file_path}（替换 {count} 处）", snapshot_id)
 
 
 def list_directory(directory_path: str = ".") -> str:
@@ -235,6 +339,11 @@ def list_directory(directory_path: str = ".") -> str:
 
     entries: list[str] = []
     for item in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        if _skip_sidecar(item):
+            continue
+        # 在 .mailin 下列出时隐藏 snapshots 目录名
+        if item.name == "snapshots" and path.name == ".mailin":
+            continue
         kind = "dir" if item.is_dir() else "file"
         entries.append(f"[{kind}] {_rel_path(item)}")
         if len(entries) >= _MAX_LIST_ENTRIES:
@@ -276,6 +385,8 @@ def search_files(
     hits: list[str] = []
 
     for path in sorted(base.rglob("*")):
+        if _skip_sidecar(path):
+            continue
         if not path.is_file():
             continue
         if not fnmatch.fnmatch(path.name, file_pattern):
@@ -330,6 +441,8 @@ def glob_search(glob_pattern: str, directory_path: str = ".") -> str:
 
     matches: list[str] = []
     for path in sorted(base.glob(glob_pattern)):
+        if _skip_sidecar(path):
+            continue
         if not str(path.resolve()).startswith(str(_workspace_root().resolve())):
             continue
         kind = "dir" if path.is_dir() else "file"
@@ -367,11 +480,55 @@ def move_file(source_path: str, destination_path: str) -> str:
         dst = _safe_path(destination_path)
     except ValueError as e:
         return str(e)
+    if _skip_sidecar(src) or _skip_sidecar(dst):
+        return "禁止移动 snapshot sidecar 内的路径"
     if not src.exists():
         return f"源路径不存在: {source_path}"
+
+    try:
+        store = SnapshotStore()
+    except ValueError as e:
+        return str(e)
+
+    src_rel = _rel_path(src)
+    # destination 可能尚不存在
+    try:
+        dst_rel = str(dst.resolve().relative_to(_workspace_root().resolve()))
+    except ValueError:
+        dst_rel = destination_path
+
+    meta, err = _require_snapshot_or_error(
+        store,
+        lambda: store.create_pre_change_snapshot(
+            operation="move",
+            target=src if src.is_file() else dst,
+            target_rel=src_rel,
+            session_id=tool_session_id.get(),
+            source=src if src.is_file() else None,
+            source_rel=src_rel,
+            destination_rel=dst_rel,
+        ),
+    )
+    if err:
+        return err
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
-    return f"已移动: {source_path} -> {destination_path}"
+    try:
+        shutil.move(str(src), str(dst))
+    except OSError as e:
+        return f"移动失败: {e}"
+
+    snapshot_id = None
+    if meta is not None:
+        post_path = dst if dst.exists() else None
+        meta = store.finalize_post_fingerprint(meta, post_path if post_path and post_path.is_file() else None)  # type: ignore[arg-type]
+        snapshot_id = meta.snapshot_id
+        try:
+            store.cleanup()
+        except Exception:
+            pass
+
+    return _format_mutation_result(f"已移动: {source_path} -> {destination_path}", snapshot_id)
 
 
 def delete_file(file_path: str) -> str:
@@ -383,6 +540,8 @@ def delete_file(file_path: str) -> str:
         path = _safe_path(file_path)
     except ValueError as e:
         return str(e)
+    if _skip_sidecar(path):
+        return "禁止删除 snapshot sidecar"
     if not path.exists():
         return f"文件不存在: {file_path}"
     if path.is_dir():
@@ -390,5 +549,51 @@ def delete_file(file_path: str) -> str:
             return f"目录非空，无法删除: {file_path}"
         path.rmdir()
         return f"已删除空目录: {file_path}"
-    path.unlink()
-    return f"已删除: {file_path}"
+
+    try:
+        store = SnapshotStore()
+    except ValueError as e:
+        return str(e)
+    target_rel = _rel_path(path)
+    meta, err = _require_snapshot_or_error(
+        store,
+        lambda: store.create_pre_change_snapshot(
+            operation="delete",
+            target=path,
+            target_rel=target_rel,
+            session_id=tool_session_id.get(),
+        ),
+    )
+    if err:
+        return err
+
+    try:
+        path.unlink()
+    except OSError as e:
+        return f"删除失败: {e}"
+
+    snapshot_id = None
+    if meta is not None:
+        meta = store.finalize_post_fingerprint(meta, None)  # type: ignore[arg-type]
+        snapshot_id = meta.snapshot_id
+        try:
+            store.cleanup()
+        except Exception:
+            pass
+
+    return _format_mutation_result(f"已删除: {file_path}", snapshot_id)
+
+
+def undo_file_change(snapshot_id: str) -> str:
+    """按 snapshot_id 回滚同 session 内的一次文件变更。
+
+    若目标 fingerprint 已变化、快照过期或不属于当前 session，则拒绝且不覆盖新内容。
+    """
+    snapshot_id = (snapshot_id or "").strip()
+    if not snapshot_id:
+        return "snapshot_id 不能为空"
+    try:
+        store = SnapshotStore()
+    except ValueError as e:
+        return str(e)
+    return restore_from_snapshot(store, snapshot_id, session_id=tool_session_id.get())

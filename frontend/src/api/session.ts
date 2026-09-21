@@ -31,6 +31,7 @@ export interface ChatMessage {
   tool_result_ref?: string | null
   tool_result_preview?: string | null
   tool_result_truncated?: boolean
+  tool_reason_code?: string | null
 }
 
 export interface SessionHistory {

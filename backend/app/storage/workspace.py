@@ -167,8 +167,54 @@ def longterm_memory_path(workspace: Path) -> Path:
     return bootstraps_dir(workspace) / "MEMORY.md"
 
 
-def config_file_path(workspace: Path) -> Path:
-    return workspace / CONFIG_FILE
+def config_file_path(workspace: Path | None = None) -> Path:
+    """结构化 CONFIG.json 路径（backend/app/config/CONFIG.json）。
+
+    workspace 参数保留仅为兼容旧调用签名，已忽略。
+    """
+    from app.core.settings import get_settings
+
+    return get_settings().config_path
+
+
+def ensure_runtime_config(settings=None) -> Path:
+    """确保 app/config/CONFIG.json 存在；必要时从旧路径或 defaults 迁移/拷贝。"""
+    from app.core.settings import get_settings
+
+    settings = settings or get_settings()
+    config_dir = Path(settings.config_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(settings.config_path)
+
+    if target.exists():
+        return target
+
+    # 兼容迁移：workspace/CONFIG.json → backend/config/CONFIG.json → app/config/CONFIG.json
+    legacy_candidates = [
+        Path(settings.workspace_path) / CONFIG_FILE,
+        Path(settings.workspace_path).parent / "config" / CONFIG_FILE,
+    ]
+    defaults_candidates = [
+        Path(settings.config_defaults_path) / CONFIG_FILE,
+        Path(settings.workspace_defaults_path) / CONFIG_FILE,
+    ]
+
+    for legacy in legacy_candidates:
+        if legacy.exists() and legacy.resolve() != target.resolve():
+            target.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+            try:
+                legacy.rename(legacy.with_name(f"{CONFIG_FILE}.migrated-away"))
+            except OSError:
+                pass
+            return target
+
+    for src in defaults_candidates:
+        if src.exists():
+            target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            return target
+
+    target.write_text("{}\n", encoding="utf-8")
+    return target
 
 
 def _config_filename(name: str) -> str:
@@ -363,9 +409,10 @@ class SessionStore:
 
 
 class ConfigStore:
-    def __init__(self, workspace: Path, defaults: Path):
+    def __init__(self, workspace: Path, defaults: Path, *, config_defaults: Path | None = None):
         self.workspace = workspace
         self.defaults = defaults
+        self.config_defaults = config_defaults if config_defaults is not None else defaults
 
     def list_configs(self) -> list[str]:
         return [n for n in CONFIG_NAMES if self.get_path(n).exists()]
@@ -374,7 +421,7 @@ class ConfigStore:
         if name not in CONFIG_NAMES:
             raise NotFoundError(f"未知配置: {name}")
         if name == "CONFIG":
-            return config_file_path(self.workspace)
+            return config_file_path()
         return bootstraps_dir(self.workspace) / _config_filename(name)
 
     def read(self, name: str) -> str:
@@ -414,9 +461,13 @@ class ConfigStore:
                 src = self.defaults / _config_filename(name)
             if src.exists():
                 shutil.copy2(src, bootstraps_dir(self.workspace) / _config_filename(name))
-        config_src = self.defaults / CONFIG_FILE
+        config_src = self.config_defaults / CONFIG_FILE
+        if not config_src.exists():
+            config_src = self.defaults / CONFIG_FILE
         if config_src.exists():
-            shutil.copy2(config_src, config_file_path(self.workspace))
+            target = config_file_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(config_src, target)
 
 
 class MemoryStore:

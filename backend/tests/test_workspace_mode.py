@@ -26,6 +26,10 @@ from app.tools.runtime import set_tool_project
 def spaces(tmp_path: Path, monkeypatch):
     home = tmp_path / "agent_home"
     defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
+    config_defaults = Path(__file__).resolve().parents[1] / "app" / "config" / "defaults"
+    if not config_defaults.exists():
+        config_defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
+    config_dir = tmp_path / "config"
     project = tmp_path / "project"
     other = tmp_path / "other"
     home.mkdir()
@@ -34,6 +38,8 @@ def spaces(tmp_path: Path, monkeypatch):
     settings = Settings(
         workspace_path=home,
         workspace_defaults_path=defaults,
+        config_dir=config_dir,
+        config_defaults_path=config_defaults,
     )
     monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
     monkeypatch.setattr("app.storage.project.get_settings", lambda: settings)
@@ -45,7 +51,8 @@ def spaces(tmp_path: Path, monkeypatch):
 def test_init_workspace_seeds_agent_home_only(spaces):
     init_workspace(spaces["settings"])
     home: Path = spaces["home"]
-    assert (home / "CONFIG.json").exists()
+    assert spaces["settings"].config_path.exists()
+    assert not (home / "CONFIG.json").exists()
     assert (home / "bootstraps" / "SOUL.md").exists()
     assert (home / "memory").is_dir()
     assert (home / "sessions").is_dir()
