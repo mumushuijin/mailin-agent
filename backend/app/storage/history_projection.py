@@ -8,7 +8,7 @@ from typing import Any
 
 from app.schemas.session import ChatMessage
 
-PROJECTION_VERSION = 1
+PROJECTION_VERSION = 2
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -19,11 +19,14 @@ class HistoryProjectionStore:
     """Display-only chat history projection used for fast paged reads."""
 
     def __init__(self, workspace: Path):
-        self.root = workspace / "sessions" / "history_projection"
+        self.root = workspace / "sessions"
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, session_id: str) -> Path:
-        return self.root / f"{_safe_session_id(session_id)}.json"
+        safe_id = _safe_session_id(session_id)
+        if safe_id in {"", ".", ".."}:
+            raise ValueError("非法 session id")
+        return self.root / safe_id / "history_projection.json"
 
     def read(self, session_id: str) -> dict[str, Any] | None:
         path = self.path_for(session_id)
@@ -49,6 +52,7 @@ class HistoryProjectionStore:
         api_usage: dict | None = None,
         session_token_stats: dict | None = None,
         todos: list[dict] | None = None,
+        ledger_seq: int | None = None,
     ) -> None:
         payload = {
             "version": PROJECTION_VERSION,
@@ -59,7 +63,9 @@ class HistoryProjectionStore:
             "api_usage": api_usage,
             "session_token_stats": session_token_stats,
             "todos": todos,
+            "ledger_seq": ledger_seq,
         }
+        self.path_for(session_id).parent.mkdir(parents=True, exist_ok=True)
         self.path_for(session_id).write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",

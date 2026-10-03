@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.config import router as config_router
-from app.config.persistence import get_revision_tracker
+from app.config.persistence import dumps_toml, get_revision_tracker
 from app.core.exceptions import AppError
 from app.main import app_error_handler
 from tests.config_test_utils import fake_settings, read_config, write_config
@@ -29,10 +29,10 @@ def settings(tmp_path: Path, monkeypatch):
         "context": {"max_tokens": 1000},
         "mcp_servers": {},
     }
-    (defaults / "CONFIG.json").write_text(json.dumps(seed, ensure_ascii=False), encoding="utf-8")
+    (defaults / "config.toml").write_text(dumps_toml(seed), encoding="utf-8")
     cfg_defaults = tmp_path / "config_defaults"
     cfg_defaults.mkdir()
-    (cfg_defaults / "CONFIG.json").write_text(json.dumps(seed, ensure_ascii=False), encoding="utf-8")
+    (cfg_defaults / "config.toml").write_text(dumps_toml(seed), encoding="utf-8")
 
     (tmp_path / "bootstraps").mkdir()
     (tmp_path / "bootstraps" / "SOUL.md").write_text("# 麦林\n", encoding="utf-8")
@@ -81,6 +81,9 @@ def test_list_modules_and_markdown_file_api_isolated(api, settings):
     assert "SOUL" not in keys
     assert "context" not in keys
     assert "CONFIG" not in keys
+
+    assert api.get("/api/config/CONFIG").status_code == 404
+    assert api.put("/api/config/CONFIG", json={"content": "{}"}).status_code == 404
 
     soul = api.get("/api/config/SOUL")
     assert soul.status_code == 200
@@ -165,7 +168,7 @@ def test_atomic_write_keeps_old_file_on_failure(settings, monkeypatch):
     def boom(*_args, **_kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr("app.services.config_service.atomic_write_json", boom)
+    monkeypatch.setattr("app.services.config_service.atomic_write_toml", boom)
     with pytest.raises(Exception):
         service.update_module(
             "agent",

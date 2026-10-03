@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test } from 'vitest'
 
 import {
   createJsonDraft,
@@ -17,34 +16,34 @@ import {
 } from './moduleGuards.ts'
 
 test('isOrdinaryModuleKey accepts registry keys only', () => {
-  assert.equal(isOrdinaryModuleKey('agent'), true)
-  assert.equal(isOrdinaryModuleKey('tools'), true)
-  assert.equal(isOrdinaryModuleKey('SOUL'), false)
-  assert.equal(isOrdinaryModuleKey('CONFIG'), false)
-  assert.equal(isOrdinaryModuleKey('mcp'), false)
+  expect(isOrdinaryModuleKey('agent')).toBe(true)
+  expect(isOrdinaryModuleKey('tools')).toBe(true)
+  expect(isOrdinaryModuleKey('SOUL')).toBe(false)
+  expect(isOrdinaryModuleKey('CONFIG')).toBe(false)
+  expect(isOrdinaryModuleKey('mcp')).toBe(false)
 })
 
 test('parseJsonText reports syntax errors', () => {
   const bad = parseJsonText('{')
-  assert.equal(bad.ok, false)
+  expect(bad.ok).toBe(false)
   if (!bad.ok) {
-    assert.equal(bad.error.kind, 'syntax')
+    expect(bad.error.kind).toBe('syntax')
   }
   const good = parseJsonText('{"a":1}')
-  assert.equal(good.ok, true)
+  expect(good.ok).toBe(true)
 })
 
 test('guardOrdinaryModule rejects wrong agent types and enums', () => {
   const typeFail = guardOrdinaryModule('agent', { max_steps: 'twelve' })
-  assert.equal(typeFail.ok, false)
+  expect(typeFail.ok).toBe(false)
   if (!typeFail.ok) {
-    assert.ok(typeFail.errors.some((e) => e.path === '/max_steps'))
+    expect(typeFail.errors.some((e) => e.path === '/max_steps')).toBe(true)
   }
 
   const enumFail = parseModuleUnknown('tools', { enforcement_mode: 'strict' })
-  assert.equal(enumFail.ok, false)
+  expect(enumFail.ok).toBe(false)
   if (!enumFail.ok) {
-    assert.ok(enumFail.errors.some((e) => e.path === '/enforcement_mode'))
+    expect(enumFail.errors.some((e) => e.path === '/enforcement_mode')).toBe(true)
   }
 
   const ok = guardOrdinaryModule('agent', {
@@ -53,36 +52,36 @@ test('guardOrdinaryModule rejects wrong agent types and enums', () => {
     max_steps: 10,
     graph_version: '0.1.0',
   })
-  assert.equal(ok.ok, true)
+  expect(ok.ok).toBe(true)
 })
 
 test('path error mapping normalizes dotted paths', () => {
-  assert.equal(normalizeJsonPath('tools.shell.max_timeout'), '/tools/shell/max_timeout')
-  assert.equal(normalizeJsonPath('/max_steps'), '/max_steps')
+  expect(normalizeJsonPath('tools.shell.max_timeout')).toBe('/tools/shell/max_timeout')
+  expect(normalizeJsonPath('/max_steps')).toBe('/max_steps')
   const mapped = mapPathErrors([
     { path: 'max_steps', kind: 'type', message: '必须是数字' },
   ])
-  assert.equal(mapped[0].path, '/max_steps')
-  assert.match(mapped[0].message, /\/max_steps/)
+  expect(mapped[0].path).toBe('/max_steps')
+  expect(mapped[0].message).toMatch(/\/max_steps/)
 })
 
 test('draft restore returns last valid JSON text', () => {
   let draft = createJsonDraft({ model: 'a', temperature: 0.7, max_steps: 8, graph_version: 'x' })
   draft = updateDraftText(draft, '{not-json', 'agent')
-  assert.ok(draft.syntaxError)
-  assert.equal(draft.dirty, true)
+  expect(draft.syntaxError).toBeTruthy()
+  expect(draft.dirty).toBe(true)
 
   draft = restoreLastValid(draft)
-  assert.equal(draft.syntaxError, null)
+  expect(draft.syntaxError).toBeNull()
   const parsed = parseJsonText(draft.text)
-  assert.equal(parsed.ok, true)
+  expect(parsed.ok).toBe(true)
   if (parsed.ok) {
-    assert.equal((parsed.value as { model: string }).model, 'a')
+    expect((parsed.value as { model: string }).model).toBe('a')
   }
 })
 
 test('formatJson keeps trailing newline for editor stability', () => {
   const text = formatJson({ a: 1 })
-  assert.ok(text.endsWith('\n'))
-  assert.match(text, /"a": 1/)
+  expect(text.endsWith('\n')).toBe(true)
+  expect(text).toMatch(/"a": 1/)
 })

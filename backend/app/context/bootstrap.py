@@ -4,7 +4,7 @@ from pathlib import Path
 
 from app.context.budget import estimate_tokens, load_context_config
 from app.core.settings import get_settings
-from app.storage.workspace import ConfigStore
+from app.storage.workspace import ConfigStore, project_agent_md
 from app.tools.runtime import get_project_workspace
 
 PROFILE_FILES = ("SOUL", "USER", "MEMORY", "HEARTBEAT")
@@ -30,7 +30,7 @@ def _append_section(sections: list[str], content: str, single_max: int, total_ma
 
 
 def load_bootstrap(workspace: Path | None = None, project_workspace: Path | None = None) -> tuple[str, int]:
-    """从 Agent 自有空间加载人格文件，再追加项目根 AGENTS.md。"""
+    """从 Agent 自有空间加载人格文件，再追加项目 `.mailin/agent.md`。"""
     workspace = workspace or get_settings().workspace_path
     project = project_workspace or get_project_workspace()
     defaults = get_settings().workspace_defaults_path
@@ -54,7 +54,7 @@ def load_bootstrap(workspace: Path | None = None, project_workspace: Path | None
             break
 
     if project is not None:
-        agents_path = Path(project) / "AGENTS.md"
+        agents_path = project_agent_md(Path(project))
         try:
             if agents_path.is_file():
                 agents = agents_path.read_text(encoding="utf-8").strip()

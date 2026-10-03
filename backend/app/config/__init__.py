@@ -1,4 +1,4 @@
-"""CONFIG.json 规范模型、归一化与运行时投影。"""
+"""全局 TOML 配置模型、归一化与运行时投影。"""
 
 from app.config.document import (
     CanonicalConfigDocument,

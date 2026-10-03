@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -30,11 +29,9 @@ def workspace(tmp_path: Path, monkeypatch):
 
 def _write_config(workspace: Path, data: dict) -> None:
     from app.core.settings import get_settings
+    from tests.config_test_utils import write_config
 
-    settings = get_settings()
-    path = Path(settings.config_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_config(get_settings(), data)
 
 
 def test_canonical_shapes_stdio_http_sse(workspace: Path):

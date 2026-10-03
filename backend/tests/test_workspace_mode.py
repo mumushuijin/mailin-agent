@@ -24,23 +24,14 @@ from app.tools.runtime import set_tool_project
 
 @pytest.fixture
 def spaces(tmp_path: Path, monkeypatch):
-    home = tmp_path / "agent_home"
-    defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
-    config_defaults = Path(__file__).resolve().parents[1] / "app" / "config" / "defaults"
-    if not config_defaults.exists():
-        config_defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
-    config_dir = tmp_path / "config"
+    home = tmp_path / "runtime" / "data" / "agent-home"
+    defaults = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "workspace"
     project = tmp_path / "project"
     other = tmp_path / "other"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
     other.mkdir()
-    settings = Settings(
-        workspace_path=home,
-        workspace_defaults_path=defaults,
-        config_dir=config_dir,
-        config_defaults_path=config_defaults,
-    )
+    settings = Settings(runtime_root=tmp_path / "runtime")
     monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
     monkeypatch.setattr("app.storage.project.get_settings", lambda: settings)
     monkeypatch.setattr("app.services.session_service.get_settings", lambda: settings)
@@ -97,6 +88,9 @@ def test_session_create_list_get_roundtrip(spaces):
     assert listed[0]["id"] == sid
     assert Path(listed[0]["workspace_path"]) == spaces["project"].resolve()
     assert not (spaces["project"] / "sessions").exists()
+    assert (spaces["project"] / ".mailin" / "agent.md").is_file()
+    assert (spaces["project"] / ".mailin" / "commands").is_dir()
+    assert (spaces["project"] / "AGENTS.md").exists() is False
 
 
 def test_session_rebind(spaces):
@@ -124,7 +118,9 @@ def test_legacy_session_chat_fails_closed(spaces):
 
 def test_bootstrap_profile_plus_project_agents(spaces):
     init_workspace(spaces["settings"])
-    (spaces["project"] / "AGENTS.md").write_text("项目规则：只用 pytest", encoding="utf-8")
+    mailin = spaces["project"] / ".mailin"
+    mailin.mkdir(parents=True, exist_ok=True)
+    (mailin / "agent.md").write_text("项目规则：只用 pytest", encoding="utf-8")
     leftover = spaces["home"] / "bootstraps" / "IDENTITY.md"
     leftover.write_text("不该注入的身份", encoding="utf-8")
     (spaces["home"] / "bootstraps" / "BOOTSTRAP.md").write_text("不该注入的引导", encoding="utf-8")
@@ -139,6 +135,85 @@ def test_bootstrap_profile_plus_project_agents(spaces):
     text2, _ = load_bootstrap(spaces["home"], empty)
     assert "麦林" in text2
     assert "项目规则：只用 pytest" not in text2
+
+
+def test_seed_creates_mailin_layout(spaces):
+    init_workspace(spaces["settings"])
+    from app.storage.workspace import (
+        AGENT_MD_REL,
+        PROJECT_COMMANDS_DIR,
+        PROJECT_SKILLS_DIR,
+        seed_project_agents,
+    )
+
+    project: Path = spaces["project"]
+    seed_project_agents(project)
+    assert (project / AGENT_MD_REL).is_file()
+    assert (project / PROJECT_SKILLS_DIR).is_dir()
+    assert (project / PROJECT_COMMANDS_DIR).is_dir()
+    assert (project / ".mailin" / "artifacts").is_dir()
+    assert (project / ".mailin" / "tool_results").is_dir()
+    assert (project / ".mailin" / ".gitignore").is_file()
+    gitignore = (project / ".mailin" / ".gitignore").read_text(encoding="utf-8")
+    assert "artifacts/" in gitignore
+    assert "tool_results/" in gitignore
+    assert "snapshots/" in gitignore
+    agent_md = (project / AGENT_MD_REL).read_text(encoding="utf-8")
+    assert ".mailin/agent.md" in agent_md or "`.mailin/" in agent_md
+    assert "整目录" not in agent_md
+    assert not (project / "AGENTS.md").exists()
+
+
+def test_migrate_legacy_agents_md(spaces):
+    init_workspace(spaces["settings"])
+    from app.storage.workspace import project_agent_md, seed_project_agents
+
+    project: Path = spaces["project"]
+    (project / "AGENTS.md").write_text("旧约定内容", encoding="utf-8")
+    seed_project_agents(project)
+    assert project_agent_md(project).read_text(encoding="utf-8") == "旧约定内容"
+    assert (project / "AGENTS.md").exists()  # 残留不删
+
+
+def test_migrate_legacy_skills(spaces):
+    init_workspace(spaces["settings"])
+    from app.storage.workspace import project_skills_dir, seed_project_agents
+    from app.services.skill_service import SkillService
+
+    project: Path = spaces["project"]
+    legacy = project / ".agents" / "skills" / "foo"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("# Foo\n\nlegacy skill", encoding="utf-8")
+    seed_project_agents(project)
+    migrated = project_skills_dir(project) / "foo" / "SKILL.md"
+    assert migrated.is_file()
+    assert "legacy skill" in migrated.read_text(encoding="utf-8")
+    assert (project / ".agents" / "skills" / "foo").exists()
+    listed = SkillService(spaces["home"], project).list(source="project")
+    assert any(item.id == "foo" for item in listed.skills)
+
+
+def test_migrate_does_not_clobber_canonical(spaces):
+    init_workspace(spaces["settings"])
+    from app.storage.workspace import project_agent_md, project_skills_dir, seed_project_agents
+
+    project: Path = spaces["project"]
+    mailin = project / ".mailin"
+    mailin.mkdir(parents=True)
+    (mailin / "agent.md").write_text("新约定", encoding="utf-8")
+    (project / "AGENTS.md").write_text("旧约定", encoding="utf-8")
+    skills = project_skills_dir(project)
+    skills.mkdir(parents=True)
+    canonical = skills / "foo"
+    canonical.mkdir()
+    (canonical / "SKILL.md").write_text("# New\n\ncanonical", encoding="utf-8")
+    legacy = project / ".agents" / "skills" / "foo"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("# Old\n\nlegacy", encoding="utf-8")
+
+    seed_project_agents(project)
+    assert project_agent_md(project).read_text(encoding="utf-8") == "新约定"
+    assert (canonical / "SKILL.md").read_text(encoding="utf-8") == "# New\n\ncanonical"
 
 
 def test_config_stays_in_agent_home(spaces):

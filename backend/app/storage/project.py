@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from app.core.exceptions import AppError, NotFoundError
@@ -38,6 +39,14 @@ def bind_session_runtime(session_id: str | None) -> Path | None:
     return project
 
 
+async def abind_session_runtime(session_id: str | None) -> Path | None:
+    """Async-safe session binding for graph nodes running on the event loop."""
+    project = await asyncio.to_thread(session_project_path, session_id)
+    set_tool_session(session_id)
+    set_tool_project(project)
+    return project
+
+
 def require_bound_session(session_id: str | None) -> tuple[str, Path]:
     """聊天回合前必须有有效绑定；不回退到 agent home。"""
     if not session_id:
@@ -48,6 +57,7 @@ def require_bound_session(session_id: str | None) -> tuple[str, Path]:
     if not raw:
         raise AppError("请先为此会话绑定项目文件夹")
     project = validate_project_workspace(raw)
+    seed_project_agents(project)
     set_tool_session(session_id)
     set_tool_project(project)
     return session_id, project

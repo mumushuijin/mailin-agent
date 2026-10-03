@@ -10,7 +10,11 @@ export interface ToolSegment {
   id: number
   tool: string
   args: Record<string, unknown>
+  toolCallId?: string | null
   result?: string
+  progressMessage?: string | null
+  startedAt?: number
+  endedAt?: number
   toolResultRef?: string | null
   toolResultTruncated?: boolean
   reasonCode?: string | null
@@ -39,6 +43,70 @@ export interface RunProgressSummary {
   todoCompleted: number
   todoTotal: number
   terminalLabel?: string
+}
+
+export type AgentStatus =
+  | 'idle'
+  | 'initializing'
+  | 'planning'
+  | 'reasoning'
+  | 'tool_calling'
+  | 'observing'
+  | 'summarizing'
+  | 'memory_sync'
+  | 'awaiting_user'
+  | 'completed'
+  | 'cancelled'
+  | 'handoff'
+  | 'error'
+
+export type AgentStateNodeKind = 'phase' | 'tool' | 'observation' | 'terminal'
+export type ToolExecutionStatus = ToolSegment['status']
+
+export interface AgentStateNode {
+  id: string
+  stepId?: string
+  kind: AgentStateNodeKind
+  status: AgentStatus
+  label: string
+  startedAt: number
+  endedAt?: number
+  durationMs?: number
+  active: boolean
+  summary?: string
+  toolIds?: string[]
+  messageId?: number
+}
+
+export interface ToolExecution {
+  toolId: string
+  toolName: string
+  status: ToolExecutionStatus
+  inputs: Record<string, unknown>
+  outputs?: string | null
+  progressMessage?: string | null
+  startedAt: number
+  endedAt?: number
+  redacted?: boolean
+}
+
+export interface AgentStateStream {
+  turnId: number
+  runId?: string | null
+  status: AgentStatus
+  currentStep: number
+  maxSteps?: number
+  startedAt: number
+  endedAt?: number
+  nodes: AgentStateNode[]
+  toolExecutions: ToolExecution[]
+  todoCompleted: number
+  todoTotal: number
+  terminalLabel?: string
+  requiresUserAction: boolean
+  confirmedSeq?: number | null
+  syncing?: boolean
+  activeMessageId?: number | null
 }
 
 export interface ChatUiMessage {
@@ -71,6 +139,7 @@ export interface PendingApproval {
   args: Record<string, unknown>
   reason: string
   toolCallId?: string
+  stepId?: string
   reasonCode?: string
   preview?: ApprovalPreview | null
 }
@@ -83,6 +152,7 @@ export interface PendingAskUser {
   options: string[]
   allowMultiple: boolean
   interruptId?: string
+  stepId?: string
   toolCallId?: string
   mode: AskUserMode
   terminalOnAck?: boolean

@@ -16,6 +16,10 @@ PRE_AGENT_STEP = "pre_agent_step"
 PRE_TOOL_CALL = "pre_tool_call"
 POST_TOOL_CALL = "post_tool_call"
 TRANSFORM_TOOL_RESULT = "transform_tool_result"
+AGENT_NODE_START = "agent_node_start"
+AGENT_NODE_END = "agent_node_end"
+TOOL_NODE_START = "tool_node_start"
+TOOL_NODE_END = "tool_node_end"
 
 VALID_HOOKS = frozenset(
     {
@@ -27,6 +31,10 @@ VALID_HOOKS = frozenset(
         PRE_TOOL_CALL,
         POST_TOOL_CALL,
         TRANSFORM_TOOL_RESULT,
+        AGENT_NODE_START,
+        AGENT_NODE_END,
+        TOOL_NODE_START,
+        TOOL_NODE_END,
     }
 )
 

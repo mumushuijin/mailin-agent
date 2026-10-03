@@ -16,7 +16,7 @@ from app.context.tool_cache import process_tool_message_for_cache
 from app.resilience import CallContext, execute_sync, tool_error_json
 from app.resilience.policies import agent_tools_batch_timeout
 from app.resilience.policy import ResiliencePolicy
-from app.storage.project import bind_session_runtime
+from app.storage.project import abind_session_runtime, bind_session_runtime
 from app.tools.policy import build_execution_context, evaluate_policy
 from app.tools.registry import get_registry
 from app.tools.runtime import tool_todos
@@ -96,8 +96,8 @@ def _resolve_effective_card_and_args(name: str, args: dict[str, Any]):
 async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
     """工具节点：执行热工具 / 桥接工具；策略 gate 在 handler 前做权威判定。"""
     session_id = config.get("configurable", {}).get("thread_id", "default")
-    run_id = config.get("configurable", {}).get("run_id")
-    project_workspace = bind_session_runtime(session_id)
+    run_id = config.get("configurable", {}).get("run_id") or (state.get("scope") or {}).get("run_id")
+    project_workspace = await abind_session_runtime(session_id)
 
     messages = state.get("messages") or []
     if not messages:
@@ -108,7 +108,11 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
         return {"messages": []}
 
     tool_calls = list(last.tool_calls)
+    call_ids = [str(tc.get("id") or "") for tc in tool_calls]
+    if not all(call_ids) or len(call_ids) != len(set(call_ids)):
+        raise ValueError("tool call ids must be present and unique")
     approved_calls = []
+    execution_grants: dict[str, dict[str, bool]] = {}
     denied_messages: list[ToolMessage] = []
     todos = list(state.get("todos") or [])
     terminal_reason: str | None = None
@@ -251,6 +255,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                 session_id=session_id,
             )
 
+        approval_granted = False
         if card is not None:
             ctx = build_execution_context(
                 card,
@@ -276,7 +281,20 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                     )
                 )
                 continue
-            if decision.outcome == "needs_approval" and approval_enabled.get():
+            if decision.outcome == "needs_approval" and not approval_enabled.get():
+                denied_messages.append(
+                    ToolMessage(
+                        content=decision.to_tool_error_message(),
+                        tool_call_id=tc_id,
+                        name=card.name,
+                        additional_kwargs={
+                            "tool_status": "failed",
+                            "reason_code": "approval_required",
+                        },
+                    )
+                )
+                continue
+            if decision.outcome == "needs_approval":
                 preview = decision.preview.to_public_dict() if decision.preview else {}
                 if shell_preview:
                     preview.update(shell_preview)
@@ -319,7 +337,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                         workspace_root=project_workspace,
                     )
                 )
-                if recheck.outcome == "deny":
+                if recheck.outcome != "allow":
                     denied_messages.append(
                         ToolMessage(
                             content=recheck.to_tool_error_message(),
@@ -327,13 +345,18 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                             name=card.name,
                             additional_kwargs={
                                 "tool_status": "failed",
-                                "reason_code": recheck.reason_code or "policy_denied",
+                            "reason_code": recheck.reason_code or "policy_denied",
                             },
                         )
                     )
                     continue
+                approval_granted = True
 
         approved_calls.append(tc)
+        execution_grants[tc_id] = {
+            "approval_granted": approval_granted,
+            "allowlist_matched": allowlist_matched,
+        }
 
     result: dict[str, Any] = {"todos": todos}
     if terminal_reason:
@@ -354,6 +377,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                 session_id,
                 process_for_cache=process_tool_message_for_cache,
                 run_id=run_id,
+                execution_grants=execution_grants,
                 timeout_seconds=max(0.1, batch_timeout - 0.25),
                 cancel_event=cancel_event,
             )

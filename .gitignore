@@ -56,11 +56,14 @@ backend/.langgraph_api/
 # 运行时工作区与用户配置（首次启动从 defaults 复制/迁移生成，属本地数据）
 # ------------------------------------------------------------------------------
 backend/workspace/
-# 保留默认模板
-!backend/workspace_defaults/
-# 运行时 CONFIG.json 落在 app/config 包目录下，勿忽略整个包
-backend/app/config/CONFIG.json
-backend/app/config/CONFIG.json.*
+/.devdata/
+/.devcache/
+/.devtemp/
+/.devlogs/
+/.runtime/
+/.electron-builder-cache/
+/.py-userbase/
+# 默认模板位于 backend/resources/defaults；用户运行数据位于 .runtime
 
 # SQLite / Checkpoint
 *.sqlite

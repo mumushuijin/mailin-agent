@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test } from 'vitest'
 
 import { clonePlainJson } from './clonePlain.ts'
 import { MCP_SECRET_MASK } from './types.ts'
@@ -15,7 +14,7 @@ test('guardMcpServerDraft requires transport fields', () => {
     enabled: true,
     connection: { type: 'streamable-http', headers: {}, args: [], env: {} },
   })
-  assert.equal(missingUrl.ok, false)
+  expect(missingUrl.ok).toBe(false)
 
   const ok = guardMcpServerDraft({
     enabled: true,
@@ -27,7 +26,7 @@ test('guardMcpServerDraft requires transport fields', () => {
       env: {},
     },
   })
-  assert.equal(ok.ok, true)
+  expect(ok.ok).toBe(true)
 })
 
 test('draftToServerWrite clears deleted secrets and keeps masks', () => {
@@ -41,24 +40,24 @@ test('draftToServerWrite clears deleted secrets and keeps masks', () => {
   draft.connection.headers = { Authorization: MCP_SECRET_MASK, 'X-New': 'plain' }
 
   const write = draftToServerWrite(draft, baseline)
-  assert.deepEqual(write.clear_headers, ['X-Extra'])
-  assert.equal(write.connection.headers.Authorization, MCP_SECRET_MASK)
-  assert.equal(write.connection.headers['X-New'], 'plain')
-  assert.ok(!('X-Extra' in write.connection.headers))
+  expect(write.clear_headers).toEqual(['X-Extra'])
+  expect(write.connection.headers.Authorization).toBe(MCP_SECRET_MASK)
+  expect(write.connection.headers['X-New']).toBe('plain')
+  expect('X-Extra' in write.connection.headers).toBe(false)
 })
 
 test('copyServerDraft blanks secret values', () => {
   const source = emptyServerDraft()
   source.connection.env = { TOKEN: MCP_SECRET_MASK }
   const copied = copyServerDraft(source)
-  assert.equal(copied.connection.env.TOKEN, '')
+  expect(copied.connection.env.TOKEN).toBe('')
 })
 
 test('clonePlainJson deep-copies nested config values', () => {
   const source = { agent: { model: 'updated', nested: { a: 1 } } }
   const cloned = clonePlainJson(source)
-  assert.notEqual(cloned, source)
-  assert.notEqual(cloned.agent, source.agent)
+  expect(cloned).not.toBe(source)
+  expect(cloned.agent).not.toBe(source.agent)
   cloned.agent.model = 'other'
-  assert.equal(source.agent.model, 'updated')
+  expect(source.agent.model).toBe('updated')
 })

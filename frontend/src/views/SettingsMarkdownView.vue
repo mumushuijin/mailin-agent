@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Card, List, Input, Button, message, Empty, Tag, Modal, Checkbox } from 'ant-design-vue'
 import {
@@ -26,6 +26,27 @@ const resetOptions = ref({
   reset_memory: true,
   reset_global_config: false,
 })
+type BackendState = Awaited<ReturnType<NonNullable<NonNullable<Window['mailin']>['backend']>['getState']>>
+const backendState = ref<BackendState | null>(null)
+let backendPoll: ReturnType<typeof setInterval> | null = null
+
+const refreshBackendState = async () => {
+  if (window.mailin?.backend) backendState.value = await window.mailin.backend.getState()
+}
+
+const retryBackend = async () => {
+  if (!window.mailin?.backend) return
+  backendState.value = await window.mailin.backend.retry() as BackendState
+}
+
+const chooseRuntimeRoot = async () => {
+  if (!window.mailin?.backend) return
+  backendState.value = await window.mailin.backend.chooseRuntimeRoot() as BackendState
+}
+
+const openRuntimeLog = async () => {
+  if (backendState.value?.paths?.log) await window.mailin?.shell?.openPath(backendState.value.paths.log)
+}
 
 const dirty = computed(
   () => !!selectedConfig.value && editingContent.value !== savedContent.value,
@@ -127,7 +148,10 @@ const handleReset = async () => {
 
 onMounted(() => {
   loadConfigs()
+  void refreshBackendState()
+  if (window.mailin?.backend) backendPoll = setInterval(() => void refreshBackendState(), 3000)
 })
+onUnmounted(() => { if (backendPoll) clearInterval(backendPoll) })
 </script>
 
 <template>
@@ -136,6 +160,19 @@ onMounted(() => {
       <h1>设定</h1>
       <p>编辑 Agent 人格与记忆相关的 Markdown 文件</p>
     </div>
+
+    <Card v-if="backendState" title="运行位置" class="runtime-card">
+      <p>后端状态：{{ backendState.status }}</p>
+      <p v-if="backendState.error" class="runtime-error">{{ backendState.error }}</p>
+      <p>安装目录：{{ backendState.installRoot || '开发环境' }}</p>
+      <p>运行根：{{ backendState.runtimeRoot || '未选择' }}</p>
+      <p v-if="backendState.paths">数据：{{ backendState.paths.data }} · 缓存：{{ backendState.paths.cache }} · 临时：{{ backendState.paths.tmp }} · 日志：{{ backendState.paths.log }}</p>
+      <div class="runtime-actions">
+        <Button @click="chooseRuntimeRoot">选择运行根</Button>
+        <Button @click="retryBackend">重试后端</Button>
+        <Button @click="openRuntimeLog">打开日志目录</Button>
+      </div>
+    </Card>
 
     <div class="config-content">
       <div class="config-list">
@@ -215,12 +252,12 @@ onMounted(() => {
           <Checkbox v-model:checked="resetOptions.reset_sessions">清除所有会话历史</Checkbox>
           <Checkbox v-model:checked="resetOptions.reset_memory">清除每日记忆文件</Checkbox>
           <Checkbox v-model:checked="resetOptions.reset_global_config">
-            重置全局配置（LLM、Agent 设置，以及 CONFIG.json 中的 mcp / mcp_servers）
+            重置全局配置（LLM、Agent 设置，以及全局 MCP 配置）
           </Checkbox>
         </div>
 
         <p style="margin-top: 12px; color: var(--color-text-secondary); font-size: 13px">
-          仅清除会话时不会改动 MCP 配置；勾选「重置全局配置」才会恢复默认 CONFIG（含 MCP）。
+          仅清除会话时不会改动 MCP 配置；勾选「重置全局配置」才会恢复默认配置（含 MCP）。
         </p>
         <p style="margin-top: 16px">您确定要继续吗？</p>
       </div>
@@ -237,6 +274,11 @@ onMounted(() => {
   padding: 24px;
   box-sizing: border-box;
 }
+
+.runtime-card { margin-bottom: 24px; }
+.runtime-card p { overflow-wrap: anywhere; margin: 0 0 8px; }
+.runtime-error { color: var(--color-danger); }
+.runtime-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 .config-header {
   flex-shrink: 0;

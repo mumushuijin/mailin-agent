@@ -18,6 +18,21 @@ declare global {
       shell?: {
         openPath: (folderPath: string) => Promise<{ ok: boolean; error?: string | null }>
       }
+      backend?: {
+        getState: () => Promise<{
+          mode: 'managed' | 'external'
+          status: 'starting' | 'ready' | 'external' | 'unavailable' | 'stopped'
+          endpoint: string | null
+          installRoot: string | null
+          runtimeRoot: string | null
+          paths: { runtimeRoot: string; data: string; cache: string; tmp: string; log: string } | null
+          error: string | null
+          pid: number | null
+        }>
+        getEndpoint: () => Promise<string | null>
+        retry: () => Promise<unknown>
+        chooseRuntimeRoot: () => Promise<unknown>
+      }
     }
   }
 }

@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -175,13 +176,24 @@ def _invoke_llm(
     policy = llm_grace_policy() if grace else llm_agent_policy()
     # 显式透传 config：execute_sync 会在独立线程执行，依赖 contextvars 的流式回调
     # 无法跨线程自动传播，必须把 config（含 astream_events 回调）显式传给 invoke。
+    request_ids: list[str] = []
+
+    def invoke_once():
+        request_id = f"req_{uuid.uuid4().hex}"
+        request_ids.append(request_id)
+        request_config = {**(config or {})}
+        request_config["metadata"] = {**request_config.get("metadata", {}), "request_id": request_id}
+        return model.invoke(messages, config=request_config)
+
     outcome = execute_sync(
         policy.dependency_id,
-        lambda: model.invoke(messages, config=config),
+        invoke_once,
         policy=policy,
         context=CallContext(session_id=session_id),
     )
     if outcome.ok:
+        if isinstance(outcome.value, AIMessage) and request_ids:
+            outcome.value.additional_kwargs["request_id"] = request_ids[-1]
         return outcome.value, None
     return None, outcome.error or "LLM 调用失败"
 
@@ -202,18 +214,27 @@ def _run_grace_summary(
     )
     if grace_response is None:
         logger.warning("grace summary 失败: %s", err)
-        grace_response = AIMessage(content=_BUDGET_SUMMARY_FALLBACK)
+        grace_response = AIMessage(
+            content=_BUDGET_SUMMARY_FALLBACK,
+            additional_kwargs={"budget_finalization_failed": True},
+        )
     elif not isinstance(grace_response, AIMessage):
-        grace_response = AIMessage(content=_BUDGET_SUMMARY_FALLBACK)
+        grace_response = AIMessage(
+            content=_BUDGET_SUMMARY_FALLBACK,
+            additional_kwargs={"budget_finalization_failed": True},
+        )
     else:
         grace_response = normalize_ai_message(grace_response)
-        if not _ai_has_content(grace_response):
+        if grace_response.tool_calls or not _ai_has_content(grace_response):
             grace_response = AIMessage(
                 content=_BUDGET_SUMMARY_FALLBACK,
                 id=grace_response.id,
                 usage_metadata=grace_response.usage_metadata,
                 response_metadata=dict(grace_response.response_metadata or {}),
-                additional_kwargs=dict(grace_response.additional_kwargs or {}),
+                additional_kwargs={
+                    **dict(grace_response.additional_kwargs or {}),
+                    "budget_finalization_failed": True,
+                },
             )
     if "timestamp" not in grace_response.additional_kwargs:
         grace_response.additional_kwargs["timestamp"] = int(time.time())
@@ -252,12 +273,14 @@ def _agent_error_payload(
     *,
     invoke_start_ledger_len: int,
     extra_kwargs: dict | None = None,
+    extra_messages: list | None = None,
 ) -> dict[str, Any]:
     token_updates = _build_token_usage_updates(state, assembled, None)
     kwargs = {"timestamp": int(time.time())}
     if extra_kwargs:
         kwargs.update(extra_kwargs)
     messages: list = list(cache_updates)
+    messages.extend(extra_messages or [])
     messages.append(AIMessage(content=content, additional_kwargs=kwargs))
     usage_dict = assembled.usage.to_dict() if assembled and assembled.usage else {}
     return {
@@ -314,15 +337,19 @@ def call_agent(state: AgentState, config: RunnableConfig) -> dict:
         )
     except Exception as exc:
         logger.exception("call_agent 未预期异常: %s", exc)
-        return _agent_error_payload(
+        result = _agent_error_payload(
             state,
             budget,
             assembled,
             cache_updates,
-            AGENT_FAILURE_MESSAGE,
+            _BUDGET_SUMMARY_FALLBACK if at_budget_exhausted else AGENT_FAILURE_MESSAGE,
             invoke_start_ledger_len=invoke_start_ledger_len,
             extra_kwargs={"agent_error": True},
         )
+        if at_budget_exhausted:
+            result["step"] = budget.used
+            result["terminal_reason"] = "step_budget_exhausted"
+        return result
 
 
 def _call_agent_core(
@@ -351,7 +378,7 @@ def _call_agent_core(
         )
         return {
             "messages": rejected_messages,
-            "step": budget.next_used(),
+            "step": budget.used if at_budget_exhausted else budget.next_used(),
             "context_summary": assembled.context_summary,
             "compression_count": assembled.compression_count,
             "memory_turn_counter": assembled.memory_turn_counter,
@@ -361,11 +388,35 @@ def _call_agent_core(
             "last_invoke_ledger_len": _ledger_len_after_invoke(
                 invoke_start_ledger_len, rejected_messages, cache_updates
             ),
+            **({"terminal_reason": "step_budget_exhausted"} if at_budget_exhausted else {}),
             **token_updates,
         }
 
     working = assembled.messages
     emergency_used = False
+
+    if at_budget_exhausted:
+        summary_human, grace_response = _run_grace_summary(model, working, session_id, config)
+        usage_dict = assembled.usage.to_dict()
+        usage_dict["compressing"] = assembled.compressing
+        final_messages = [*cache_updates, grace_response]
+        failed = bool(grace_response.additional_kwargs.get("budget_finalization_failed"))
+        return {
+            "messages": final_messages,
+            "request_id": grace_response.additional_kwargs.get("request_id"),
+            "step": budget.used,
+            "context_summary": assembled.context_summary,
+            "compression_count": assembled.compression_count,
+            "memory_turn_counter": assembled.memory_turn_counter,
+            "memory_nudge_pending": bool(getattr(assembled, "memory_nudge_pending", False)),
+            "context_usage": usage_dict,
+            "working_messages": working,
+            "last_invoke_ledger_len": _ledger_len_after_invoke(
+                invoke_start_ledger_len, final_messages, cache_updates
+            ),
+            **({"terminal_reason": "step_budget_exhausted"} if failed else {}),
+            **_build_token_usage_updates(state, assembled, grace_response),
+        }
 
     # pre_llm_call：仅在轮首（最后一条为真实用户消息，budget.used==0）注入一次，
     # 避免每步重复注入污染上下文、破坏 prompt cache。注入内容为运行时临时消息，
@@ -379,10 +430,14 @@ def _call_agent_core(
             is_turn_start=True,
         )
 
+    injected_message = None
+    if inject_context:
+        injected_message = make_system_message(inject_context, "hook_context")
+
     def _with_injection(msgs: list) -> list:
         if not inject_context:
             return msgs
-        return list(msgs) + [make_system_message(inject_context, "hook_context")]
+        return list(msgs) + [injected_message]
 
     response, llm_error = _invoke_llm(
         model_with_tools, _with_injection(working), session_id, config=config
@@ -406,6 +461,7 @@ def _call_agent_core(
                     "上下文已满，紧急压缩后仍无法继续。请新建会话。",
                     invoke_start_ledger_len=invoke_start_ledger_len,
                     extra_kwargs={"context_rejected": True},
+                    extra_messages=None,
                 )
             return _agent_error_payload(
                 state,
@@ -415,32 +471,12 @@ def _call_agent_core(
                 AGENT_FAILURE_MESSAGE,
                 invoke_start_ledger_len=invoke_start_ledger_len,
                 extra_kwargs={"agent_error": True},
+                extra_messages=None,
             )
 
     if isinstance(response, AIMessage):
         response = normalize_ai_message(response)
         response = _strip_duplicate_tool_calls(response, ledger)
-        if at_budget_exhausted and _needs_grace_summary(response):
-            summary_human, grace_response = _run_grace_summary(model, working, session_id, config)
-            usage_dict = assembled.usage.to_dict()
-            usage_dict["compressing"] = assembled.compressing
-            token_updates = _merge_token_usage_updates(state, assembled, response, grace_response)
-            grace_messages: list = list(cache_updates)
-            grace_messages.extend([summary_human, grace_response])
-            return {
-                "messages": grace_messages,
-                "step": budget.next_used(),
-                "context_summary": assembled.context_summary,
-                "compression_count": assembled.compression_count,
-                "memory_turn_counter": assembled.memory_turn_counter,
-            "memory_nudge_pending": bool(getattr(assembled, "memory_nudge_pending", False)),
-                "context_usage": usage_dict,
-                "working_messages": working,
-                "last_invoke_ledger_len": _ledger_len_after_invoke(
-                    invoke_start_ledger_len, grace_messages, cache_updates
-                ),
-                **token_updates,
-            }
         if "timestamp" not in response.additional_kwargs:
             response.additional_kwargs["timestamp"] = int(time.time())
         if ledger and is_system_maintenance(ledger[-1]):
@@ -455,6 +491,7 @@ def _call_agent_core(
 
     return {
         "messages": out_messages,
+        "request_id": (response.additional_kwargs or {}).get("request_id") if isinstance(response, AIMessage) else None,
         "step": budget.next_used(),
         "context_summary": assembled.context_summary,
         "compression_count": assembled.compression_count,

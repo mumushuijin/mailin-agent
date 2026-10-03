@@ -1,6 +1,8 @@
 import json
+import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -44,8 +46,22 @@ def derive_session_title(message: str) -> str:
 
 BOOTSTRAPS_DIR = "bootstraps"
 MAILIN_DIR = ".mailin"
+AGENT_MD_NAME = "agent.md"
+AGENT_MD_REL = f"{MAILIN_DIR}/{AGENT_MD_NAME}"
 ARTIFACTS_DIR = f"{MAILIN_DIR}/artifacts"
-CONFIG_FILE = "CONFIG.json"
+TOOL_RESULTS_DIR = f"{MAILIN_DIR}/tool_results"
+PROJECT_SKILLS_DIR = f"{MAILIN_DIR}/skills"
+PROJECT_COMMANDS_DIR = f"{MAILIN_DIR}/commands"
+SNAPSHOTS_DIR = f"{MAILIN_DIR}/snapshots"
+LEGACY_AGENTS_MD = "AGENTS.md"
+LEGACY_AGENTS_SKILLS = ".agents/skills"
+CONFIG_FILE = "config.toml"
+
+MAILIN_GITIGNORE = """# Mailin runtime (do not commit)
+artifacts/
+tool_results/
+snapshots/
+"""
 
 _SECTION_JSON_FILES = ("memory_sections.json", "user_sections.json")
 
@@ -56,7 +72,7 @@ BOOTSTRAP_NAMES = [
     "HEARTBEAT",
 ]
 
-CONFIG_NAMES = ["CONFIG", *BOOTSTRAP_NAMES]
+CONFIG_NAMES = [*BOOTSTRAP_NAMES]
 
 ARTIFACT_EXTENSIONS = {
     ".html",
@@ -93,8 +109,110 @@ def mailin_dir(project: Path) -> Path:
     return project / MAILIN_DIR
 
 
+def project_agent_md(project: Path) -> Path:
+    return mailin_dir(project) / AGENT_MD_NAME
+
+
+def project_skills_dir(project: Path) -> Path:
+    return mailin_dir(project) / "skills"
+
+
+def project_commands_dir(project: Path) -> Path:
+    return mailin_dir(project) / "commands"
+
+
+def project_snapshots_dir(project: Path) -> Path:
+    return mailin_dir(project) / "snapshots"
+
+
 def project_tool_results_dir(project: Path, session_id: str) -> Path:
     return mailin_dir(project) / "tool_results" / session_id
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _migrate_legacy_agent_md(project: Path) -> None:
+    target = project_agent_md(project)
+    if _is_nonempty_file(target):
+        return
+    legacy = project / LEGACY_AGENTS_MD
+    if not legacy.is_file():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _migrate_legacy_skills(project: Path) -> None:
+    legacy_root = project.joinpath(*LEGACY_AGENTS_SKILLS.split("/"))
+    if not legacy_root.is_dir():
+        return
+    dest_root = project_skills_dir(project)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for child in legacy_root.iterdir():
+        dest = dest_root / child.name
+        if dest.exists():
+            continue
+        if child.is_dir():
+            shutil.copytree(child, dest)
+        elif child.is_file():
+            shutil.copy2(child, dest)
+
+
+def _seed_agent_md_from_template(project: Path) -> None:
+    target = project_agent_md(project)
+    if target.exists():
+        return
+    from app.core.settings import get_settings
+
+    defaults = get_settings().workspace_defaults_path / "project"
+    for name in (AGENT_MD_NAME, LEGACY_AGENTS_MD):
+        source = defaults / name
+        if source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            return
+
+
+def _ensure_mailin_gitignore(project: Path) -> None:
+    path = mailin_dir(project) / ".gitignore"
+    if path.exists():
+        return
+    path.write_text(MAILIN_GITIGNORE, encoding="utf-8")
+
+
+def _seed_commands_readme(project: Path) -> None:
+    dest = project_commands_dir(project) / "README.md"
+    if dest.exists():
+        return
+    from app.core.settings import get_settings
+
+    source = get_settings().workspace_defaults_path / "project" / "commands" / "README.md"
+    if source.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def ensure_project_mailin_layout(project: Path) -> None:
+    """确保项目侧唯一 `.mailin/` 布局，并安全迁移旧 AGENTS.md / .agents/skills。"""
+    for rel in (
+        ARTIFACTS_DIR,
+        TOOL_RESULTS_DIR,
+        PROJECT_SKILLS_DIR,
+        PROJECT_COMMANDS_DIR,
+        SNAPSHOTS_DIR,
+    ):
+        (project / rel).mkdir(parents=True, exist_ok=True)
+
+    _migrate_legacy_agent_md(project)
+    _migrate_legacy_skills(project)
+    _seed_agent_md_from_template(project)
+    _seed_commands_readme(project)
+    _ensure_mailin_gitignore(project)
 
 
 def _is_same_or_child(path: Path, root: Path) -> bool:
@@ -135,19 +253,14 @@ def validate_project_workspace(raw: str | Path | None) -> Path:
         raise AppError("不能将 Agent 自有空间作为项目工作区")
     if _is_same_or_child(path, defaults):
         raise AppError("不能将模板目录作为项目工作区")
+    if _is_same_or_child(path, Path(settings.config_dir)):
+        raise AppError("不能将全局配置目录作为项目工作区")
     return path
 
 
 def seed_project_agents(project: Path) -> None:
-    """项目根没有 AGENTS.md 时，从模板复制一份种子。"""
-    target = project / "AGENTS.md"
-    if target.exists():
-        return
-    from app.core.settings import get_settings
-
-    source = get_settings().workspace_defaults_path / "project" / "AGENTS.md"
-    if source.exists():
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    """确保项目 `.mailin/` 布局、种子 agent.md，并迁移旧布局（不删除旧残留）。"""
+    ensure_project_mailin_layout(project)
 
 
 def assert_not_agent_space(path: Path) -> None:
@@ -157,9 +270,12 @@ def assert_not_agent_space(path: Path) -> None:
     settings = get_settings()
     home = getattr(settings, "workspace_path", None)
     defaults = getattr(settings, "workspace_defaults_path", None)
+    config_dir = getattr(settings, "config_dir", None)
     if home and _is_same_or_child(path, Path(home)):
         raise ValueError("路径越界")
     if defaults and _is_same_or_child(path, Path(defaults)):
+        raise ValueError("路径越界")
+    if config_dir and _is_same_or_child(path, Path(config_dir)):
         raise ValueError("路径越界")
 
 
@@ -168,58 +284,37 @@ def longterm_memory_path(workspace: Path) -> Path:
 
 
 def config_file_path(workspace: Path | None = None) -> Path:
-    """结构化 CONFIG.json 路径（backend/app/config/CONFIG.json）。
-
-    workspace 参数保留仅为兼容旧调用签名，已忽略。
-    """
+    """全局 TOML 配置路径；项目 workspace 不参与配置选择。"""
     from app.core.settings import get_settings
 
-    return get_settings().config_path
+    settings = get_settings()
+    if hasattr(settings, "config_path"):
+        return settings.config_path
+    from app.core.runtime_layout import RuntimeLayout
+
+    return RuntimeLayout.resolve().config_path
 
 
 def ensure_runtime_config(settings=None) -> Path:
-    """确保 app/config/CONFIG.json 存在；必要时从旧路径或 defaults 迁移/拷贝。"""
+    """从只读模板初始化全局配置，绝不读取旧 JSON。"""
     from app.core.settings import get_settings
 
     settings = settings or get_settings()
     config_dir = Path(settings.config_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
     target = Path(settings.config_path)
-
     if target.exists():
         return target
+    source = Path(settings.config_defaults_path) / CONFIG_FILE
+    if not source.is_file():
+        raise RuntimeError(f"默认配置资源缺失: {source}")
+    from app.config.persistence import atomic_write_toml, read_toml
 
-    # 兼容迁移：workspace/CONFIG.json → backend/config/CONFIG.json → app/config/CONFIG.json
-    legacy_candidates = [
-        Path(settings.workspace_path) / CONFIG_FILE,
-        Path(settings.workspace_path).parent / "config" / CONFIG_FILE,
-    ]
-    defaults_candidates = [
-        Path(settings.config_defaults_path) / CONFIG_FILE,
-        Path(settings.workspace_defaults_path) / CONFIG_FILE,
-    ]
-
-    for legacy in legacy_candidates:
-        if legacy.exists() and legacy.resolve() != target.resolve():
-            target.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
-            try:
-                legacy.rename(legacy.with_name(f"{CONFIG_FILE}.migrated-away"))
-            except OSError:
-                pass
-            return target
-
-    for src in defaults_candidates:
-        if src.exists():
-            target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-            return target
-
-    target.write_text("{}\n", encoding="utf-8")
+    atomic_write_toml(target, read_toml(source))
     return target
 
 
 def _config_filename(name: str) -> str:
-    if name == "CONFIG":
-        return CONFIG_FILE
     return f"{name}.md"
 
 
@@ -243,7 +338,7 @@ def normalize_workspace_path(relative: str, *, for_write: bool = False) -> str:
         raise ValueError("路径不能为空")
 
     first = rel.split("/", 1)[0]
-    if first in RESERVED_TOP_LEVEL or first == CONFIG_FILE:
+    if first in RESERVED_TOP_LEVEL:
         return rel
 
     if for_write and "/" not in rel:
@@ -280,10 +375,15 @@ class SessionStore:
         return json.loads(self.index_path.read_text(encoding="utf-8"))
 
     def _save(self, data: dict) -> None:
-        self.index_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        fd, temporary = tempfile.mkstemp(prefix=".index-", suffix=".tmp", dir=self.sessions_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.index_path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def _hydrate(self, session_id: str, meta: dict) -> dict:
         record = {"id": session_id, **meta}
@@ -420,8 +520,6 @@ class ConfigStore:
     def get_path(self, name: str) -> Path:
         if name not in CONFIG_NAMES:
             raise NotFoundError(f"未知配置: {name}")
-        if name == "CONFIG":
-            return config_file_path()
         return bootstraps_dir(self.workspace) / _config_filename(name)
 
     def read(self, name: str) -> str:
@@ -431,8 +529,6 @@ class ConfigStore:
         return path.read_text(encoding="utf-8")
 
     def write(self, name: str, content: str) -> None:
-        if name == "CONFIG":
-            json.loads(content)
         path = self.get_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -461,13 +557,12 @@ class ConfigStore:
                 src = self.defaults / _config_filename(name)
             if src.exists():
                 shutil.copy2(src, bootstraps_dir(self.workspace) / _config_filename(name))
+        from app.config.persistence import atomic_write_toml, read_toml
+
         config_src = self.config_defaults / CONFIG_FILE
-        if not config_src.exists():
-            config_src = self.defaults / CONFIG_FILE
-        if config_src.exists():
-            target = config_file_path()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(config_src, target)
+        if not config_src.is_file():
+            raise RuntimeError(f"默认配置资源缺失: {config_src}")
+        atomic_write_toml(config_file_path(), read_toml(config_src))
 
 
 class MemoryStore:

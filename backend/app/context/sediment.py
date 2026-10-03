@@ -77,7 +77,8 @@ def rescue_before_compression(
     try:
         model = get_chat_model()
         prompt = RESCUE_PROMPT.format(history=messages_text[:12000])
-        resp = model.invoke([HumanMessage(content=prompt)])
+        from app.core.model_request import invoke_auxiliary_model
+        resp = invoke_auxiliary_model(model, [HumanMessage(content=prompt)])
         usage = extract_api_usage(resp, source="compression_rescue")
         if usage:
             api_usages.append(usage)

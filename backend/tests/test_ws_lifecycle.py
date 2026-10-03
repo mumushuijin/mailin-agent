@@ -168,6 +168,7 @@ async def test_ws_cancel_emits_terminal_events_when_stream_silent():
 
     chat_service.iter_chat_events = failing_iter
     chat_service.repair_cancelled_checkpoint = AsyncMock()
+    chat_service.mark_terminal_checkpoint = AsyncMock()
 
     svc = WsChatService(manager, chat_service)
     await svc._execute_run(1, "run-1", "hi", "sess-1")
@@ -202,6 +203,66 @@ async def test_cancel_run_cancels_approval_future_instead_of_deny():
 
     assert future.cancelled()
     chat_service.repair_cancelled_checkpoint.assert_awaited_once_with("sess-1")
+
+
+@pytest.mark.asyncio
+async def test_stale_approval_is_rejected_without_consuming_pending_future():
+    manager = MagicMock()
+    manager.send_event = AsyncMock()
+    chat_service = MagicMock()
+    svc = WsChatService(manager, chat_service)
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    svc._approval_futures["run-1"] = future
+    svc._run_sessions["run-1"] = "sess-1"
+    svc._pending_interrupt_meta["run-1"] = {"tool_call_id": "tool-1", "session_id": "sess-1"}
+
+    await svc.handle_message(
+        1,
+        {
+            "op": "approve",
+            "run_id": "run-1",
+            "decision": "allow",
+            "tool_call_id": "tool-old",
+            "session_id": "sess-1",
+        },
+    )
+
+    assert not future.done()
+    assert "run-1" in svc._approval_futures
+    error = manager.send_event.await_args.args[1]
+    assert error.type == "error"
+    assert error.data["reason_code"] == "stale_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_state_sync_returns_snapshot_only_for_active_run_session():
+    manager = MagicMock()
+    manager.send_event = AsyncMock()
+    chat_service = MagicMock()
+    svc = WsChatService(manager, chat_service)
+    svc._run_sessions["run-1"] = "sess-1"
+    dispatcher = MagicMock()
+    dispatcher.publish = AsyncMock(return_value=True)
+    svc._dispatchers["run-1"] = dispatcher
+    state = {
+        "checkpoint_id": "cp-1", "state_revision": 1,
+        "scope": {"workspace_id": "ws-1", "session_id": "sess-1", "run_id": "run-1", "task_id": "task-1", "request_id": "req-1", "step_id": "step-1"},
+        "context": {"working_message": []}, "max_step_every_run": 8,
+        "tasks": ["task-1"], "current_task": "task-1",
+        "current_step": {"step_id": "step-1", "tool_calls": []}, "memory": {},
+    }
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(return_value=MagicMock(values=state))
+    with patch("app.services.ws_chat_service.asyncio.to_thread", new=AsyncMock(return_value=graph)):
+        await svc.handle_message(7, {"op": "state.sync", "run_id": "run-1", "session_id": "sess-old"})
+        dispatcher.publish.assert_not_awaited()
+        await svc.handle_message(7, {"op": "state.sync", "run_id": "run-1", "session_id": "sess-1"})
+
+    event = dispatcher.publish.await_args.args[1]["agent_event"]
+    assert event.type == "state_sync"
+    assert event.state["checkpoint_id"] == "cp-1"
 
 
 def test_push_maintenance_background_payload():

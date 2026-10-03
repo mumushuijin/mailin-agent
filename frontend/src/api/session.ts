@@ -25,12 +25,17 @@ export interface ToolCall {
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'tool'
   content?: string
+  message_id?: string | null
+  vendor_message_id?: string | null
+  scope?: { workspace_id: string; session_id: string; run_id: string; task_id: string | null; request_id: string | null; step_id: string | null } | null
+  origin?: 'user' | 'assistant' | 'tool' | 'system_maintenance' | null
   tool_calls?: ToolCall[]
   tool_call_id?: string
   timestamp?: number
   tool_result_ref?: string | null
   tool_result_preview?: string | null
   tool_result_truncated?: boolean
+  tool_status?: string | null
   tool_reason_code?: string | null
 }
 

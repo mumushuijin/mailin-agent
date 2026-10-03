@@ -1,4 +1,4 @@
-"""CONFIG.json 规范根文档模型。"""
+"""全局 TOML 配置规范根文档模型。"""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class ConfigDomainModel(FlexibleModel):
 
 
 class CanonicalConfigDocument(FlexibleModel):
-    """规范 CONFIG.json 根结构。"""
+    """规范全局配置根结构。"""
 
     schema_version: int = 1
     config: ConfigDomainModel = Field(default_factory=ConfigDomainModel)

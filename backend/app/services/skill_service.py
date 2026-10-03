@@ -281,7 +281,9 @@ class SkillService:
     def _project_root(self) -> Path | None:
         if not self.config.get("project_enabled", True) or self.project_workspace is None:
             return None
-        return (self.project_workspace / ".agents" / "skills").resolve()
+        from app.storage.workspace import project_skills_dir
+
+        return project_skills_dir(self.project_workspace).resolve()
 
     def _cache_key(self) -> tuple[str, str | None]:
         project = str(self._project_root()) if self._project_root() else None
@@ -502,13 +504,13 @@ class SkillService:
         return 0, ""
 
     def _write_skill_config(self, config: dict[str, Any]) -> None:
-        from app.config.persistence import atomic_write_json
+        from app.config.persistence import atomic_write_toml
         from app.storage.workspace import config_file_path
 
         path = config_file_path()
         full = _load_workspace_config(self.workspace)
         full["skills"] = config
-        atomic_write_json(path, full)
+        atomic_write_toml(path, full)
         clear_skill_cache()
 
     def set_enabled(self, skill_id: str, enabled: bool, *, source: SkillSource | None = None) -> SkillToggleResponse:

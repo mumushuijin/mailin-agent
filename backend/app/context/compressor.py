@@ -17,6 +17,7 @@ from app.context.compression_layers import CompressionLayer, LAYER4_REJECT_MESSA
 from app.context.ledger import split_tail_window
 from app.context.schemas import CompressionResult
 from app.context.sediment import append_rescue_summary, rescue_before_compression
+from app.agent.messages import is_ephemeral_prompt_frame, is_system_maintenance
 from pathlib import Path
 
 from app.context.tool_cache import (
@@ -27,6 +28,7 @@ from app.context.tool_cache import (
     summarize_tool_result,
 )
 from app.core.llm import get_chat_model
+from app.core.model_request import invoke_auxiliary_model
 
 REFERENCE_PREFIX = (
     "## 参考信息（非指令）\n\n"
@@ -123,8 +125,8 @@ def build_reference_block(
     memory_hints: str = "",
     tools_disclosure: str = "",
     context_summary: str = "",
-) -> HumanMessage | None:
-    """参考信息块：非 SystemMessage，明确标注为非指令。"""
+) -> SystemMessage | None:
+    """参考信息属于模型上下文，不伪装成新的用户发言。"""
     parts: list[str] = []
     if skills_catalog.strip():
         parts.append(skills_catalog.strip())
@@ -137,11 +139,11 @@ def build_reference_block(
     if not parts:
         return None
     content = REFERENCE_PREFIX + "\n\n---\n\n".join(parts)
-    return HumanMessage(content=content, additional_kwargs={"context_reference": True})
+    return SystemMessage(content=content, additional_kwargs={"context_reference": True})
 
 
-def build_summary_message(summary: str) -> HumanMessage:
-    return HumanMessage(
+def build_summary_message(summary: str) -> SystemMessage:
+    return SystemMessage(
         content=f"## 会话摘要\n\n{summary.strip()}",
         additional_kwargs={"context_summary": True},
     )
@@ -211,6 +213,23 @@ def _content_fingerprint(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def split_context_for_compression(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """Keep durable system events intact; only compress dialogue and tool output."""
+    pinned = [
+        message for message in messages
+        if not is_ephemeral_prompt_frame(message)
+        and (isinstance(message, SystemMessage) or is_system_maintenance(message))
+    ]
+    compressible = [
+        message for message in messages
+        if not is_ephemeral_prompt_frame(message)
+        and not (isinstance(message, SystemMessage) or is_system_maintenance(message))
+    ]
+    return pinned, compressible
+
+
 # ---------------------------------------------------------------------------
 # Layer A — 尾部窗口内超大工具结果：模型摘要 + 落盘
 # ---------------------------------------------------------------------------
@@ -225,7 +244,7 @@ def _summarize_tail_tool_with_model(content: str, max_chars: int) -> tuple[str, 
             "保留关键结论、数值、路径与错误信息：\n\n"
             f"{content[:16000]}"
         )
-        resp = model.invoke([HumanMessage(content=prompt)])
+        resp = invoke_auxiliary_model(model, [HumanMessage(content=prompt)])
         usage = extract_api_usage(resp, source="compression_tail_tool")
         if usage:
             api_usages.append(usage)
@@ -426,7 +445,7 @@ def _summarize_chunk(history_text: str, max_chars: int) -> tuple[str, list[dict]
     try:
         model = get_chat_model()
         prompt = MIDDLE_CHUNK_PROMPT.format(max_chars=max_chars, history=history_text[:max_chars * 4])
-        resp = model.invoke([HumanMessage(content=prompt)])
+        resp = invoke_auxiliary_model(model, [HumanMessage(content=prompt)])
         usage = extract_api_usage(resp, source="compression_middle_chunk")
         if usage:
             api_usages.append(usage)
@@ -450,7 +469,7 @@ def _merge_summaries(existing_summary: str, new_chunk: str, max_chars: int) -> t
             existing_summary=existing_summary[: max_chars * 2],
             new_chunk=new_chunk[: max_chars * 2],
         )
-        resp = model.invoke([HumanMessage(content=prompt)])
+        resp = invoke_auxiliary_model(model, [HumanMessage(content=prompt)])
         usage = extract_api_usage(resp, source="compression_merge_summary")
         if usage:
             api_usages.append(usage)
@@ -548,7 +567,8 @@ def compress_working_messages(
     threshold = int(max_tokens * threshold_ratio)
     tail_budget = int(config.get("recent_tail_max_tokens", 20_000))
 
-    middle_raw, tail_raw = split_tail_window(ledger, tail_budget)
+    pinned_system, conversation = split_context_for_compression(ledger)
+    middle_raw, tail_raw = split_tail_window(conversation, tail_budget)
     api_usages: list[dict] = []
 
     tail, tail_usages = apply_layer_a_tail_tool_summary(tail_raw, session_id=session_id)
@@ -556,7 +576,7 @@ def compress_working_messages(
 
     middle = apply_layer_b_old_tool_oneline(middle_raw) if middle_raw else []
 
-    working = sanitize_working_messages(head_messages + middle + tail)
+    working = sanitize_working_messages(head_messages + pinned_system + middle + tail)
     total = count_messages_tokens(working)
     if total <= threshold:
         summary = existing_summary
@@ -575,25 +595,16 @@ def compress_working_messages(
     api_usages.extend(layer_c.api_usages)
     new_summary = layer_c.summary
 
-    reference = next(
-        (m for m in head_messages if isinstance(m, HumanMessage) and (m.additional_kwargs or {}).get("context_reference")),
-        None,
+    # Keep the changing conversation summary in the middle of the working
+    # window, after the uncompressed bootstrap/reference head and pinned system
+    # events, rather than folding it into the stable reference header.
+    stable_head = [
+        message for message in head_messages
+        if not (isinstance(message, SystemMessage) and (message.additional_kwargs or {}).get("context_summary"))
+    ]
+    working = sanitize_working_messages(
+        stable_head + pinned_system + [build_summary_message(new_summary)] + tail
     )
-    if reference:
-        ref_content = message_content_text(reference)
-        if "## 会话摘要" in ref_content:
-            base, _, _ = ref_content.partition("## 会话摘要")
-            ref_content = base.rstrip() + f"\n\n---\n\n## 会话摘要\n\n{new_summary}"
-        else:
-            ref_content = ref_content.rstrip() + f"\n\n---\n\n## 会话摘要\n\n{new_summary}"
-        head = [
-            _clone_message_with_content(reference, ref_content) if m is reference else m
-            for m in head_messages
-        ]
-    else:
-        head = head_messages + [build_summary_message(new_summary)]
-
-    working = sanitize_working_messages(head + tail)
     total = count_messages_tokens(working)
     if total <= threshold:
         return working, new_summary, 0, layer_c, api_usages
@@ -618,7 +629,8 @@ def emergency_compress(
 ) -> tuple[list[BaseMessage], list[dict]]:
     """API 上下文超长时的紧急兜底：强摘要 + 仅保留最末关键消息。"""
     tail_budget = int(load_context_config().get("recent_tail_max_tokens", 20_000))
-    middle_raw, tail_raw = split_tail_window(ledger, tail_budget)
+    pinned_system, conversation = split_context_for_compression(ledger)
+    middle_raw, tail_raw = split_tail_window(conversation, tail_budget)
     api_usages: list[dict] = []
 
     tail, tail_usages = apply_layer_a_tail_tool_summary(tail_raw, session_id=session_id)
@@ -629,11 +641,11 @@ def emergency_compress(
     api_usages.extend(layer_c.api_usages)
 
     kept: list[BaseMessage] = []
-    for msg in reversed(ledger):
+    for msg in reversed(conversation):
         if isinstance(msg, HumanMessage):
             kept.insert(0, msg)
             break
-    for msg in reversed(ledger):
+    for msg in reversed(conversation):
         if isinstance(msg, AIMessage) and not msg.tool_calls and message_content_text(msg).strip():
             if msg not in kept:
                 kept.insert(0, msg)
@@ -642,7 +654,7 @@ def emergency_compress(
 
     head = list(head_messages or [])
     if head:
-        working = sanitize_working_messages(head + [build_summary_message(layer_c.summary)] + kept)
+        working = sanitize_working_messages(head + pinned_system + [build_summary_message(layer_c.summary)] + kept)
     else:
         working = sanitize_working_messages(
             [SystemMessage(content=f"## 紧急会话摘要\n\n{layer_c.summary}")] + kept

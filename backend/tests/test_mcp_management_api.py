@@ -185,7 +185,8 @@ def test_masked_save_preserves_secret(api, workspace: Path):
     }
     res = api.put("/api/mcp/sec", json=update)
     assert res.status_code == 200
-    raw = json.loads(settings_module.get_settings().config_path.read_text(encoding="utf-8"))
+    from app.config.persistence import read_toml
+    raw = read_toml(settings_module.get_settings().config_path)
     assert raw["mcp"]["servers"]["sec"]["connection"]["headers"]["Authorization"] == "Bearer real-token-value"
 
     clear = {
@@ -199,5 +200,5 @@ def test_masked_save_preserves_secret(api, workspace: Path):
         "clear_headers": ["Authorization"],
     }
     assert api.put("/api/mcp/sec", json=clear).status_code == 200
-    raw = json.loads(settings_module.get_settings().config_path.read_text(encoding="utf-8"))
+    raw = read_toml(settings_module.get_settings().config_path)
     assert "Authorization" not in raw["mcp"]["servers"]["sec"]["connection"]["headers"]

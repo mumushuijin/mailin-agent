@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test } from 'vitest'
 
 import { groupSessionsByProject, UNBOUND_GROUP_KEY, type GroupableSession } from './projectGroups.ts'
 
@@ -35,11 +34,11 @@ test('groups sessions by project path and sorts by recency', () => {
     }),
   ])
 
-  assert.equal(groups.length, 2)
-  assert.equal(groups[0]?.label, 'beta')
-  assert.deepEqual(groups[0]?.sessions.map((s) => s.id), ['b1'])
-  assert.equal(groups[1]?.label, 'alpha')
-  assert.deepEqual(groups[1]?.sessions.map((s) => s.id), ['a2', 'a1'])
+  expect(groups.length).toBe(2)
+  expect(groups[0]?.label).toBe('beta')
+  expect(groups[0]?.sessions.map((s) => s.id)).toEqual(['b1'])
+  expect(groups[1]?.label).toBe('alpha')
+  expect(groups[1]?.sessions.map((s) => s.id)).toEqual(['a2', 'a1'])
 })
 
 test('unbound sessions form a trailing group', () => {
@@ -48,9 +47,9 @@ test('unbound sessions form a trailing group', () => {
     session({ id: 'old', workspace_path: null, updated_at: 99 }),
   ])
 
-  assert.equal(groups.length, 2)
-  assert.equal(groups[0]?.label, 'proj')
-  assert.equal(groups[1]?.key, UNBOUND_GROUP_KEY)
-  assert.equal(groups[1]?.label, '未绑定')
-  assert.deepEqual(groups[1]?.sessions.map((s) => s.id), ['old'])
+  expect(groups.length).toBe(2)
+  expect(groups[0]?.label).toBe('proj')
+  expect(groups[1]?.key).toBe(UNBOUND_GROUP_KEY)
+  expect(groups[1]?.label).toBe('未绑定')
+  expect(groups[1]?.sessions.map((s) => s.id)).toEqual(['old'])
 })

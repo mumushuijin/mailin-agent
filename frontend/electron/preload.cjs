@@ -20,4 +20,10 @@ contextBridge.exposeInMainWorld('mailin', {
   shell: {
     openPath: (folderPath) => ipcRenderer.invoke('shell:openPath', folderPath),
   },
+  backend: {
+    getState: () => ipcRenderer.invoke('backend:getState'),
+    getEndpoint: () => ipcRenderer.invoke('backend:getEndpoint'),
+    retry: () => ipcRenderer.invoke('backend:retry'),
+    chooseRuntimeRoot: () => ipcRenderer.invoke('backend:chooseRuntimeRoot'),
+  },
 })

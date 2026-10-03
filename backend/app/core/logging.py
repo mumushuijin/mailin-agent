@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import sys
 import uuid
 from collections.abc import Iterator
@@ -19,6 +20,26 @@ from structlog.contextvars import (
 )
 
 _configured = False
+_runtime_handler: logging.FileHandler | None = None
+_SECRET_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password|authorization)", re.IGNORECASE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)([^\s,;]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_log_value(value: Any) -> Any:
+    """递归脱敏日志字段，避免配置诊断和异常文本泄漏凭证。"""
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, child in value.items():
+            redacted[key] = "***" if _SECRET_KEY_RE.search(str(key)) else redact_log_value(child)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return type(value)(redact_log_value(item) for item in value)
+    if isinstance(value, str):
+        return _SECRET_ASSIGNMENT_RE.sub(r"\1***", value)
+    return value
 
 
 def _log_timezone() -> ZoneInfo:
@@ -31,6 +52,10 @@ def _add_timestamp(_logger: Any, _method_name: str, event_dict: dict[str, Any]) 
     """统一使用项目时区（默认 Asia/Shanghai / UTC+8）。"""
     event_dict["timestamp"] = datetime.now(_log_timezone()).isoformat(timespec="milliseconds")
     return event_dict
+
+
+def _redact_event(_logger: Any, _method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    return redact_log_value(event_dict)
 
 
 def setup_logging(*, level: str = "INFO", log_format: str = "console") -> None:
@@ -46,6 +71,7 @@ def setup_logging(*, level: str = "INFO", log_format: str = "console") -> None:
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
+        _redact_event,
         _add_timestamp,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
@@ -55,6 +81,7 @@ def setup_logging(*, level: str = "INFO", log_format: str = "console") -> None:
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.stdlib.add_log_level,
+            _redact_event,
             _add_timestamp,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
@@ -83,6 +110,25 @@ def setup_logging(*, level: str = "INFO", log_format: str = "console") -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(log_level)
+
+
+def attach_runtime_log_file(log_dir: Any) -> None:
+    """Send backend logs to the resolved writable runtime log directory."""
+    global _runtime_handler
+    from pathlib import Path
+
+    path = Path(log_dir) / "backend.log"
+    if _runtime_handler and _runtime_handler.baseFilename == str(path):
+        return
+    root = logging.getLogger()
+    if _runtime_handler:
+        root.removeHandler(_runtime_handler)
+        _runtime_handler.close()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(root.handlers[0].formatter if root.handlers else logging.Formatter("%(levelname)s %(message)s"))
+    root.addHandler(handler)
+    _runtime_handler = handler
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

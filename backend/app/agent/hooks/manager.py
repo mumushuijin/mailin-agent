@@ -93,6 +93,17 @@ def dispatch_observe(event: str, **kwargs: Any) -> None:
         _safe_call(event, cb, kwargs)
 
 
+def dispatch_observe_nonblocking(event: str, **kwargs: Any) -> None:
+    """Deliver observability callbacks off the graph execution thread."""
+    payload = dict(kwargs)
+    for callback in _manager.callbacks(event):
+        thread = threading.Thread(
+            target=_safe_call, args=(event, callback, payload), daemon=True,
+            name=f"agent-hook-{event}",
+        )
+        thread.start()
+
+
 # ---------------------------------------------------------------------------
 # 干预型分发
 # ---------------------------------------------------------------------------

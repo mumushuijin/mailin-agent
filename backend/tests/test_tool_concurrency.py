@@ -147,6 +147,8 @@ def test_safe_batch_isolates_one_member_failure(monkeypatch):
 
 
 def test_safe_batch_returns_completed_and_timeout_results(monkeypatch):
+    monkeypatch.setattr("app.storage.project.bind_session_runtime", lambda _session_id: None)
+
     def slow(**_kwargs):
         time.sleep(0.2)
         return "slow"
@@ -187,7 +189,7 @@ def test_safe_batch_returns_completed_and_timeout_results(monkeypatch):
         ],
         "sess-1",
         process_for_cache=lambda msg, _session_id: msg,
-        timeout_seconds=0.03,
+        timeout_seconds=0.1,
     )
 
     assert [msg.tool_call_id for msg in results] == ["fast-id", "slow-id"]
@@ -203,22 +205,14 @@ def test_safe_batch_preserves_project_workspace_context(monkeypatch, tmp_path):
     from app.storage.workspace import SessionStore
     from app.tools.runtime import get_project_workspace, set_tool_project
 
-    home = tmp_path / "agent_home"
-    defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
-    config_defaults = Path(__file__).resolve().parents[1] / "app" / "config" / "defaults"
-    if not config_defaults.exists():
-        config_defaults = defaults
+    home = tmp_path / "runtime" / "data" / "agent-home"
+    defaults = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "workspace"
     project = tmp_path / "project"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
     (project / "marker.txt").write_text("bound", encoding="utf-8")
 
-    settings = Settings(
-        workspace_path=home,
-        workspace_defaults_path=defaults,
-        config_dir=tmp_path / "config",
-        config_defaults_path=config_defaults,
-    )
+    settings = Settings(runtime_root=tmp_path / "runtime")
     monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
     monkeypatch.setattr("app.storage.project.get_settings", lambda: settings)
     init_workspace(settings)

@@ -28,7 +28,7 @@ TOOL_DOCS: dict[str, ToolDoc] = {
 
 参数说明：
 - command（必填）：要执行的 shell 命令字符串
-- timeout（可选，秒）：前台超时时间，默认见 CONFIG.json tools.shell.default_timeout
+- timeout（可选，秒）：前台超时时间，默认见全局配置 tools.shell.default_timeout
 - workdir（可选）：相对 workspace 的工作目录，默认 tools.shell.workdir 或 "."
 - background（可选，默认 false）：true 时立即返回作业 id，用 process 查询/等待/终止
 
@@ -40,7 +40,7 @@ TOOL_DOCS: dict[str, ToolDoc] = {
 
 风险限制：
 - 默认需要用户确认（requires_confirmation）
-- CONFIG.json 中 auto_approve_patterns 可匹配只读安全命令自动放行
+- 全局配置中的 auto_approve_patterns 可匹配只读安全命令自动放行
 - hardline 危险命令（如 rm -rf /）会被钩子直接拦截
 - 子进程环境已过滤 LLM API Key 等凭证
 - 后台作业仅当前会话可见，取消会话会终止仍在运行的作业""",

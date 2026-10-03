@@ -1,4 +1,5 @@
 // 工具显示配置
+
 export interface ToolDisplayConfig {
   name: string         // 友好名称
   icon: string         // emoji 图标
@@ -80,6 +81,27 @@ export const DEFAULT_TOOL_CONFIG: ToolDisplayConfig = {
   objectKeys: ['path', 'command', 'cmd', 'query', 'name', 'title'],
 }
 
+const redactDisplayValue = (value: unknown, depth = 0): unknown => {
+  if (depth > 3) return '[已截断]'
+  if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 497)}...` : value
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactDisplayValue(item, depth + 1))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        /token|secret|password|authorization|cookie|api[_-]?key|private[_-]?key|env(?:ironment)?/i.test(key)
+          ? '[已脱敏]'
+          : redactDisplayValue(item, depth + 1),
+      ]),
+    )
+  }
+  return value
+}
+
+const redactDisplayArgs = (args: Record<string, unknown> | undefined): Record<string, unknown> => (
+  (redactDisplayValue(args || {}) as Record<string, unknown>) || {}
+)
+
 // 解析 MCP 工具名：mcp_{server}_{tool} → 友好展示
 function parseMcpToolName(toolName: string): ToolDisplayConfig {
   if (!toolName.startsWith('mcp_')) {
@@ -133,7 +155,7 @@ export function getToolActionDisplay(
   status: ToolActionStatus,
 ): ToolActionDisplay {
   const config = getToolConfig(toolName)
-  const source = args || {}
+  const source = redactDisplayArgs(args)
   const keys = config.objectKeys || []
   let targetKey = ''
   let target = ''
@@ -189,7 +211,7 @@ export function formatToolArgs(args: Record<string, unknown>): string {
   }
 
   const parts: string[] = []
-  for (const [key, value] of Object.entries(args)) {
+  for (const [key, value] of Object.entries(redactDisplayArgs(args))) {
     let displayValue: string
     if (typeof value === 'string') {
       // 截断长字符串
@@ -210,8 +232,12 @@ export function formatToolArgs(args: Record<string, unknown>): string {
 // 格式化工具结果显示
 export function formatToolResult(result: string | undefined): string {
   if (!result) return ''
+  const redacted = result.replace(
+    /(authorization|token|secret|password|api[-_]?key|private[-_]?key)\s*[:=]\s*([^\s,;]+)/gi,
+    '$1: [已脱敏]',
+  )
   // 截断长结果
-  return result.length > 500 ? result.slice(0, 500) + '...' : result
+  return redacted.length > 500 ? redacted.slice(0, 497) + '...' : redacted
 }
 
 export function toolResultLooksLikeError(result?: string): boolean {
@@ -245,6 +271,6 @@ export function toolErrorPreview(result?: string): string {
 
 export function toolResultPreview(result?: string): string {
   if (!result?.trim()) return ''
-  const firstLine = result.trim().split('\n')[0] || result
+  const firstLine = formatToolResult(result).trim().split('\n')[0] || result
   return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine
 }

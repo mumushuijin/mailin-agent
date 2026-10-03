@@ -13,6 +13,6 @@
 
 `MEMORY.md` / `USER.md` 由 JSON **自动组装**，请勿手改；意外修改后重启服务会自动对齐 JSON 或恢复快照（`bootstraps/.hot_memory_snapshots/`）。
 
-项目规则请写在**项目工作区根目录**的 `AGENTS.md`，不要放在本目录。
+项目规则请写在**项目工作区**的 `.mailin/agent.md`，不要放在本目录。
 
-运行时配置 `CONFIG.json` 位于 Agent 自有空间根目录。
+全局配置位于运行根的 `data/config/config.toml`，从独立的只读配置模板初始化。

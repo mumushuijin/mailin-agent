@@ -1,3 +1,5 @@
+> 历史设计草案：本文的 `CONFIG.json` / `workspace_defaults` 路径已过时。当前全局配置位于 `<runtime-root>/data/config/config.toml`，默认值在 `resources/defaults/config/config.toml`；当前 MCP 配置使用 `[mcp.servers]`。
+
 # MCP 客户端对接方案（v0.1）
 
 > 仿照 [Hermes Agent `mcp_tool.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool.py) 设计，适配麦林现有 `ToolCard` + `ToolRegistry` + `tool_search` 架构。
@@ -56,7 +58,7 @@ backend/app/tools/mcp/
 ├── DESIGN.md              # 本文档
 ├── __init__.py            # 对外 API：discover / shutdown / reload / status
 ├── config.py              # 读取 mcp_servers、环境变量插值、安全过滤
-├── types.py               # McpServerConfig、McpServerStatus 等
+├── types.py               # MCPServerConfig、McpServerStatus 等
 ├── loop.py                # 后台专用 asyncio 事件循环（daemon 线程）
 ├── server_task.py         # 单 Server 长连接 Task（stdio / HTTP）
 ├── discovery.py           # connect → initialize → list_tools

@@ -15,7 +15,7 @@ from app.config import (
     project_module_for_api,
     validate_module_value,
 )
-from app.config.persistence import atomic_write_json, get_revision_tracker
+from app.config.persistence import atomic_write_toml, get_revision_tracker, read_toml
 from app.core.exceptions import ConfigConflictError, ConfigValidationError, NotFoundError
 from app.core.llm import get_chat_model
 from app.core.settings import get_settings
@@ -133,22 +133,22 @@ class ConfigService:
         if not path.exists():
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            data = read_toml(path)
+        except (OSError, ValueError) as exc:
             raise ConfigValidationError(
-                "CONFIG.json 无法解析",
+                "运行配置无法解析",
                 errors=[
                     {
                         "path": "/",
                         "kind": "syntax",
-                        "message": f"JSON 无法解析: {exc.msg}",
-                        "expected": "json",
+                        "message": "TOML 无法解析",
+                        "expected": "toml",
                     }
                 ],
             ) from exc
         if not isinstance(data, dict):
             raise ConfigValidationError(
-                "CONFIG.json 根必须是对象",
+                "运行配置根必须是对象",
                 errors=[{"path": "/", "kind": "type", "message": "必须是对象", "expected": "object"}],
             )
         return data
@@ -295,7 +295,7 @@ class ConfigService:
 
         path = config_file_path()
         try:
-            atomic_write_json(path, merged)
+            atomic_write_toml(path, merged)
         except OSError as exc:
             raise ConfigValidationError(
                 "配置写入失败，已保留旧文件",

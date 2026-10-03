@@ -1,7 +1,7 @@
 """内置钩子与注册入口。
 
 register_hooks() 在应用启动（main.lifespan）时调用一次，把内置钩子注册到
-全局 HookManager。是否启用由 workspace/CONFIG.json 的 hooks.enabled 控制
+全局 HookManager。是否启用由运行根配置的 hooks.enabled 控制
 （缺省启用）。
 
 内置钩子均为观察型（只记日志、不改变行为），用于验证钩子链路是否贯通，
@@ -25,7 +25,7 @@ _registered = False
 
 
 def hooks_enabled() -> bool:
-    """读取 CONFIG.json 的 hooks.enabled（缺省 True）。配置异常时保守启用。"""
+    """读取全局配置的 hooks.enabled（缺省 True）。配置异常时保守启用。"""
     try:
         from app.tools.registry import load_full_config
 
@@ -102,7 +102,7 @@ def register_hooks(*, force: bool = False) -> bool:
         return True
 
     if not hooks_enabled():
-        logger.info("钩子系统已禁用（CONFIG.json hooks.enabled=false），跳过注册")
+        logger.info("钩子系统已禁用（hooks.enabled=false），跳过注册")
         _registered = True
         return False
 

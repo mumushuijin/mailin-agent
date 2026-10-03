@@ -19,6 +19,24 @@ from app.tools.tool_search import (
 )
 
 
+def test_tool_attempt_count_is_saved_on_tool_message(monkeypatch):
+    from app.tools import tool_search
+
+    original_execute = tool_search.execute_single_tool_call
+
+    def execute(*_args, **_kwargs):
+        tool_search._tool_attempt_count.set(3)
+        return "fake_tool", "result"
+
+    monkeypatch.setattr(tool_search, "execute_single_tool_call", execute)
+    message = tool_search._execute_parsed_call(
+        "fake_tool", {}, "call-1", cards=[], config=ToolSearchConfig(),
+        session_id="session-1", process_for_cache=lambda item, _sid: item,
+    )
+    assert message.additional_kwargs["attempt"] == 3
+    monkeypatch.setattr(tool_search, "execute_single_tool_call", original_execute)
+
+
 @pytest.fixture(autouse=True)
 def _clear_registry_cache():
     clear_tools_cache()
@@ -158,7 +176,7 @@ def test_get_tools_respects_tool_search():
     registry_mod.get_registry = lambda: registry  # type: ignore[assignment]
     try:
         names = {t.name for t in get_tools()}
-        assert "glob_search" not in names
+        assert "glob_search" in names
         assert TOOL_SEARCH_NAME in names
         assert "read_file" in names
     finally:

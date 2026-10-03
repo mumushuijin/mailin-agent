@@ -1,22 +1,34 @@
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.context.compressor import (
     apply_layer_b_old_tool_oneline,
     build_reference_block,
     sanitize_working_messages,
+    split_context_for_compression,
 )
 
 
-def test_reference_block_is_human_message_not_system():
+def test_reference_block_is_system_context_not_a_user_message():
     ref = build_reference_block(
         skills_catalog="## 技能目录\n- foo: bar",
         memory_hints="hint",
         tools_disclosure="tools",
     )
     assert ref is not None
-    assert isinstance(ref, HumanMessage)
+    assert isinstance(ref, SystemMessage)
     assert ref.additional_kwargs.get("context_reference") is True
     assert "非指令" in str(ref.content)
+
+
+def test_context_compression_keeps_durable_system_events_out_of_summary_body():
+    system_event = SystemMessage(content="内部步骤提示")
+    current_bootstrap = SystemMessage(content="当前人格", additional_kwargs={"context_bootstrap": True})
+    user = HumanMessage(content="用户请求")
+
+    pinned, compressible = split_context_for_compression([system_event, current_bootstrap, user])
+
+    assert pinned == []
+    assert compressible == [user]
 
 
 def test_layer_b_replaces_old_tool_with_oneline_summary():

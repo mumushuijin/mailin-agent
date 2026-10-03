@@ -12,7 +12,7 @@ class ToolDoc:
 TOOL_DOCS: dict[str, ToolDoc] = {
     "skill_list": ToolDoc(
         summary="列出可用 skill 的轻量目录",
-        description="""列出全局与当前项目 `.agents/skills/` 中可用的 skill 摘要。
+        description="""列出全局与当前项目 `.mailin/skills/` 中可用的 skill 摘要。
 
 适用场景：需要确认有哪些 skill、来源是 global 还是 project、是否被覆盖或禁用。
 注意：只返回摘要，不返回完整 `SKILL.md`；执行匹配任务前应调用 `skill_read` 加载完整说明。""",

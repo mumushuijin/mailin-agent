@@ -7,7 +7,7 @@ from app.context.budget import count_message_tokens, load_context_config
 
 
 def get_ledger_messages(state: dict) -> list[BaseMessage]:
-    """从 AgentState 读取会话账本（checkpoint 中的 messages 字段）。"""
+    """读取当前运行时从 JSONL 账本装入的消息。"""
     return list(state.get("messages") or [])
 
 

@@ -1,7 +1,10 @@
+import asyncio
+import copy
 from pathlib import Path
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.base import CheckpointTuple
 
 from app.core.settings import get_settings
 
@@ -9,19 +12,48 @@ _checkpointer: AsyncSqliteSaver | None = None
 _conn: aiosqlite.Connection | None = None
 
 
+class CanonicalAsyncSqliteSaver(AsyncSqliteSaver):
+    """Persist checkpoint_uid under the public canonical checkpoint_id channel name."""
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        payload = copy.deepcopy(checkpoint)
+        channels = payload.get("channel_values") or {}
+        if "checkpoint_uid" in channels:
+            channels["checkpoint_id"] = channels.pop("checkpoint_uid")
+            payload["channel_values"] = channels
+        return await super().aput(config, payload, metadata, new_versions)
+
+    async def aget_tuple(self, config):
+        value = await super().aget_tuple(config)
+        if value is None:
+            return None
+        payload = copy.deepcopy(value.checkpoint)
+        channels = payload.get("channel_values") or {}
+        if "checkpoint_id" in channels:
+            channels["checkpoint_uid"] = channels.pop("checkpoint_id")
+            payload["channel_values"] = channels
+        return CheckpointTuple(
+            config=value.config,
+            checkpoint=payload,
+            metadata=value.metadata,
+            parent_config=value.parent_config,
+            pending_writes=value.pending_writes,
+        )
+
+
 def _checkpoint_path() -> Path:
     settings = get_settings()
-    path = settings.workspace_path / "sessions" / "checkpoints.sqlite"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    return settings.workspace_path / "sessions" / "checkpoints.sqlite"
 
 
 async def init_checkpointer() -> AsyncSqliteSaver:
     global _checkpointer, _conn
     if _checkpointer is not None:
         return _checkpointer
-    _conn = await aiosqlite.connect(str(_checkpoint_path()))
-    _checkpointer = AsyncSqliteSaver(_conn)
+    path = _checkpoint_path()
+    await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+    _conn = await aiosqlite.connect(str(path))
+    _checkpointer = CanonicalAsyncSqliteSaver(_conn)
     return _checkpointer
 
 

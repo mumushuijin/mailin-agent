@@ -28,7 +28,7 @@ TOOL_DOCS: dict[str, ToolDoc] = {
 - 文件超过 512KB → 工具会拒绝，应分段处理
 
 参数说明：
-- file_path（必填）：相对工作区根目录的文件路径，如 notes/todo.md、CONFIG.json；不要用绝对路径
+- file_path（必填）：相对工作区根目录的文件路径，如 notes/todo.md；不要用绝对路径
 - offset（可选，默认 1）：起始行号（1 起始），用于读取下一段
 - limit（可选）：读取行数；缺省时读到文件末尾或单次 token 上限为止
 

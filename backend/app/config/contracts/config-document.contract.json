@@ -1490,7 +1490,7 @@
       }
     },
     "additionalProperties": true,
-    "description": "规范 CONFIG.json 根结构。",
+    "description": "规范全局配置根结构。",
     "properties": {
       "schema_version": {
         "default": 1,

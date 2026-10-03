@@ -76,7 +76,7 @@ def test_discovers_global_and_project_skills(tmp_path: Path):
     project.mkdir()
     global_root = skills_dir(home)
     _write_skill(global_root, "research", "# Research\n\nFind sources.")
-    _write_skill(project / ".agents" / "skills", "backend", "# Backend\n\n项目后端规范")
+    _write_skill(project / ".mailin" / "skills", "backend", "# Backend\n\n项目后端规范")
 
     result = SkillService(home, project).list()
     by_id = {(item.id, item.source): item for item in result.skills}
@@ -155,7 +155,7 @@ def test_project_skill_overrides_global_duplicate(tmp_path: Path):
     home.mkdir()
     project.mkdir()
     _write_skill(skills_dir(home), "backend", "# Backend\n\nGlobal")
-    _write_skill(project / ".agents" / "skills", "backend", "# Backend\n\nProject")
+    _write_skill(project / ".mailin" / "skills", "backend", "# Backend\n\nProject")
 
     result = SkillService(home, project).list()
     global_entry = next(item for item in result.skills if item.source == "global")
@@ -226,7 +226,7 @@ def test_match_prefers_project_and_command_alias(tmp_path: Path):
     home.mkdir()
     project.mkdir()
     _write_skill(skills_dir(home), "openspec-propose", "# openspec-propose\n\nGlobal")
-    _write_skill(project / ".agents" / "skills", "openspec-propose", "# openspec-propose\n\nProject")
+    _write_skill(project / ".mailin" / "skills", "openspec-propose", "# openspec-propose\n\nProject")
 
     matches = SkillService(home, project).match("/opsx-propose 我想提案").matches
 
@@ -244,7 +244,7 @@ def test_catalog_is_lightweight_and_project_scoped(tmp_path: Path):
     project_a.mkdir()
     project_b.mkdir()
     _write_skill(skills_dir(home), "global", "# Global\n\nGLOBAL FULL BODY")
-    _write_skill(project_a / ".agents" / "skills", "project-only", "# Project Only\n\nPROJECT A FULL BODY")
+    _write_skill(project_a / ".mailin" / "skills", "project-only", "# Project Only\n\nPROJECT A FULL BODY")
 
     catalog_a, _ = load_skills_catalog(home, project_a)
     catalog_b, _ = load_skills_catalog(home, project_b)
@@ -260,7 +260,7 @@ def test_refresh_picks_up_filesystem_changes(tmp_path: Path):
     project = tmp_path / "project"
     home.mkdir()
     project.mkdir()
-    root = project / ".agents" / "skills"
+    root = project / ".mailin" / "skills"
     service = SkillService(home, project)
     assert service.list().total == 0
 
@@ -274,15 +274,15 @@ def test_refresh_picks_up_filesystem_changes(tmp_path: Path):
 
 
 def test_skill_api_and_router(tmp_path: Path, monkeypatch):
-    home = tmp_path / "home"
-    defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
+    home = tmp_path / "runtime" / "data" / "agent-home"
+    defaults = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "workspace"
     project = tmp_path / "project"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
-    settings = Settings(workspace_path=home, workspace_defaults_path=defaults)
+    settings = Settings(runtime_root=tmp_path / "runtime")
     init_workspace(settings)
     _write_skill(skills_dir(home), "research", "# Research\n\nGlobal")
-    _write_skill(project / ".agents" / "skills", "backend", "# Backend\n\nProject")
+    _write_skill(project / ".mailin" / "skills", "backend", "# Backend\n\nProject")
 
     from app.api import skills as skills_api
 

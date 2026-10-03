@@ -17,4 +17,4 @@ mailin mcp install <name>
 mailin mcp configure <name>
 ```
 
-v0.1 用户请直接在 `workspace/CONFIG.json` 的 `mcp_servers` 段手写配置。
+v0.1 用户请直接在 `<runtime-root>/data/config/config.toml` 的 `[mcp.servers]` 段手写配置。

@@ -11,12 +11,18 @@
     "dev:web": "vite",
     "build": "run-p type-check \"build-only {@}\" --",
     "build:electron": "cross-env ELECTRON=true VITE_ELECTRON=true run-p type-check \"build-only:electron {@}\" --",
+    "build:backend": "node scripts/build-backend.cjs",
     "preview": "vite preview",
     "build-only": "vite build",
     "build-only:electron": "vite build",
     "type-check": "vue-tsc --build",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "electron:dev": "npm run dev",
-    "electron:build": "npm run build:electron && electron-builder",
+    "electron:build": "node scripts/clean-electron-output.cjs && npm run build:backend && npm run build:electron && node scripts/run-electron-builder.cjs --dir && npm run verify:release",
+    "electron:build:mirror": "cross-env MAILIN_BUILD_MIRROR=1 npm run electron:build",
+    "test:runtime": "node --test scripts/runtime-smoke.test.cjs",
+    "verify:release": "node scripts/verify-release-layout.cjs",
     "electron:preview": "cross-env NODE_ENV=production electron .",
     "perf:fixtures": "node scripts/perf-fixtures.cjs",
     "postinstall": "node scripts/ensure-electron.cjs",
@@ -36,6 +42,7 @@
     "@types/dompurify": "^3.0.5",
     "@types/node": "^24.10.13",
     "@vitejs/plugin-vue": "^6.0.4",
+    "@vue/test-utils": "^2.5.1",
     "@vue/tsconfig": "^0.8.1",
     "concurrently": "^9.2.1",
     "cross-env": "^7.0.3",
@@ -45,6 +52,7 @@
     "typescript": "~5.9.3",
     "vite": "^7.3.1",
     "vite-plugin-vue-devtools": "^8.0.6",
+    "vitest": "^5.0.1",
     "vue-tsc": "^3.2.4",
     "wait-on": "^8.0.3"
   },
@@ -57,6 +65,29 @@
     "files": [
       "dist/**/*",
       "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/dist/mailin-backend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../backend/resources/defaults/workspace",
+        "to": "defaults/workspace",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../backend/resources/defaults/config",
+        "to": "defaults/config",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "win": {
       "target": [

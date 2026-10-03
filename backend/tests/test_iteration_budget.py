@@ -74,10 +74,10 @@ def test_router_routes_to_tools_when_pending_tool_calls():
     state = {
         "step": DEFAULT_MAX_STEPS,
         "max_steps": DEFAULT_MAX_STEPS,
-        "messages": [
+        "context": {"working_message": [
             HumanMessage(content="hi"),
             AIMessage(content="", tool_calls=[{"id": "c1", "name": "list_directory", "args": {}}]),
-        ],
+        ]},
     }
     assert should_continue(state) == "tools"
 
@@ -86,7 +86,7 @@ def test_router_ends_without_pending_tool_calls():
     state = {
         "step": DEFAULT_MAX_STEPS,
         "max_steps": DEFAULT_MAX_STEPS,
-        "messages": [HumanMessage(content="hi"), AIMessage(content="done")],
+        "context": {"working_message": [HumanMessage(content="hi"), AIMessage(content="done")]},
     }
     assert should_continue(state) == END
 

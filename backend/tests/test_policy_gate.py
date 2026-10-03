@@ -277,21 +277,13 @@ def test_build_execution_context_falls_back_to_session_workspace(tmp_path, monke
     from app.storage.workspace import SessionStore
     from app.tools.runtime import set_tool_project
 
-    home = tmp_path / "agent_home"
-    defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
-    config_defaults = Path(__file__).resolve().parents[1] / "app" / "config" / "defaults"
-    if not config_defaults.exists():
-        config_defaults = defaults
+    home = tmp_path / "runtime" / "data" / "agent-home"
+    defaults = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "workspace"
     project = tmp_path / "project"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
     (project / "notes.txt").write_text("hi", encoding="utf-8")
-    settings = Settings(
-        workspace_path=home,
-        workspace_defaults_path=defaults,
-        config_dir=tmp_path / "config",
-        config_defaults_path=config_defaults,
-    )
+    settings = Settings(runtime_root=tmp_path / "runtime")
     monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
     monkeypatch.setattr("app.tools.policy.gate.get_settings", lambda: settings)
     monkeypatch.setattr("app.storage.project.get_settings", lambda: settings)

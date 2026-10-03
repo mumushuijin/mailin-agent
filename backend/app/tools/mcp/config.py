@@ -69,22 +69,23 @@ _KNOWN_CONNECTION_KEYS = frozenset(
 
 
 def _load_workspace_config(workspace: Path | None = None) -> dict:
+    from app.config.persistence import read_toml
     from app.storage.workspace import config_file_path
 
     _ = workspace
     path = config_file_path()
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_toml(path)
 
 
 def _write_workspace_config(data: dict, workspace: Path | None = None) -> None:
-    from app.config.persistence import atomic_write_json, get_revision_tracker
+    from app.config.persistence import atomic_write_toml, get_revision_tracker
     from app.storage.workspace import config_file_path
 
     _ = workspace
     path = config_file_path()
-    atomic_write_json(path, data)
+    atomic_write_toml(path, data)
     get_revision_tracker().bump_for_path(path)
 
 

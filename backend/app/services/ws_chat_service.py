@@ -6,8 +6,10 @@ import uuid
 from typing import Any
 
 from app.agent.approval_context import approval_enabled
+from app.agent.state import public_state_projection
 from app.agent.graph import get_graph, make_thread_config
 from app.agent.streaming.events import AgentEvent
+from app.agent.streaming.dispatcher import DispatchEvent, RunEventDispatcher
 from app.agent.streaming.interrupts import get_pending_interrupts, has_pending_interrupt
 from app.core.logging import get_logger, log_scope, new_trace_id
 from app.services.chat_service import ChatService
@@ -24,6 +26,32 @@ class WsChatService:
         self._approval_futures: dict[str, asyncio.Future] = {}
         self._run_sessions: dict[str, str] = {}
         self._pending_interrupt_meta: dict[str, dict[str, Any]] = {}
+        self._dispatchers: dict[str, RunEventDispatcher] = {}
+        self._dispatch_conn: dict[str, int] = {}
+
+    async def _send_run_event(self, run_id: str, event: AgentEvent) -> bool:
+        dispatcher = self._dispatchers.get(run_id)
+        if dispatcher is None:
+            conn_id = self._dispatch_conn.get(run_id)
+            if conn_id is not None:
+                await self.manager.send_event(conn_id, event)
+            return False
+        return await dispatcher.publish(
+            event.type,
+            {"agent_event": event},
+            state=event if event.state is not None else None,
+        )
+
+    async def _run_dispatcher(self, run_id: str, conn_id: int, dispatcher: RunEventDispatcher) -> None:
+        async def send(item: DispatchEvent) -> None:
+            value = item.payload.get("agent_event")
+            if not isinstance(value, AgentEvent):
+                return
+            if item.kind == "state_sync":
+                value = AgentEvent("state_sync", value.data, run_id, state=value.state)
+            await self.manager.send_event(conn_id, value)
+
+        await dispatcher.run(send)
 
     async def handle_message(self, conn_id: int, payload: dict[str, Any]) -> None:
         op = payload.get("op")
@@ -49,9 +77,40 @@ class WsChatService:
                 await self.cancel_run(run_id)
             return
 
+        if op == "state.sync":
+            run_id = payload.get("run_id")
+            session_id = payload.get("session_id")
+            if not run_id or not session_id or self._run_sessions.get(run_id) != session_id:
+                return
+            graph = await asyncio.to_thread(get_graph)
+            snapshot = await graph.aget_state(make_thread_config(session_id))
+            canonical = dict(snapshot.values or {}) if snapshot else {}
+            if canonical and (canonical.get("scope") or {}).get("run_id") == run_id:
+                await self._send_run_event(
+                    run_id,
+                    AgentEvent(
+                        "state_sync", {"session_id": session_id}, run_id,
+                        state=public_state_projection(canonical),
+                    ),
+                )
+            return
+
         if op == "approve":
             run_id = payload.get("run_id")
             if not run_id or run_id not in self._approval_futures:
+                if run_id:
+                    await self.manager.send_event(
+                        conn_id,
+                        AgentEvent(
+                            "error",
+                            {
+                                "error": "审批或问答响应已过期",
+                                "fail_closed": True,
+                                "reason_code": "stale_interrupt",
+                            },
+                            run_id,
+                        ),
+                    )
                 return
             expected_session = self._run_sessions.get(run_id)
             payload_session = payload.get("session_id")
@@ -60,23 +119,73 @@ class WsChatService:
                     "stale approval ignored: session mismatch run=%s",
                     run_id,
                 )
+                await self.manager.send_event(
+                    conn_id,
+                    AgentEvent(
+                        "error",
+                        {
+                            "error": "响应与当前 session 不匹配",
+                            "fail_closed": True,
+                            "reason_code": "stale_session",
+                        },
+                        run_id,
+                    ),
+                )
                 return
 
             pending = self._pending_interrupt_meta.get(run_id) or {}
-            future = self._approval_futures.pop(run_id)
+            expected_step = pending.get("step_id")
+            provided_step = payload.get("step_id")
+            if expected_step and provided_step != expected_step:
+                await self.manager.send_event(
+                    conn_id,
+                    AgentEvent(
+                        "error",
+                        {"error": "响应与当前 step 不匹配", "fail_closed": True, "reason_code": "stale_step"},
+                        run_id,
+                    ),
+                )
+                return
+            future = self._approval_futures.get(run_id)
+            if future is None:
+                return
             if future.done():
                 return
 
             if payload.get("kind") == "ask_user":
                 interrupt_id = payload.get("interrupt_id")
                 expected_iid = pending.get("interrupt_id")
-                if expected_iid and interrupt_id and interrupt_id != expected_iid:
+                if expected_iid and interrupt_id != expected_iid:
                     log.warning("stale ask_user ignored: interrupt_id mismatch run=%s", run_id)
+                    await self.manager.send_event(
+                        conn_id,
+                        AgentEvent(
+                            "error",
+                            {
+                                "error": "问答响应与当前中断不匹配",
+                                "fail_closed": True,
+                                "reason_code": "stale_interrupt",
+                            },
+                            run_id,
+                        ),
+                    )
                     return
                 tool_call_id = payload.get("tool_call_id")
                 expected_tc = pending.get("tool_call_id")
-                if expected_tc and tool_call_id and tool_call_id != expected_tc:
+                if expected_tc and tool_call_id != expected_tc:
                     log.warning("stale ask_user ignored: tool_call_id mismatch run=%s", run_id)
+                    await self.manager.send_event(
+                        conn_id,
+                        AgentEvent(
+                            "error",
+                            {
+                                "error": "问答响应与当前工具调用不匹配",
+                                "fail_closed": True,
+                                "reason_code": "stale_tool_call",
+                            },
+                            run_id,
+                        ),
+                    )
                     return
                 mode = payload.get("mode") or pending.get("mode") or "answer_and_continue"
                 result: dict[str, Any] = {
@@ -94,11 +203,24 @@ class WsChatService:
                 # 工具审批：校验 tool_call_id
                 tool_call_id = payload.get("tool_call_id")
                 expected_tc = pending.get("tool_call_id")
-                if expected_tc and tool_call_id and tool_call_id != expected_tc:
+                if expected_tc and tool_call_id != expected_tc:
                     log.warning("stale approval ignored: tool_call_id mismatch run=%s", run_id)
+                    await self.manager.send_event(
+                        conn_id,
+                        AgentEvent(
+                            "error",
+                            {
+                                "error": "审批响应与当前工具调用不匹配",
+                                "fail_closed": True,
+                                "reason_code": "stale_tool_call",
+                            },
+                            run_id,
+                        ),
+                    )
                     return
                 decision = payload.get("decision", "deny")
                 future.set_result("allow" if decision == "allow" else "deny")
+            self._approval_futures.pop(run_id, None)
             return
 
         await self.manager.send_event(
@@ -136,6 +258,11 @@ class WsChatService:
         sid: str | None = session_id
         token = approval_enabled.set(True)
         cancel_notified = False
+        interrupt_delivered = False
+        dispatcher = RunEventDispatcher(run_id, maxsize=128)
+        self._dispatchers[run_id] = dispatcher
+        self._dispatch_conn[run_id] = conn_id
+        dispatcher_task = asyncio.create_task(self._run_dispatcher(run_id, conn_id, dispatcher))
 
         with log_scope(
             trace_id=new_trace_id(),
@@ -152,26 +279,28 @@ class WsChatService:
                         sid = event.data["session_id"]
                         self._run_sessions[run_id] = sid
                         self.manager.subscribe_session(conn_id, sid)
+                    if event.type == "interrupt":
+                        interrupt_delivered = True
                     if event.data.get("cancelled") and event.type in ("error", "done"):
                         cancel_notified = True
-                    await self.manager.send_event(conn_id, event)
+                    await self._send_run_event(run_id, event)
 
                 if sid:
-                    await self._handle_interrupts(conn_id, run_id, sid)
+                    await self._handle_interrupts(conn_id, run_id, sid, already_notified=interrupt_delivered)
 
             except asyncio.CancelledError:
                 status = "cancelled"
                 if sid:
                     await self.chat_service.repair_cancelled_checkpoint(sid)
+                    await self.chat_service.mark_terminal_checkpoint(sid, run_id, "cancelled", "cancelled")
                 if not cancel_notified:
                     await self._emit_cancelled(conn_id, run_id, sid)
             except Exception as e:
                 status = "failed"
                 log.error("run.failed", error=str(e), exc_info=True)
-                await self.manager.send_event(
-                    conn_id,
-                    AgentEvent("error", {"error": str(e)}, run_id),
-                )
+                if sid:
+                    await self.chat_service.mark_terminal_checkpoint(sid, run_id, "failed", "error")
+                await self._send_run_event(run_id, AgentEvent("error", {"error": str(e)}, run_id))
             finally:
                 duration_ms = (time.monotonic() - start) * 1000
                 log.info(
@@ -186,8 +315,17 @@ class WsChatService:
                 self._approval_futures.pop(run_id, None)
                 self._run_sessions.pop(run_id, None)
                 self._pending_interrupt_meta.pop(run_id, None)
+                dispatcher.close()
+                try:
+                    await asyncio.shield(dispatcher_task)
+                except asyncio.CancelledError:
+                    pass
+                self._dispatchers.pop(run_id, None)
+                self._dispatch_conn.pop(run_id, None)
 
-    async def _handle_interrupts(self, conn_id: int, run_id: str, session_id: str) -> None:
+    async def _handle_interrupts(
+        self, conn_id: int, run_id: str, session_id: str, *, already_notified: bool = False
+    ) -> None:
         graph = await asyncio.to_thread(get_graph)
         config = make_thread_config(session_id)
 
@@ -204,6 +342,10 @@ class WsChatService:
 
             # 规范化给客户端的字段
             value = interrupt_data.get("value") if "value" in interrupt_data else interrupt_data
+            snapshot = await graph.aget_state(config)
+            canonical = dict(snapshot.values or {}) if snapshot else {}
+            scope = canonical.get("scope") or {}
+            step_id = scope.get("step_id")
             if isinstance(value, dict):
                 self._pending_interrupt_meta[run_id] = {
                     "kind": value.get("kind"),
@@ -212,20 +354,27 @@ class WsChatService:
                     "mode": value.get("mode"),
                     "session_id": session_id,
                     "run_id": run_id,
+                    "step_id": step_id,
                 }
                 # 展平 value 便于前端直接读 kind/prompt
-                event_data = {**value, "run_id": run_id, "session_id": session_id}
+                event_data = {**value, "run_id": run_id, "session_id": session_id, "step_id": step_id}
             else:
                 self._pending_interrupt_meta[run_id] = {
                     "session_id": session_id,
                     "run_id": run_id,
+                    "step_id": step_id,
                 }
                 event_data = {**interrupt_data, "run_id": run_id, "session_id": session_id}
 
-            await self.manager.send_event(
-                conn_id,
-                AgentEvent("interrupt", event_data, run_id),
-            )
+            if not already_notified:
+                await self._send_run_event(
+                    run_id,
+                    AgentEvent(
+                        "interrupt", event_data, run_id,
+                        state=public_state_projection(canonical) if "context" in canonical else None,
+                    ),
+                )
+            already_notified = False
 
             loop = asyncio.get_running_loop()
             future: asyncio.Future = loop.create_future()
@@ -247,10 +396,7 @@ class WsChatService:
                     }
                 else:
                     decision = "deny"
-                await self.manager.send_event(
-                    conn_id,
-                    AgentEvent("error", {"error": "等待用户响应超时，已安全拒绝"}, run_id),
-                )
+                await self._send_run_event(run_id, AgentEvent("error", {"error": "等待用户响应超时，已安全拒绝"}, run_id))
             except asyncio.CancelledError:
                 # cancel：fail-closed，不猜测答案
                 kind = (self._pending_interrupt_meta.get(run_id) or {}).get("kind")
@@ -273,7 +419,7 @@ class WsChatService:
             async for event in self.chat_service.resume_chat_events(
                 session_id, decision, run_id=run_id
             ):
-                await self.manager.send_event(conn_id, event)
+                await self._send_run_event(run_id, event)
 
             graph = await asyncio.to_thread(get_graph)
 
@@ -304,12 +450,9 @@ class WsChatService:
         session_id: str | None,
     ) -> None:
         """取消时推送成对终态事件，便于前端清理工具/loading 状态。"""
-        await self.manager.send_event(
-            conn_id,
-            AgentEvent("error", {"error": "已取消", "cancelled": True}, run_id),
-        )
-        await self.manager.send_event(
-            conn_id,
+        await self._send_run_event(run_id, AgentEvent("error", {"error": "已取消", "cancelled": True}, run_id))
+        await self._send_run_event(
+            run_id,
             AgentEvent(
                 "done",
                 {

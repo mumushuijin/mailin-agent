@@ -1,4 +1,4 @@
-"""测试用 settings 构造：CONFIG 落在独立 config_dir。"""
+"""测试用 settings 构造：全局 TOML 落在独立 config_dir。"""
 
 from __future__ import annotations
 
@@ -25,21 +25,21 @@ def fake_settings(
             "workspace_defaults_path": defs,
             "config_dir": cfg_dir,
             "config_defaults_path": cfg_defs,
-            "config_path": cfg_dir / "CONFIG.json",
+            "config_path": cfg_dir / "config.toml",
         },
     )()
 
 
 def write_config(settings: Any, data: dict) -> Path:
-    import json
+    from app.config.persistence import dumps_toml
 
     path = Path(settings.config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(dumps_toml(data), encoding="utf-8")
     return path
 
 
 def read_config(settings: Any) -> dict:
-    import json
+    from app.config.persistence import read_toml
 
-    return json.loads(Path(settings.config_path).read_text(encoding="utf-8"))
+    return read_toml(Path(settings.config_path))

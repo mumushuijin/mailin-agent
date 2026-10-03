@@ -25,6 +25,11 @@ from app.tools.exposure import to_langchain_tool, to_langchain_tools
 from app.resilience import execute_sync, tool_error_json, tool_policy
 
 logger = logging.getLogger(__name__)
+_tool_attempt_count: contextvars.ContextVar[int] = contextvars.ContextVar("tool_attempt_count", default=1)
+
+
+def get_last_tool_attempt_count() -> int:
+    return _tool_attempt_count.get()
 
 _T = TypeVar("_T")
 
@@ -764,6 +769,7 @@ def invoke_card(
         _run,
         policy=tool_policy(card.name),
     )
+    _tool_attempt_count.set(max(1, int(outcome.attempts or 1)))
     if outcome.ok and outcome.value is not None:
         return outcome.value
     return tool_error_json(outcome.error or f"工具 '{card.name}' 调用失败")
@@ -820,6 +826,7 @@ def execute_single_tool_call(
         cards, config = _cards_for_dispatch()
     elif config is None:
         config = load_tool_search_config()
+    _tool_attempt_count.set(1)
 
     invoke_kwargs = {
         "tool_call_id": tool_call_id,
@@ -897,7 +904,7 @@ def _execute_parsed_call(
     session_id: str,
     process_for_cache,
     run_id: str | None = None,
-    approval_granted: bool = True,
+    approval_granted: bool = False,
     allowlist_matched: bool = False,
 ) -> ToolMessage:
     # 并行 ThreadPool 可能丢失 ContextVar；按 session 重新绑定项目工作区
@@ -942,6 +949,7 @@ def _execute_parsed_call(
         extra_kwargs: dict[str, Any] = {
             "tool_status": status,
             "reason_code": reason_code,
+            "attempt": get_last_tool_attempt_count(),
         }
         if display_name == "read_file":
             file_path = args.get("file_path")
@@ -976,6 +984,7 @@ def run_tool_calls(
     *,
     process_for_cache,
     run_id: str | None = None,
+    execution_grants: dict[str, dict[str, bool]] | None = None,
     timeout_seconds: float | None = None,
     cancel_event=None,
 ) -> list[ToolMessage]:
@@ -984,6 +993,14 @@ def run_tool_calls(
 
     cards, config = _cards_for_dispatch()
     parsed: list[tuple[str, dict[str, Any], str]] = [_parse_tool_call_args(tc) for tc in tool_calls]
+    execution_grants = execution_grants or {}
+
+    def _grant_for(tool_call_id: str) -> dict[str, bool]:
+        grant = execution_grants.get(tool_call_id) or {}
+        return {
+            "approval_granted": bool(grant.get("approval_granted")),
+            "allowlist_matched": bool(grant.get("allowlist_matched")),
+        }
     messages: list[ToolMessage] = []
     deadline = time.monotonic() + timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
 
@@ -1073,6 +1090,7 @@ def run_tool_calls(
                             session_id=session_id,
                             process_for_cache=process_for_cache,
                             run_id=run_id,
+                            **_grant_for(tid),
                         )
                     )
                 else:
@@ -1088,6 +1106,7 @@ def run_tool_calls(
                         session_id=session_id,
                         process_for_cache=process_for_cache,
                         run_id=run_id,
+                        **_grant_for(tid),
                     )
                     pending_single = {future}
                     try:
@@ -1202,6 +1221,7 @@ def run_tool_calls(
                 session_id=session_id,
                 process_for_cache=process_for_cache,
                 run_id=run_id,
+                **_grant_for(tid),
             )
         )
         i += 1

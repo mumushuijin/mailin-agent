@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import time
 
 from fastapi import FastAPI, Request
@@ -10,7 +11,7 @@ from app.api.router import router as api_router
 from app.core.exceptions import AppError
 from app.agent.graph import get_graph
 from app.agent.hooks import register_hooks
-from app.core.logging import get_logger, log_scope, new_trace_id, setup_logging
+from app.core.logging import attach_runtime_log_file, get_logger, log_scope, new_trace_id, setup_logging
 from app.core.settings import get_settings, init_workspace
 from app.core.telemetry import setup_telemetry
 from app.resilience import register_default_policies
@@ -25,7 +26,10 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging(level=settings.log_level, log_format=settings.log_format)
-    init_workspace(settings)
+    # Workspace initialization performs synchronous filesystem I/O. Keep it
+    # off the event loop so LangGraph/FastAPI health checks remain responsive.
+    await asyncio.to_thread(init_workspace, settings)
+    attach_runtime_log_file(settings.log_dir)
     setup_telemetry()
     register_default_policies()
     register_hooks()
@@ -33,6 +37,19 @@ async def lifespan(app: FastAPI):
     # 不在启动时连接 MCP，避免后台 discover 与事件循环争抢导致 API 无响应
     clear_tools_cache()
     await asyncio.to_thread(get_graph)
+
+    print(
+        json.dumps(
+            {
+                "event": "ready",
+                "host": settings.host,
+                "port": settings.port,
+                "mode": settings.mode,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
     from app.maintenance import get_maintenance_scheduler
 

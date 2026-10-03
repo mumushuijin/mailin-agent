@@ -1,7 +1,6 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test } from 'vitest'
 
-import { getToolActionDisplay, getToolConfig, toolResultPreview } from './toolDisplay.ts'
+import { formatToolArgs, formatToolResult, getToolActionDisplay, getToolConfig, toolResultPreview } from './toolDisplay.ts'
 
 test('known file tools produce compact path-aware action labels', () => {
   const action = getToolActionDisplay(
@@ -10,10 +9,10 @@ test('known file tools produce compact path-aware action labels', () => {
     'done',
   )
 
-  assert.equal(action.verb, '已读取')
-  assert.equal(action.name, '文件')
-  assert.equal(action.target, 'frontend/src/views/ChatView.vue')
-  assert.equal(action.targetKind, 'path')
+  expect(action.verb).toBe('已读取')
+  expect(action.name).toBe('文件')
+  expect(action.target).toBe('frontend/src/views/ChatView.vue')
+  expect(action.targetKind).toBe('path')
 })
 
 test('command tools preserve the command as a scannable target', () => {
@@ -23,22 +22,27 @@ test('command tools preserve the command as a scannable target', () => {
     'running',
   )
 
-  assert.equal(action.verb, '正在运行')
-  assert.equal(action.target, 'npm run type-check')
-  assert.equal(action.targetKind, 'command')
+  expect(action.verb).toBe('正在运行')
+  expect(action.target).toBe('npm run type-check')
+  expect(action.targetKind).toBe('command')
 })
 
 test('unknown tools fall back without throwing when args are missing', () => {
   const config = getToolConfig('mcp_unknown_tool')
   const action = getToolActionDisplay('mcp_unknown_tool', undefined, 'error')
 
-  assert.equal(config.icon, '🔌')
-  assert.equal(action.verb, '已执行')
-  assert.equal(action.name, 'tool')
-  assert.equal(action.target, undefined)
+  expect(config.icon).toBe('🔌')
+  expect(action.verb).toBe('已执行')
+  expect(action.name).toBe('tool')
+  expect(action.target).toBeUndefined()
 })
 
 test('result preview collapses multiline and oversized output', () => {
-  assert.equal(toolResultPreview('ok\nsecond line'), 'ok')
-  assert.equal(toolResultPreview('x'.repeat(130)).length, 118)
+  expect(toolResultPreview('ok\nsecond line')).toBe('ok')
+  expect(toolResultPreview('x'.repeat(130)).length).toBe(118)
+})
+
+test('tool detail formatting redacts sensitive values', () => {
+  expect(formatToolArgs({ token: 'secret', path: 'src/App.vue' })).toMatch(/token: \[已脱敏\]/)
+  expect(formatToolResult('authorization: Bearer-secret')).not.toMatch(/Bearer-secret/)
 })

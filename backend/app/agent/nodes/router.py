@@ -11,13 +11,17 @@ def effective_step(state: AgentState) -> int:
     return IterationBudget.from_state(state).used
 
 
-def should_continue(state: AgentState) -> str:
-    messages = state["messages"]
+def pending_tool_message(state: AgentState) -> AIMessage | None:
+    messages = (state.get("context") or {}).get("working_message") or []
     if not messages:
-        return END
+        return None
 
     last = messages[-1]
     if isinstance(last, AIMessage) and last.tool_calls:
-        return "tools"
+        return last
 
-    return END
+    return None
+
+
+def should_continue(state: AgentState) -> str:
+    return "tools" if pending_tool_message(state) else END

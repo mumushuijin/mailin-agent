@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 SYSTEM_MAINTENANCE_KEY = "system_maintenance"
 MAINTENANCE_KIND_KEY = "kind"
@@ -19,8 +19,26 @@ def is_real_user_message(msg: BaseMessage) -> bool:
     return isinstance(msg, HumanMessage) and not is_system_maintenance(msg)
 
 
-def make_system_message(content: str, kind: str) -> HumanMessage:
-    return HumanMessage(
+def is_internal_prompt_message(msg: BaseMessage) -> bool:
+    """Return whether a message must be hidden from the user-facing history."""
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    return isinstance(msg, SystemMessage) or any(
+        kwargs.get(key)
+        for key in (SYSTEM_MAINTENANCE_KEY, "context_reference", "context_summary")
+    )
+
+
+def is_ephemeral_prompt_frame(msg: BaseMessage) -> bool:
+    """Return whether a message is rebuilt for each model window, not a transcript event."""
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    if kwargs.get("context_reference") or kwargs.get("context_summary") or kwargs.get("context_bootstrap") or kwargs.get("kind") in {"budget_summary", "hook_context"}:
+        return True
+    # An explicitly emitted maintenance event is durable; rebuilt prompt frames are not.
+    return isinstance(msg, SystemMessage) and not is_system_maintenance(msg)
+
+
+def make_system_message(content: str, kind: str) -> SystemMessage:
+    return SystemMessage(
         content=content,
         additional_kwargs={
             SYSTEM_MAINTENANCE_KEY: True,

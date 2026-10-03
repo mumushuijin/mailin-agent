@@ -39,12 +39,15 @@ class IterationBudget:
 
     @classmethod
     def from_state(cls, state: AgentState) -> IterationBudget:
-        messages = state.get("messages") or []
+        session = state.get("session") or {}
+        ledger = session.get("ledger") or {}
+        run = ((state.get("task") or {}).get("run") or {})
+        messages = state.get("messages") or ledger.get("messages") or []
         if messages and is_real_user_message(messages[-1]):
             used = 0
         else:
-            used = int(state.get("step") or 0)
-        max_total = clamp_max_steps(state.get("max_steps"), default=DEFAULT_MAX_STEPS)
+            used = int(state.get("step") or run.get("current_step") or 0)
+        max_total = clamp_max_steps(state.get("max_steps") or run.get("max_steps"), default=DEFAULT_MAX_STEPS)
         return cls(used=used, max_total=max_total)
 
     @property

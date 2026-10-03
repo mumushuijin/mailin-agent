@@ -20,13 +20,12 @@ from app.storage.workspace import SessionStore
 
 @pytest.fixture
 def latency_spaces(tmp_path: Path, monkeypatch):
-    home = tmp_path / "agent_home"
+    home = tmp_path / "runtime" / "data" / "agent-home"
     project = tmp_path / "project"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
     settings = Settings(
-        workspace_path=home,
-        workspace_defaults_path=Path(__file__).resolve().parents[1] / "workspace_defaults",
+        runtime_root=tmp_path / "runtime",
         openai_api_key="test-key",
     )
     init_workspace(settings)

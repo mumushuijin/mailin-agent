@@ -22,6 +22,7 @@ from app.context.compressor import (
     build_reference_block,
     compress_working_messages,
     emergency_compress,
+    build_summary_message,
     sanitize_working_messages,
 )
 from app.context.ledger import (
@@ -34,6 +35,7 @@ from app.context.ledger import (
 from app.context.schemas import AssembleResult, ContextBreakdown
 from app.context.sediment import build_memory_hints, should_increment_memory_turn
 from app.context.skills import load_skills_catalog
+from app.agent.messages import is_ephemeral_prompt_frame
 from app.core.settings import get_settings
 from app.resilience import context_step_policy, guarded_step
 from app.tools.context import build_tools_disclosure_context
@@ -126,17 +128,22 @@ def _build_head_messages(
     tools_disclosure: str,
     context_summary: str,
 ) -> tuple[list[BaseMessage], int]:
-    """窗口头部：仅 bootstrap 为 SystemMessage，其余为参考信息块。"""
-    system_message = SystemMessage(content=bootstrap_text)
+    """窗口头部：bootstrap 与参考块都是系统上下文，不伪装成用户发言。"""
+    system_message = SystemMessage(
+        content=bootstrap_text,
+        additional_kwargs={"context_bootstrap": True},
+    )
     reference = build_reference_block(
         skills_catalog=skills_catalog,
         memory_hints=memory_hints,
         tools_disclosure=tools_disclosure,
-        context_summary=context_summary,
+        context_summary="",
     )
     head: list[BaseMessage] = [system_message]
     if reference is not None:
         head.append(reference)
+    if context_summary.strip():
+        head.append(build_summary_message(context_summary))
     head_tokens = count_messages_tokens(head)
     return head, head_tokens
 
@@ -169,7 +176,13 @@ def assemble_context(
     tail_budget = int(config.get("recent_tail_max_tokens", 20_000))
     threshold = threshold_tokens(max_tokens, threshold_ratio)
 
-    ledger = repair_orphan_tool_calls(get_ledger_messages(state))
+    # Prompt/system rows remain complete in the durable ledger. The active
+    # bootstrap and reference block are rebuilt below as the uncompressed head;
+    # stale prompt rows never enter the compressible conversation body.
+    ledger = [
+        message for message in repair_orphan_tool_calls(get_ledger_messages(state))
+        if not is_ephemeral_prompt_frame(message)
+    ]
     existing_summary = state.get("context_summary") or ""
     compression_count = int(state.get("compression_count") or 0)
     compression_api_usages: list[dict] = []
@@ -212,7 +225,7 @@ def assemble_context(
             bootstrap=bootstrap_tokens,
             skills=skills_tokens,
             summary=count_messages_tokens(
-                [m for m in working if isinstance(m, HumanMessage) and (m.additional_kwargs or {}).get("context_summary")]
+                [m for m in working if isinstance(m, SystemMessage) and (m.additional_kwargs or {}).get("context_summary")]
             ),
             recent_turns=count_messages_tokens(
                 [m for m in working if not isinstance(m, SystemMessage)]
@@ -357,13 +370,8 @@ def assemble_context(
             m
             for m in working_messages
             if not isinstance(m, SystemMessage)
-            and not (
-                isinstance(m, HumanMessage)
-                and (m.additional_kwargs or {}).get("context_reference")
-            )
-            and not (
-                isinstance(m, HumanMessage) and (m.additional_kwargs or {}).get("context_summary")
-            )
+            and not ((m.additional_kwargs or {}).get("context_reference"))
+            and not ((m.additional_kwargs or {}).get("context_summary"))
         ]
         body_tokens = count_messages_tokens(body_messages)
         tool_tokens = _count_tool_tokens(body_messages)

@@ -41,13 +41,17 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: str | None = None
+    message_id: str | None = None
+    vendor_message_id: str | None = None
+    scope: dict[str, str | None] | None = None
+    origin: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     timestamp: int | None = None
     tool_result_ref: str | None = None
     tool_result_preview: str | None = None
     tool_result_truncated: bool = False
-    tool_reason_code: str | None = None
+    tool_status: str | None = None
     tool_reason_code: str | None = None
 
 

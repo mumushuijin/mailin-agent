@@ -21,7 +21,8 @@ def test_config_list(client):
     assert r.status_code == 200
     data = r.json()
     assert "configs" in data
-    assert "CONFIG" in data["configs"]
+    assert "SOUL" in data["configs"]
+    assert "CONFIG" not in data["configs"]
 
 
 def test_agent_info(client):

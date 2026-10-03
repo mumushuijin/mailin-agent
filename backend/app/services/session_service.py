@@ -3,6 +3,7 @@ from app.core.settings import get_settings
 from app.schemas.session import Session
 from app.storage.checkpoint import delete_thread, reset_checkpointer
 from app.storage.history_projection import HistoryProjectionStore
+from app.storage.conversation_files import SessionConversationFiles
 from app.storage.workspace import SessionStore
 
 
@@ -11,12 +12,14 @@ class SessionService:
         settings = get_settings()
         self.store = SessionStore(settings.workspace_path)
         self.history_projection = HistoryProjectionStore(settings.workspace_path)
+        self.conversation_files = SessionConversationFiles(settings.workspace_path)
 
     def list_sessions(self) -> list[Session]:
         return [Session(**s) for s in self.store.list()]
 
     def create(self, workspace_path: str) -> str:
         session_id = self.store.create(workspace_path)
+        self.conversation_files.session_dir(session_id).mkdir(parents=True, exist_ok=True)
         dispatch_observe(ON_SESSION_START, session_id=session_id)
         return session_id
 
@@ -31,12 +34,12 @@ class SessionService:
 
     async def delete(self, session_id: str) -> None:
         self.store.delete(session_id)
-        self.history_projection.delete(session_id)
+        self.conversation_files.delete_session(session_id)
         await delete_thread(session_id)
 
     async def clear_all(self) -> None:
         for session in self.store.list():
-            self.history_projection.delete(session["id"])
+            self.conversation_files.delete_session(session["id"])
             await delete_thread(session["id"])
         self.store.clear_all()
         await reset_checkpointer()

@@ -1,7 +1,7 @@
-import { getWsApiBase } from './index'
-import type { ChatResponse, StreamCallback, StreamEvent } from './chat'
+import { getWsApiBaseAsync } from './index'
+import type { AgentCheckpointState, ChatResponse, StreamCallback, StreamEvent } from './chat'
+import { readCanonicalAgentState } from '@/utils/canonicalAgentState'
 
-const WS_URL = `${getWsApiBase()}/api/ws/chat`
 const HEARTBEAT_MS = 30_000
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
@@ -18,9 +18,22 @@ type ConfigUpdatedHandler = (data: { name: string }) => void
 export type WsConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 type ConnectionHandler = (state: WsConnectionState) => void
 
-function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>; run_id?: string }): StreamEvent | null {
+function mapWsToStreamEvent(msg: {
+  type: string
+  data?: Record<string, unknown>
+  run_id?: string
+  state?: AgentCheckpointState
+  seq?: number
+  event_id?: string
+}): StreamEvent | null {
   const data = msg.data || {}
-  const base = { run_id: msg.run_id }
+  const state = readCanonicalAgentState(msg.state || data.state)
+  const base = {
+    run_id: msg.run_id || state?.scope.run_id || undefined,
+    state,
+    event_id: msg.event_id,
+    seq: msg.seq,
+  }
 
   switch (msg.type) {
     case 'session':
@@ -42,6 +55,8 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
         type: 'tool_finish',
         tool: data.tool as string,
         result: data.result as string,
+        result_ref: data.result_ref as string | null | undefined,
+        result_truncated: Boolean(data.result_truncated),
         tool_call_id: data.tool_call_id as string,
         ...base,
       }
@@ -133,6 +148,8 @@ function mapWsToStreamEvent(msg: { type: string; data?: Record<string, unknown>;
       }
     case 'config_updated':
       return { type: 'config_updated', config_name: data.name as string, ...base }
+    case 'state_sync':
+      return { type: 'state_sync', session_id: data.session_id as string, ...base }
     default:
       return null
   }
@@ -187,15 +204,17 @@ class ChatWebSocket {
 
     this.intentionalClose = false
     this.setState(this.reconnectAttempt > 0 ? 'reconnecting' : 'connecting')
-    this.connectPromise = new Promise<void>((resolve, reject) => {
-      try {
-        this.ws = new WebSocket(WS_URL)
-      } catch (e) {
-        this.connectPromise = null
-        this.setState('disconnected')
-        reject(e)
-        return
-      }
+    this.connectPromise = (async () => {
+      const wsUrl = `${await getWsApiBaseAsync()}/api/ws/chat`
+      return new Promise<void>((resolve, reject) => {
+        try {
+          this.ws = new WebSocket(wsUrl)
+        } catch (e) {
+          this.connectPromise = null
+          this.setState('disconnected')
+          reject(e)
+          return
+        }
 
       this.ws.onopen = () => {
         this.reconnectAttempt = 0
@@ -224,15 +243,16 @@ class ChatWebSocket {
         }
       }
 
-      this.ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data as string)
-          this.handleMessage(msg)
-        } catch {
-          // ignore
+        this.ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data as string)
+            this.handleMessage(msg)
+          } catch {
+            // ignore
+          }
         }
-      }
-    })
+      })
+    })()
 
     return this.connectPromise
   }
@@ -355,6 +375,10 @@ class ChatWebSocket {
     this.send({ op: 'session.subscribe', session_id: sessionId })
   }
 
+  requestStateSync(runId: string, sessionId: string) {
+    this.send({ op: 'state.sync', run_id: runId, session_id: sessionId })
+  }
+
   private send(payload: Record<string, unknown>) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload))
@@ -391,7 +415,7 @@ class ChatWebSocket {
     }
   }
 
-  approve(runId: string, decision: 'allow' | 'deny', opts?: { toolCallId?: string; sessionId?: string }) {
+  approve(runId: string, decision: 'allow' | 'deny', opts?: { toolCallId?: string; sessionId?: string; stepId?: string }) {
     this.releaseInterruptWait(runId)
     this.send({
       op: 'approve',
@@ -399,13 +423,14 @@ class ChatWebSocket {
       decision,
       tool_call_id: opts?.toolCallId,
       session_id: opts?.sessionId,
+      step_id: opts?.stepId,
     })
   }
 
   answerAskUser(
     runId: string,
     answer: string | string[],
-    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string },
+    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string; stepId?: string },
   ) {
     this.releaseInterruptWait(runId)
     this.send({
@@ -417,12 +442,13 @@ class ChatWebSocket {
       tool_call_id: opts?.toolCallId,
       mode: opts?.mode || 'answer_and_continue',
       session_id: opts?.sessionId,
+      step_id: opts?.stepId,
     })
   }
 
   ackHandoff(
     runId: string,
-    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string },
+    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string },
   ) {
     this.releaseInterruptWait(runId)
     this.send({
@@ -433,6 +459,7 @@ class ChatWebSocket {
       interrupt_id: opts?.interruptId,
       tool_call_id: opts?.toolCallId,
       session_id: opts?.sessionId,
+      step_id: opts?.stepId,
     })
   }
 

@@ -24,7 +24,7 @@ from tests.config_test_utils import fake_settings, read_config, write_config
 def workspace(tmp_path: Path, monkeypatch):
     defaults = tmp_path / "defaults"
     defaults.mkdir()
-    (defaults / "CONFIG.json").write_text("{}", encoding="utf-8")
+    (defaults / "config.toml").write_text("", encoding="utf-8")
     seed = {
         "agent": {"model": "legacy", "temperature": 0.1, "max_steps": 3},
         "tools": {"enforcement_mode": "enforce", "memory": True, "mcp": True},

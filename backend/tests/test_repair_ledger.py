@@ -32,13 +32,13 @@ def test_router_routes_to_tools_when_pending_tool_calls():
     state = {
         "step": 6,
         "max_steps": 6,
-        "messages": [
+        "context": {"working_message": [
             HumanMessage(content="hi"),
             AIMessage(
                 content="",
                 tool_calls=[{"id": "c1", "name": "list_directory", "args": {}}],
             ),
-        ],
+        ]},
     }
     assert should_continue(state) == "tools"
 

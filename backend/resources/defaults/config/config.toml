@@ -1,0 +1,140 @@
+[agent]
+model = "qwen-plus"
+temperature = 0.7
+max_steps = 48
+graph_version = "0.1.0-mvp"
+
+[mcp_servers]
+
+[tools]
+enforcement_mode = "enforce"
+memory = true
+session = true
+skills = true
+calculator = true
+datetime = true
+web_search = false
+mcp = true
+
+[tools.filesystem]
+enabled = true
+
+[tools.filesystem.snapshots]
+enabled = true
+
+[tools.filesystem.snapshots.retention]
+max_count = 50
+max_age_seconds = 604800
+max_total_bytes = 209715200
+
+[tools.shell]
+enabled = true
+default_timeout = 60
+max_timeout = 300
+safety_mode = true
+workdir = "."
+auto_approve_patterns = [
+    "git status",
+    "git diff*",
+    "git log*",
+    "dir",
+    "dir *",
+    "ls",
+    "ls *",
+]
+
+[tools.shell.policy]
+allowed_roots = [
+    ".",
+]
+capabilities = []
+
+[[tools.shell.policy.commands]]
+executable = "git"
+args_prefix = [
+    "status",
+]
+allowed_roots = [
+    ".",
+]
+capabilities = []
+
+[[tools.shell.policy.commands]]
+executable = "git"
+args_prefix = [
+    "diff",
+]
+allowed_roots = [
+    ".",
+]
+capabilities = []
+
+[[tools.shell.policy.commands]]
+executable = "git"
+args_prefix = [
+    "log",
+]
+allowed_roots = [
+    ".",
+]
+capabilities = []
+
+[tools.shell.extra_env]
+
+[tools.tool_search]
+enabled = true
+hot_tools = [
+    "read_file",
+    "write_file",
+    "replace_in_file",
+    "glob_search",
+    "search_files",
+    "list_directory",
+    "run_shell",
+    "process",
+    "skill_list",
+    "skill_match",
+    "skill_read",
+    "todo",
+    "ask_user",
+]
+search_default_limit = 5
+max_search_limit = 20
+mcp_as_hot = false
+
+[middleware]
+
+[skills]
+global_roots = [
+    "skills",
+]
+project_enabled = true
+catalog_max_items = 80
+catalog_max_chars = 12000
+cache_ttl_seconds = 5
+disabled = []
+
+[telemetry]
+langsmith_enabled = false
+sample_rate = 0.01
+
+[context]
+max_tokens = 128000
+compress_threshold_ratio = 0.75
+tool_result_max_tokens = 4000
+tool_summary_max_chars = 500
+recent_turn_pairs = 5
+max_compression_attempts = 3
+
+[context.bootstrap]
+single_file_max_chars = 20000
+total_max_chars = 150000
+
+[context.budget]
+bootstrap = 0.18
+skills = 0.04
+summary = 0.12
+recent_turns = 0.28
+tool_results = 0.25
+current_message = 0.05
+reserved = 0.08

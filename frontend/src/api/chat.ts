@@ -1,5 +1,6 @@
 import api, { getStreamApiBase } from './index'
 import { chatWs } from './ws'
+import { readCanonicalAgentState } from '@/utils/canonicalAgentState'
 
 const API_BASE = getStreamApiBase()
 
@@ -58,6 +59,21 @@ export interface SessionTokenStats {
   request_count: number
 }
 
+export interface AgentCheckpointState {
+  checkpoint_id: string
+  state_revision: number
+  scope: { workspace_id: string; session_id: string; run_id: string; task_id: string | null; request_id: string | null; step_id: string | null }
+  context: Record<string, unknown> & { working_message: unknown[] }
+  max_step_every_run: number
+  tasks: string[]
+  current_task: string | null
+  current_step: Record<string, unknown>
+  memory: Record<string, unknown>
+  task_details?: Record<string, unknown>
+  run_status?: string
+  terminal_reason?: string | null
+}
+
 export interface StreamEvent {
   type:
     | 'session'
@@ -78,10 +94,13 @@ export interface StreamEvent {
     | 'todo'
     | 'background'
     | 'config_updated'
+    | 'state_sync'
   content?: string
   tool?: string
   args?: Record<string, unknown>
   result?: string
+  result_ref?: string | null
+  result_truncated?: boolean
   error?: string
   status?: string
   stage?: string
@@ -123,6 +142,10 @@ export interface StreamEvent {
   api_usage?: ApiUsage
   session_token_stats?: SessionTokenStats
   compression?: { status: string; layer?: number; message?: string }
+  state?: AgentCheckpointState
+  event_id?: string
+  gap_detected?: boolean
+  seq?: number
 }
 
 export type StreamCallback = (event: StreamEvent) => void
@@ -195,20 +218,35 @@ export const chatApi = {
             if (data && currentEvent) {
               try {
                 const parsed = JSON.parse(data)
-                const runId = parsed.run_id as string | undefined
+                const state = readCanonicalAgentState(parsed.state)
+                const runId = (parsed.run_id || state?.scope.run_id) as string | undefined
+                const eventMeta = {
+                  run_id: runId,
+                  state,
+                  event_id: parsed.event_id,
+                  seq: parsed.seq,
+                }
 
                 if (currentEvent === 'session') {
                   finalSessionId = parsed.session_id
-                  onChunk({ type: 'session', session_id: parsed.session_id, run_id: runId })
+                  onChunk({ type: 'session', session_id: parsed.session_id, ...eventMeta })
                 } else if (currentEvent === 'step_start') {
-                  onChunk({ type: 'step_start', step: parsed.step, max_steps: parsed.max_steps, run_id: runId })
+                  onChunk({ type: 'step_start', step: parsed.step, max_steps: parsed.max_steps, ...eventMeta })
                 } else if (currentEvent === 'chunk') {
                   fullContent += parsed.content || ''
-                  onChunk({ type: 'chunk', content: parsed.content, run_id: runId })
+                  onChunk({ type: 'chunk', content: parsed.content, ...eventMeta })
                 } else if (currentEvent === 'tool_start') {
-                  onChunk({ type: 'tool_start', tool: parsed.tool, args: parsed.args, tool_call_id: parsed.tool_call_id, run_id: runId })
+                  onChunk({ type: 'tool_start', tool: parsed.tool, args: parsed.args, tool_call_id: parsed.tool_call_id, ...eventMeta })
                 } else if (currentEvent === 'tool_finish') {
-                  onChunk({ type: 'tool_finish', tool: parsed.tool, result: parsed.result, tool_call_id: parsed.tool_call_id, run_id: runId })
+                  onChunk({
+                    type: 'tool_finish',
+                    tool: parsed.tool,
+                    result: parsed.result,
+                    result_ref: parsed.result_ref,
+                    result_truncated: Boolean(parsed.result_truncated),
+                    tool_call_id: parsed.tool_call_id,
+                    ...eventMeta,
+                  })
                 } else if (currentEvent === 'tool_progress') {
                   onChunk({
                     type: 'tool_progress',
@@ -216,10 +254,10 @@ export const chatApi = {
                     status: parsed.status,
                     result: parsed.message || parsed.result,
                     message: parsed.message || parsed.chunk,
-                    run_id: runId,
+                    ...eventMeta,
                   })
                 } else if (currentEvent === 'step_finish') {
-                  onChunk({ type: 'step_finish', step: parsed.step, run_id: runId })
+                  onChunk({ type: 'step_finish', step: parsed.step, ...eventMeta })
                 } else if (currentEvent === 'stage') {
                   onChunk({
                     type: 'stage',
@@ -228,16 +266,16 @@ export const chatApi = {
                     elapsed_ms: parsed.elapsed_ms,
                     duration_ms: parsed.duration_ms,
                     error: parsed.error,
-                    run_id: runId,
+                    ...eventMeta,
                   })
                 } else if (currentEvent === 'context_usage') {
-                  onChunk({ type: 'context_usage', context_usage: parsed, run_id: runId })
+                  onChunk({ type: 'context_usage', context_usage: parsed, ...eventMeta })
                 } else if (currentEvent === 'api_usage') {
-                  onChunk({ type: 'api_usage', api_usage: parsed, run_id: runId })
+                  onChunk({ type: 'api_usage', api_usage: parsed, ...eventMeta })
                 } else if (currentEvent === 'session_token_stats') {
-                  onChunk({ type: 'session_token_stats', session_token_stats: parsed, run_id: runId })
+                  onChunk({ type: 'session_token_stats', session_token_stats: parsed, ...eventMeta })
                 } else if (currentEvent === 'compression') {
-                  onChunk({ type: 'compression', compression: parsed, run_id: runId })
+                  onChunk({ type: 'compression', compression: parsed, ...eventMeta })
                 } else if (currentEvent === 'interrupt') {
                   onChunk({
                     type: 'interrupt',
@@ -254,14 +292,14 @@ export const chatApi = {
                     options: Array.isArray(parsed.options) ? parsed.options : [],
                     allow_multiple: Boolean(parsed.allow_multiple),
                     preview: parsed.preview,
-                    run_id: runId,
+                    ...eventMeta,
                   })
                 } else if (currentEvent === 'todo') {
-                  onChunk({ type: 'todo', todos: Array.isArray(parsed.todos) ? parsed.todos : [], run_id: runId })
+                  onChunk({ type: 'todo', todos: Array.isArray(parsed.todos) ? parsed.todos : [], ...eventMeta })
                 } else if (currentEvent === 'background') {
-                  onChunk({ type: 'background', background: parsed, run_id: runId })
+                  onChunk({ type: 'background', background: parsed, ...eventMeta })
                 } else if (currentEvent === 'config_updated') {
-                  onChunk({ type: 'config_updated', config_name: parsed.name, run_id: runId })
+                  onChunk({ type: 'config_updated', config_name: parsed.name, ...eventMeta })
                 } else if (currentEvent === 'done') {
                   finalSessionId = parsed.session_id
                   onChunk({
@@ -270,10 +308,12 @@ export const chatApi = {
                     session_id: parsed.session_id,
                     partial: Boolean(parsed.partial),
                     cancelled: Boolean(parsed.cancelled),
-                    run_id: runId,
+                    terminal_reason: parsed.terminal_reason,
+                    handoff: Boolean(parsed.handoff),
+                    ...eventMeta,
                   })
                 } else if (currentEvent === 'error') {
-                  onChunk({ type: 'error', error: parsed.error, cancelled: Boolean(parsed.cancelled), run_id: runId })
+                  onChunk({ type: 'error', error: parsed.error, cancelled: Boolean(parsed.cancelled), ...eventMeta })
                 }
               } catch {
                 // 忽略解析错误
@@ -325,20 +365,20 @@ export const chatApi = {
   approveTool: (
     runId: string,
     decision: 'allow' | 'deny',
-    opts?: { toolCallId?: string; sessionId?: string },
+    opts?: { toolCallId?: string; sessionId?: string; stepId?: string },
   ) => {
     chatWs.approve(runId, decision, opts)
   },
   answerAskUser: (
     runId: string,
     answer: string | string[],
-    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string },
+    opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string; stepId?: string },
   ) => {
     chatWs.answerAskUser(runId, answer, opts)
   },
   ackHandoff: (
     runId: string,
-    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string },
+    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string },
   ) => {
     chatWs.ackHandoff(runId, opts)
   },

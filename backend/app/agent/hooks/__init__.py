@@ -18,10 +18,15 @@ from app.agent.hooks.events import (
     PRE_TOOL_CALL,
     TRANSFORM_TOOL_RESULT,
     VALID_HOOKS,
+    AGENT_NODE_START,
+    AGENT_NODE_END,
+    TOOL_NODE_START,
+    TOOL_NODE_END,
 )
 from app.agent.hooks.manager import (
     HookManager,
     dispatch_observe,
+    dispatch_observe_nonblocking,
     dispatch_post_llm_call,
     dispatch_post_tool_call,
     dispatch_pre_agent_step,
@@ -39,6 +44,7 @@ __all__ = [
     "register_hooks",
     "hooks_enabled",
     "dispatch_observe",
+    "dispatch_observe_nonblocking",
     "dispatch_pre_tool_call",
     "dispatch_post_tool_call",
     "dispatch_pre_agent_step",
@@ -53,5 +59,9 @@ __all__ = [
     "PRE_TOOL_CALL",
     "POST_TOOL_CALL",
     "TRANSFORM_TOOL_RESULT",
+    "AGENT_NODE_START",
+    "AGENT_NODE_END",
+    "TOOL_NODE_START",
+    "TOOL_NODE_END",
     "VALID_HOOKS",
 ]

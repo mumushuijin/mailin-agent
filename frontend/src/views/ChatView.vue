@@ -22,10 +22,19 @@ import MarkdownContent from '@/components/MarkdownContent.vue'
 import ToolApprovalModal from '@/components/ToolApprovalModal.vue'
 import AskUserModal from '@/components/AskUserModal.vue'
 import ContextUsageRing from '@/components/ContextUsageRing.vue'
+import AgentStateTimeline from '@/components/AgentStateTimeline.vue'
 import { createChatStreamEventBatcher } from '@/composables/useChatStream'
 import { getLastWorkspacePath, openDirectory, pickDirectory, saveLastWorkspacePath } from '@/composables/useWorkspaceFolder'
 import { getLastSessionId, saveLastSessionId, useProjectNavigator } from '@/composables/useProjectNavigator'
+import {
+  AGENT_STATUS_META,
+  createAgentStateStream,
+  finalizeAgentState,
+  isTerminalAgentStatus,
+} from '@/utils/agentStateStream'
 import type {
+  AgentStateStream,
+  AgentStatus,
   ChatUiMessage,
   MessageSegment,
   PendingApproval,
@@ -61,14 +70,30 @@ const contextUsage = ref<ContextUsage | null>(null)
 const apiUsage = ref<ApiUsage | null>(null)
 const contextCompressing = ref(false)
 const activeStage = ref<string | null>(null)
+const agentState = ref<AgentStateStream | null>(null)
+const turnAgentStates = ref<Record<number, AgentStateStream>>({})
 const activeRunId = ref<string | null>(null)
 const historyNextCursor = ref<string | null>(null)
 const hasMoreHistory = ref(false)
 const wsConnectionState = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('idle')
 const runStartedAt = ref<number | null>(null)
 const runClockNow = ref(Date.now())
-const lastRunSummary = ref<RunProgressSummary | null>(null)
-const terminalRunStatus = ref<'done' | 'cancelled' | 'error' | 'handoff' | null>(null)
+/**
+ * 轮次键 = 触发本轮的用户消息 id。
+ * 挂载位置：该用户消息所在 user 组之后的第一个 assistant 组顶部。
+ * 仅会话内前端计时；切会话 / 刷新后不恢复（见 design）。
+ */
+const turnRunSummaries = ref<Record<number, RunProgressSummary>>({})
+/** 当前正在计时的轮次键；与 turnRunSummaries 中已落定摘要分离 */
+const activeTurnKey = ref<number | null>(null)
+type TerminalRunStatus = 'done' | 'cancelled' | 'error' | 'handoff'
+const terminalRunStatus = ref<TerminalRunStatus | null>(null)
+const terminalStatusPriority: Record<TerminalRunStatus, number> = {
+  done: 1,
+  cancelled: 2,
+  handoff: 3,
+  error: 4,
+}
 let runTimer: ReturnType<typeof setInterval> | null = null
 
 // 工具审批（WebSocket interrupt）
@@ -190,6 +215,9 @@ const progressStageLabel = computed(() => {
   if (wsConnectionState.value === 'connecting') return '连接中…'
   if (wsConnectionState.value === 'reconnecting') return '重连中…'
   if (contextCompressing.value) return '整理上下文中…'
+  if (loading.value && agentState.value && agentState.value.status !== 'idle') {
+    return AGENT_STATUS_META[agentState.value.status].label
+  }
   if (activeStage.value === 'history_load') return '加载历史中…'
   if (activeStage.value === 'connecting') return '连接中…'
   if (activeStage.value === 'accepted') return '已接收，准备中…'
@@ -200,6 +228,7 @@ const progressStageLabel = computed(() => {
   if (activeStage.value === 'usage_snapshot') return '更新用量中…'
   if (activeStage.value === 'waiting_user') return '等待确认中…'
   if (activeStage.value === 'postprocess') return '收尾处理中…'
+  if (agentState.value?.status) return AGENT_STATUS_META[agentState.value.status].label
   const groups = messageGroups.value
   const lastGroup = groups[groups.length - 1]
   if (lastGroup && hasGroupToolWithoutText(lastGroup)) {
@@ -229,8 +258,16 @@ const currentElapsedMs = computed(() => (
   runStartedAt.value ? Math.max(0, runClockNow.value - runStartedAt.value) : 0
 ))
 
-const runProgressSummary = computed<RunProgressSummary | null>(() => {
-  if (loading.value && runStartedAt.value) {
+const formatToolElapsed = (segment: ToolSegment): string => {
+  if (!segment.startedAt) return ''
+  if (segment.status === 'running') void runClockNow.value
+  const end = segment.endedAt || (segment.status === 'running' ? Date.now() : segment.startedAt)
+  return formatElapsed(Math.max(0, end - segment.startedAt))
+}
+
+/** 当前活跃轮的实时进度（仅 loading + 已开始计时时） */
+const activeRunProgressSummary = computed<RunProgressSummary | null>(() => {
+  if (loading.value && runStartedAt.value && !isTerminalAgentStatus(agentState.value?.status)) {
     return {
       visible: true,
       active: true,
@@ -240,7 +277,62 @@ const runProgressSummary = computed<RunProgressSummary | null>(() => {
       todoTotal: sessionTodos.value.length,
     }
   }
-  return lastRunSummary.value
+  return null
+})
+
+/** 兼容：是否有活跃运行（todo 摘要等仍用此判断） */
+const runProgressSummary = computed<RunProgressSummary | null>(() => activeRunProgressSummary.value)
+
+/** 解析 assistant 组对应的轮次键：向前找最近一个 user 组的首条消息 id */
+const resolveTurnKeyForAssistantGroup = (groupIndex: number): number | null => {
+  for (let i = groupIndex - 1; i >= 0; i--) {
+    const group = messageGroups.value[i]
+    if (group?.role === 'user' && group.messages[0]) {
+      return group.messages[0].id
+    }
+  }
+  return null
+}
+
+/** 某 assistant 组应展示的进度：活跃轮用实时摘要，否则用已落定映射 */
+const progressForAssistantGroup = (groupIndex: number): RunProgressSummary | null => {
+  const key = resolveTurnKeyForAssistantGroup(groupIndex)
+  if (key == null) return null
+  if (activeTurnKey.value === key && activeRunProgressSummary.value) {
+    return activeRunProgressSummary.value
+  }
+  return turnRunSummaries.value[key] ?? null
+}
+
+/** 与 messageGroups 对齐：仅 assistant 组可能非 null */
+const assistantGroupProgress = computed(() => (
+  messageGroups.value.map((group, index) => (
+    group.role === 'assistant' ? progressForAssistantGroup(index) : null
+  ))
+))
+
+const cloneAgentState = (state: AgentStateStream): AgentStateStream => ({
+  ...state,
+  nodes: state.nodes.map((node) => ({ ...node, toolIds: node.toolIds ? [...node.toolIds] : undefined })),
+  toolExecutions: state.toolExecutions.map((execution) => ({ ...execution, inputs: { ...execution.inputs } })),
+})
+
+const agentStateForAssistantGroup = (groupIndex: number): AgentStateStream | null => {
+  const key = resolveTurnKeyForAssistantGroup(groupIndex)
+  if (key == null) return null
+  if (activeTurnKey.value === key && agentState.value) return agentState.value
+  return turnAgentStates.value[key] ?? null
+}
+
+/**
+ * 本轮尚无 assistant 组时，在用户消息之后用底部 loading 组展示进度占位。
+ * assistant 组一旦出现，进度改挂在该组顶部。
+ */
+const shouldShowActiveProgressPlaceholder = computed(() => {
+  if (!activeRunProgressSummary.value || activeTurnKey.value == null) return false
+  const groups = messageGroups.value
+  if (groups.length === 0) return true
+  return groups[groups.length - 1]!.role === 'user'
 })
 
 const startRunClock = () => {
@@ -258,8 +350,37 @@ const stopRunClock = () => {
   }
 }
 
-const markRunTerminal = (status: 'done' | 'cancelled' | 'error' | 'handoff') => {
-  terminalRunStatus.value = status
+const terminalAgentStatus = (status: TerminalRunStatus): Extract<AgentStatus, 'completed' | 'cancelled' | 'handoff' | 'error'> => {
+  if (status === 'done') return 'completed'
+  return status
+}
+
+const terminalLabel = (status: TerminalRunStatus): string => {
+  if (status === 'done') return '本轮完成'
+  if (status === 'cancelled') return '本轮已取消'
+  if (status === 'handoff') return '已交还用户'
+  return '本轮失败'
+}
+
+const markRunTerminal = (status: TerminalRunStatus) => {
+  const current = terminalRunStatus.value
+  const resolvedStatus = current && terminalStatusPriority[current] > terminalStatusPriority[status]
+    ? current
+    : status
+  terminalRunStatus.value = resolvedStatus
+  if (agentState.value) {
+    finalizeAgentState(agentState.value, terminalAgentStatus(resolvedStatus), terminalLabel(resolvedStatus))
+  }
+}
+
+const clearTurnProgressState = () => {
+  turnRunSummaries.value = {}
+  turnAgentStates.value = {}
+  agentState.value = null
+  activeTurnKey.value = null
+  terminalRunStatus.value = null
+  stopRunClock()
+  runStartedAt.value = null
 }
 
 const finalizeRunSummary = (fallbackStatus: 'done' | 'cancelled' | 'error' | 'handoff' = 'done') => {
@@ -276,7 +397,7 @@ const finalizeRunSummary = (fallbackStatus: 'done' | 'cancelled' | 'error' | 'ha
         : status === 'handoff'
           ? '已交还用户'
           : '本轮失败'
-  lastRunSummary.value = {
+  const summary: RunProgressSummary = {
     visible: true,
     active: false,
     stageLabel: label,
@@ -292,8 +413,25 @@ const finalizeRunSummary = (fallbackStatus: 'done' | 'cancelled' | 'error' | 'ha
             ? '已交还'
             : '执行失败',
   }
+  if (agentState.value) {
+    finalizeAgentState(
+      agentState.value,
+      terminalAgentStatus(status),
+      summary.terminalLabel || label,
+    )
+  }
+  const key = activeTurnKey.value
+  if (key != null) {
+    // 只写入当前活跃轮，不触碰更早轮次的已落定摘要
+    turnRunSummaries.value = { ...turnRunSummaries.value, [key]: summary }
+    if (agentState.value) {
+      turnAgentStates.value = { ...turnAgentStates.value, [key]: cloneAgentState(agentState.value) }
+    }
+  }
   stopRunClock()
   runStartedAt.value = null
+  activeTurnKey.value = null
+  terminalRunStatus.value = null
 }
 
 const saveCurrentSession = (sessionId: string) => {
@@ -337,6 +475,7 @@ interface ToolResultDisplay {
   ref?: string | null
   preview?: string | null
   truncated?: boolean
+  status?: string | null
 }
 
 const safeJsonArgs = (raw: string): Record<string, unknown> => {
@@ -372,6 +511,7 @@ const buildDisplayMessages = (
         ref: msg.tool_result_ref,
         preview: msg.tool_result_preview,
         truncated: Boolean(msg.tool_result_truncated),
+        status: msg.tool_status,
       })
     }
   }
@@ -410,10 +550,13 @@ const buildDisplayMessages = (
             id: now + i * 1000 + tcIndex,
             tool: tc.function.name,
             args: safeJsonArgs(tc.function.arguments),
+            toolCallId: tc.id,
             result: result?.content,
             toolResultRef: result?.ref,
             toolResultTruncated: result?.truncated,
-            status: result?.content && toolResultLooksLikeError(result.content) ? 'error' : 'done',
+            status: result?.status && ['failed', 'cancelled', 'skipped'].includes(result.status)
+              ? 'error'
+              : result?.content && toolResultLooksLikeError(result.content) ? 'error' : 'done',
           })
         })
 
@@ -474,10 +617,7 @@ const buildDisplayMessages = (
 const loadSessionHistory = async (sessionId: string) => {
   const seq = ++historyLoadSeq
   historyLoading.value = true
-  lastRunSummary.value = null
-  terminalRunStatus.value = null
-  stopRunClock()
-  runStartedAt.value = null
+  clearTurnProgressState()
   messages.value = []
   contextUsage.value = null
   apiUsage.value = null
@@ -857,6 +997,7 @@ const handleApproval = (decision: 'allow' | 'deny') => {
   if (!pendingApproval.value) return
   chatApi.approveTool(pendingApproval.value.runId, decision, {
     toolCallId: pendingApproval.value.toolCallId,
+    stepId: pendingApproval.value.stepId,
     sessionId: currentSessionId.value || undefined,
   })
   pendingApproval.value = null
@@ -867,6 +1008,7 @@ const handleAskUser = (answer: string | string[]) => {
   const pending = pendingAskUser.value
   chatApi.answerAskUser(pending.runId, answer, {
     interruptId: pending.interruptId,
+    stepId: pending.stepId,
     toolCallId: pending.toolCallId,
     mode: pending.mode,
     sessionId: currentSessionId.value || undefined,
@@ -879,6 +1021,7 @@ const handleHandoffAck = () => {
   const pending = pendingAskUser.value
   chatApi.ackHandoff(pending.runId, {
     interruptId: pending.interruptId,
+    stepId: pending.stepId,
     toolCallId: pending.toolCallId,
     sessionId: currentSessionId.value || undefined,
   })
@@ -922,7 +1065,8 @@ const sendMessage = async () => {
 
   messages.value.push(userMsg)
   inputMessage.value = ''
-  lastRunSummary.value = null
+  activeTurnKey.value = userMsg.id
+  agentState.value = createAgentStateStream(userMsg.id, null, Date.now())
   terminalRunStatus.value = null
   runStartedAt.value = Date.now()
   startRunClock()
@@ -943,6 +1087,7 @@ const sendMessage = async () => {
     apiUsage,
     contextCompressing,
     activeStage,
+    agentState,
     pendingApproval,
     pendingAskUser,
     sessionTodos,
@@ -955,6 +1100,7 @@ const sendMessage = async () => {
   }
   const batcher = createChatStreamEventBatcher(streamCtx)
 
+  let discardTurnProgress = false
   try {
     await chatApi.sendMessageWs(
       userMessage,
@@ -981,14 +1127,18 @@ const sendMessage = async () => {
       markRunTerminal('error')
       message.error('发送消息失败')
       messages.value.pop()
+      discardTurnProgress = true
     }
   } finally {
     batcher.flush()
-    if (currentSessionId.value === startedSessionId) {
-      finalizeRunSummary('done')
-    } else {
+    if (discardTurnProgress || currentSessionId.value !== startedSessionId) {
       stopRunClock()
       runStartedAt.value = null
+      activeTurnKey.value = null
+      terminalRunStatus.value = null
+      agentState.value = null
+    } else {
+      finalizeRunSummary('done')
     }
     loading.value = false
     abortController.value = null
@@ -1092,25 +1242,13 @@ const openWorkspaceFolder = async () => {
       </div>
       <template v-else-if="messages.length > 0">
         <!-- 加载更早消息入口 -->
-        <div v-if="hasMoreToRender" class="load-more" @click="loadMoreMessages">
+        <div
+          v-if="hasMoreToRender"
+          class="load-more"
+          @click="loadMoreMessages"
+        >
           <LoadingOutlined v-if="loadingMore" />
           <span>{{ loadingMore ? '加载中...' : '加载更早的消息' }}</span>
-        </div>
-        <div
-          v-if="runProgressSummary"
-          :class="['run-progress', { active: runProgressSummary.active }]"
-          aria-live="polite"
-        >
-          <span class="run-progress-indicator" aria-hidden="true"></span>
-          <span class="run-progress-stage">{{ runProgressSummary.stageLabel }}</span>
-          <code class="inline-code">用时 {{ runProgressSummary.elapsedLabel }}</code>
-          <code
-            v-if="runProgressSummary.todoTotal > 0"
-            class="inline-code"
-          >{{ runProgressSummary.todoCompleted }}/{{ runProgressSummary.todoTotal }} 个任务完成</code>
-          <span v-if="runProgressSummary.terminalLabel" class="run-progress-terminal">
-            {{ runProgressSummary.terminalLabel }}
-          </span>
         </div>
         <div
           v-for="(group, groupIndex) in messageGroups"
@@ -1126,8 +1264,22 @@ const openWorkspaceFolder = async () => {
 
           <!-- 消息内容 -->
           <div class="group-content">
+            <!-- 轮次顶部只保留耗时 -->
+            <AgentStateTimeline
+              v-if="assistantGroupProgress[groupIndex]"
+              :progress="assistantGroupProgress[groupIndex]!"
+              :state="agentStateForAssistantGroup(groupIndex)"
+              mode="time"
+            />
             <!-- 遍历每条消息 -->
             <template v-for="(msg, msgIndex) in group.messages" :key="msg.id">
+              <!-- 阶段、工具和终态紧邻对应的 Agent 消息 -->
+              <AgentStateTimeline
+                v-if="group.role === 'assistant' && assistantGroupProgress[groupIndex]"
+                :progress="assistantGroupProgress[groupIndex]!"
+                :state="agentStateForAssistantGroup(groupIndex)"
+                mode="message"
+              />
               <!-- 如果有分段，按分段显示 -->
               <template v-if="msg.segments && msg.segments.length > 0">
                 <template v-for="segment in msg.segments" :key="segment.id">
@@ -1172,6 +1324,7 @@ const openWorkspaceFolder = async () => {
                       <Tag v-else-if="segment.status === 'policy_denied'" color="warning" class="tool-tag">策略拒绝</Tag>
                       <Tag v-else-if="segment.status === 'cancelled'" color="warning" class="tool-tag">已取消</Tag>
                       <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
+                      <code v-if="formatToolElapsed(segment)" class="tool-duration">{{ formatToolElapsed(segment) }}</code>
                       <span
                         v-if="segment.status !== 'running'"
                         class="collapse-indicator"
@@ -1186,6 +1339,10 @@ const openWorkspaceFolder = async () => {
                       <span class="system-label">系统返回</span>
                       <span>{{ toolResultPreview(segment.result) }}</span>
                     </p>
+                    <p
+                      v-if="!isToolExpanded(segment.id) && segment.progressMessage"
+                      class="tool-progress-summary"
+                    >{{ segment.progressMessage }}</p>
                     <div
                       v-if="segment.snapshotId && segment.status === 'done'"
                       class="tool-undo-row"
@@ -1206,6 +1363,10 @@ const openWorkspaceFolder = async () => {
                       v-if="!isToolExpanded(segment.id) && toolResultLooksLikeError(segment.result)"
                       class="tool-error-preview"
                     ><span class="system-label">系统错误</span>{{ toolErrorPreview(segment.result) }}</p>
+                    <p
+                      v-if="!isToolExpanded(segment.id) && (segment.status === 'error' || segment.status === 'policy_denied')"
+                      class="tool-retry-note"
+                    >请展开查看详情，确认后重新发起请求</p>
                     <!-- 展开后显示入参和结果 -->
                     <div v-if="isToolExpanded(segment.id)" class="tool-details">
                       <!-- 入参 -->
@@ -1274,12 +1435,17 @@ const openWorkspaceFolder = async () => {
         </div>
       </div>
 
-      <!-- 加载指示器（助手消息组样式）- 等待响应时显示 -->
+      <!-- 加载指示器（助手消息组样式）- 等待响应时显示；尚无 assistant 组时兼作进度占位 -->
       <div v-if="loading && shouldShowLoadingIndicator" class="message-group assistant loading-group">
         <div class="group-avatar">
           <MailinLogo :size="36" />
         </div>
         <div class="group-content">
+          <AgentStateTimeline
+            v-if="shouldShowActiveProgressPlaceholder && activeRunProgressSummary"
+            :progress="activeRunProgressSummary"
+            :state="agentState"
+          />
           <div class="message-bubble thinking-bubble">
             <div class="thinking-indicator">
               <div class="loading-dots" aria-hidden="true">
@@ -1450,54 +1616,6 @@ const openWorkspaceFolder = async () => {
 .load-more:hover {
   color: var(--color-primary);
   border-color: var(--color-primary);
-}
-
-/* 当前回合的轻量进度上下文 */
-.run-progress {
-  align-self: center;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  max-width: min(800px, 100%);
-  padding: 7px 12px;
-  margin-bottom: 4px;
-  color: var(--color-text-secondary);
-  background: color-mix(in srgb, var(--color-surface) 88%, var(--color-primary-light));
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  font-size: 12px;
-}
-
-.run-progress.active {
-  border-color: var(--color-primary-border);
-}
-
-.run-progress-indicator {
-  width: 7px;
-  height: 7px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--color-text-secondary);
-}
-
-.run-progress.active .run-progress-indicator {
-  background: var(--color-primary);
-  animation: progress-pulse 1.4s ease-in-out infinite;
-}
-
-.run-progress-stage {
-  color: var(--color-text);
-  font-weight: 600;
-}
-
-.run-progress-terminal {
-  color: var(--color-text-secondary);
-}
-
-@keyframes progress-pulse {
-  0%, 100% { opacity: 0.45; transform: scale(0.85); }
-  50% { opacity: 1; transform: scale(1); }
 }
 
 /* 消息组样式 */
@@ -1899,6 +2017,11 @@ const openWorkspaceFolder = async () => {
   background: color-mix(in srgb, var(--color-surface) 88%, #f0ad4e);
 }
 
+.tool-card.policy_denied {
+  border-color: color-mix(in srgb, var(--color-primary) 55%, #f0ad4e);
+  background: color-mix(in srgb, var(--color-surface) 88%, #f0ad4e);
+}
+
 .tool-header {
   display: flex;
   align-items: center;
@@ -1917,6 +2040,12 @@ const openWorkspaceFolder = async () => {
   flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
+}
+
+.tool-duration {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: 11px;
 }
 
 .tool-action-verb {
@@ -1959,6 +2088,20 @@ const openWorkspaceFolder = async () => {
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+.tool-progress-summary {
+  margin: 6px 0 0;
+  color: var(--color-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.tool-retry-note {
+  margin: 4px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 11px;
 }
 
 .tool-undo-row {

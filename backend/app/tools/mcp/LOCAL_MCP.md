@@ -1,3 +1,5 @@
+> 历史 stdio 规划：下列 JSON 片段仅描述字段结构，不能直接粘贴到当前 TOML 文件。当前全局配置位于 `<runtime-root>/data/config/config.toml`，MCP Server 使用 `[mcp.servers.<name>]`。以设置页和当前 API 为准。
+
 # 本地 stdio MCP 管理指南
 
 stdio 传输（子进程模式）**尚未在代码中实现**，但配置格式与目录约定已确定。本文说明用户如何自行下载 MCP 工具、放在哪、麦林如何找到并拉起子进程。

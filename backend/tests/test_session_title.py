@@ -21,17 +21,14 @@ from app.services.session_service import SessionService
 
 @pytest.fixture
 def spaces(tmp_path: Path, monkeypatch):
-    home = tmp_path / "agent_home"
-    defaults = Path(__file__).resolve().parents[1] / "workspace_defaults"
+    home = tmp_path / "runtime" / "data" / "agent-home"
+    defaults = Path(__file__).resolve().parents[1] / "resources" / "defaults" / "workspace"
     project = tmp_path / "project"
     other = tmp_path / "other"
-    home.mkdir()
+    home.mkdir(parents=True)
     project.mkdir()
     other.mkdir()
-    settings = Settings(
-        workspace_path=home,
-        workspace_defaults_path=defaults,
-    )
+    settings = Settings(runtime_root=tmp_path / "runtime")
     monkeypatch.setattr("app.core.settings.get_settings", lambda: settings)
     monkeypatch.setattr("app.storage.project.get_settings", lambda: settings)
     monkeypatch.setattr("app.services.session_service.get_settings", lambda: settings)

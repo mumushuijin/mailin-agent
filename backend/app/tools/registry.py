@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -31,8 +30,9 @@ def _tool_switch_enabled(value, *, default: bool = True) -> bool:
 
 
 def load_full_config(workspace: Path | None = None) -> dict:
-    """读取 CONFIG.json 并投影为运行时有效顶层视图（兼容旧格式与规范根）。"""
+    """读取全局 TOML 并投影为运行时有效顶层视图。"""
     from app.config import normalize_config_document, project_effective_runtime_config
+    from app.config.persistence import read_toml
     from app.storage.workspace import config_file_path
 
     _ = workspace  # 兼容旧签名；CONFIG 已迁出 workspace
@@ -40,8 +40,8 @@ def load_full_config(workspace: Path | None = None) -> dict:
     if not path.exists():
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        raw = read_toml(path)
+    except (OSError, ValueError):
         return {}
     if not isinstance(raw, dict):
         return {}
