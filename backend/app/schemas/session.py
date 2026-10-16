@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 PLACEHOLDER_TITLE = "新会话"
 TITLE_SOURCE_PLACEHOLDER = "placeholder"
@@ -27,24 +27,18 @@ class SessionRename(BaseModel):
     title: str
 
 
-class ToolCallFunction(BaseModel):
-    name: str
-    arguments: str
-
-
 class ToolCall(BaseModel):
     id: str
-    type: str = "function"
-    function: ToolCallFunction
+    name: str
+    arguments: dict
 
 
 class ChatMessage(BaseModel):
     role: str
-    content: str | None = None
+    content: str | list | None = None
     message_id: str | None = None
-    vendor_message_id: str | None = None
-    scope: dict[str, str | None] | None = None
-    origin: str | None = None
+    turn_id: str | None = None
+    seq: int | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     timestamp: int | None = None
@@ -53,11 +47,16 @@ class ChatMessage(BaseModel):
     tool_result_truncated: bool = False
     tool_status: str | None = None
     tool_reason_code: str | None = None
+    tool_result_reference: dict | None = None
+    interaction: dict | None = None
 
 
 class SessionHistory(BaseModel):
     session_id: str
+    workspace_id: str | None = None
+    projection_version: int
     messages: list[ChatMessage]
+    timelines: list[dict] = Field(default_factory=list)
     context_usage: dict | None = None
     api_usage: dict | None = None
     session_token_stats: dict | None = None

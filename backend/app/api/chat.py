@@ -16,15 +16,15 @@ log = get_logger(__name__)
 
 
 @contextlib.contextmanager
-def _http_run_scope(session_id: str | None):
-    run_id = str(uuid.uuid4())
+def _http_run_scope(session_id: str | None, turn_id: str | None = None):
+    turn_id = turn_id or "turn_" + uuid.uuid4().hex
     start = time.monotonic()
     status = "success"
 
-    with log_scope(run_id=run_id, session_id=session_id):
+    with log_scope(turn_id=turn_id, session_id=session_id):
         log.info("run.started")
         try:
-            yield run_id
+            yield turn_id
         except Exception as exc:
             status = "failed"
             log.error("run.failed", error=str(exc), exc_info=True)
@@ -41,23 +41,23 @@ def _http_run_scope(session_id: str | None):
 
 @router.post("/send", response_model=ChatResponse)
 async def send_message(body: ChatRequest):
-    with _http_run_scope(body.session_id) as run_id:
-        return await chat_service.send_sync(body.message, body.session_id, run_id=run_id)
+    with _http_run_scope(body.session_id, body.turn_id) as turn_id:
+        return await chat_service.send_sync(body.message, body.session_id, turn_id=turn_id)
 
 
 @router.post("/send/stream")
 async def send_message_stream(body: ChatRequest):
-    run_id = str(uuid.uuid4())
+    turn_id = body.turn_id or "turn_" + uuid.uuid4().hex
 
     async def event_generator():
         start = time.monotonic()
         status = "success"
 
-        with log_scope(run_id=run_id, session_id=body.session_id):
+        with log_scope(turn_id=turn_id, session_id=body.session_id):
             log.info("run.started")
             try:
                 async for event in chat_service.send_stream(
-                    body.message, body.session_id, run_id=run_id
+                    body.message, body.session_id, turn_id=turn_id
                 ):
                     yield event
             except Exception as e:

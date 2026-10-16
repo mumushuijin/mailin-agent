@@ -58,31 +58,35 @@ uv run mailin serve --mode production --host 127.0.0.1 --port 0 --runtime-root D
 
 ## Agent checkpoint 与会话账本
 
-Agent checkpoint 使用固定的 canonical state：`checkpoint_id`、`scope`、`context`、
-`max_step_every_run`、`tasks`、`current_task`、`current_step`、`memory`，并带有状态修订、
-终态和账本游标等恢复字段。WebSocket 与 SSE 在状态事件中共享该快照；LLM 文本增量仍作为
-临时事件发送。
+仅支持 checkpoint `schema_version=2`、账本元数据 `schema_version=2`、历史投影 `version=3`。
+应用用户轮次统一使用 `turn_id`；WS/SSE/同步发送、取消和交互答复采用相同轮次关联。
+checkpoint 的 scope 仅含 workspace/session/turn，当前 task、step 和模型 request 分别位于
+`current_task`、`current_step.step_id`、`current_step.model.request_id`，快照 ID 为独立 `cp_...`。
+正式 agent 迭代预算使用 `max_step_every_turn`；普通问候允许 `tasks=[]`、`current_task=null`。
 
-每个 session 的完整消息账本位于 `.runtime/data/agent-home/sessions/<session_id>/ledger.jsonl`，
-每行严格包含 `seq`、`message_id`、`scope`、`origin`、`message`。`scope` 的六种身份分别是
-`workspace_id`（工作空间）、`session_id`（会话）、`run_id`（一轮用户指令）、
-`task_id`（任务项）、`request_id`（一次实际模型请求，包括重试）、`step_id`（一次节点执行）。
-没有对应任务项、请求或节点执行时使用 JSON `null`。`origin` 只接受 `user`、`assistant`、
-`tool`、`system_maintenance`。`message_id` 是应用账本 ID；供应商消息 ID 留在
-`message.data.id`，工具调用 ID 留在 `message.data.tool_calls[*].id`，传输 `event_id` 不入账本。
-例如：
+已解析运行目录的 `sessions/<session_id>/ledger_meta.json` 保存版本和容器归属；
+`ledger.jsonl` 每行是一条消息，必需 seq/message_id/timestamp/message，适用时带 turn_id。
+所有持久时间均为 UTC Unix 毫秒。框架原始消息 ID（如 `run--...`）保存在 `message.id`，
+不用于判断应用 turn；框架内部 callback/config run_id 保留原含义。示例：
 
 ```json
-{"seq":1,"message_id":"msg_a1","scope":{"workspace_id":"ws_1","session_id":"00000000-0000-4000-8000-000000000001","run_id":"run_1","task_id":"task_1","request_id":null,"step_id":null},"origin":"user","message":{"type":"human","data":{"content":"你好"}}}
+{"seq":1,"message_id":"msg_a1","turn_id":"turn_1","timestamp":1791964800000,"message":{"role":"user","content":"你好"}}
 ```
 
 模型请求重建的 bootstrap、参考块和摘要视图只进入工作窗口，不作为普通对话事件追加。
-诊断导出直接保留上述新格式 JSONL 行，并分别标注 checkpoint 的 `context.working_message`
-为可恢复工作窗口、某次模型请求输入为运行时临时组装结果；两者不能当作相同的持久消息序列。
+关键模型/工具尝试、交互、节点/任务、turn 终态和摘要维护以结构化 system 消息审计，
+不会进入默认模型提示或聊天正文。工具定义参数和完整结果以账本为权威，checkpoint 只存
+definition_seq/result_seq 与恢复必要状态。大型结果引用包含受控相对路径、bytes、media_type、SHA-256。
+诊断导出通过 `SessionConversationFiles.export_files` 包含一次元数据、账本和所有引用/摘要资源。
 checkpoint 只保存模型工作窗口及账本已应用序号；历史投影位于
 同目录的 `history_projection.json`，损坏或缺失时可由账本重建。上下文压缩摘要保存在同目录的
 `summaries/`，checkpoint 只保存摘要指针。共享 `sessions/checkpoints.sqlite` 和
 `sessions/index.json` 保持在 sessions 根目录。
+
+旧 checkpoint、账本、投影和 `run_id` 请求明确拒绝，应用不转换、覆盖或自动清理旧会话。
+用户备份并主动清理旧会话后新建。回滚须配套应用版本和对应数据备份；旧版不能读取新格式。
+恢复发现已启动却没有可靠结果的工具时追加一次 unknown 结算，失败结束原 turn，禁止自动重放。
+完整协议、字段清单及恢复规则见 [checkpoint-ledger-v2.md](../.docs/checkpoint-ledger-v2.md)。
 
 ## 目录
 

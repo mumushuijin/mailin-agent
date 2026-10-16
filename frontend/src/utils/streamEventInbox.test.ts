@@ -2,11 +2,11 @@ import { describe, expect, it } from 'vitest'
 import type { StreamEvent } from '@/api/chat'
 import { StreamEventInbox } from '@/utils/streamEventInbox'
 
-const event = (runId: string, seq: number, type: StreamEvent['type']): StreamEvent => ({
+const event = (turnId: string, seq: number, type: StreamEvent['type']): StreamEvent => ({
   type,
-  run_id: runId,
+  turn_id: turnId,
   seq,
-  event_id: `${runId}-${seq}`,
+  event_id: `${turnId}-${seq}`,
 })
 
 describe('StreamEventInbox', () => {
@@ -70,7 +70,7 @@ describe('StreamEventInbox', () => {
     expect(inbox.push(first).events).toHaveLength(0)
     expect(inbox.push(event('run-4', 0, 'chunk')).events).toHaveLength(0)
     expect(inbox.push(event('run-5', 2, 'chunk')).events).toHaveLength(0)
-    expect(inbox.push(event('run-5', 1, 'session')).events.map((item) => item.run_id)).toEqual(['run-5'])
+    expect(inbox.push(event('run-5', 1, 'session')).events.map((item) => item.turn_id)).toEqual(['run-5'])
     expect(inbox.push(event('run-4', 3, 'step_start')).events).toHaveLength(0)
     expect(inbox.push(event('run-4', 4, 'session')).events).toHaveLength(0)
   })

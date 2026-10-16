@@ -1,190 +1,270 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, message_to_dict
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from app.storage.conversation_files import SessionConversationFiles
+from app.storage.conversation_files import INLINE_CONTENT_BYTES, SessionConversationFiles
 from app.storage.ledger_contract import validate_row
 
-
-def scope(sid, run="run-1"):
-    return {"workspace_id": "workspace-1", "session_id": sid, "run_id": run,
-            "task_id": "task-1", "request_id": None, "step_id": None}
+SID = "00000000-0000-4000-8000-000000000001"
+OTHER = "00000000-0000-4000-8000-000000000002"
 
 
-def encoded(content):
-    return message_to_dict(HumanMessage(content=content))
+def message(content):
+    return {"role": "user", "content": content}
 
 
-def test_append_only_ledger_is_idempotent_and_rejects_invalid_session(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000001"
+def test_idempotency_returns_original_seq_and_conflicts_fail(tmp_path):
+    files = SessionConversationFiles(tmp_path)
     with pytest.raises(ValueError):
-        store.session_dir("../../escape")
-    first = store.append(sid, "m1", encoded("hello"), scope=scope(sid), origin="user")
-    duplicate = store.append(sid, "m1", encoded("hello"), scope=scope(sid), origin="user")
-    second = store.append(sid, "m2", encoded("world"), scope=scope(sid), origin="user")
-    assert first == (1, True)
-    assert duplicate == (1, False)
-    assert second == (2, True)
-    rows = store.read(sid)
-    assert [row["message_id"] for row in rows] == ["m1", "m2"]
-    assert [row["message_id"] for row in store.read(sid, after_seq=1)] == ["m2"]
-    assert store.read(sid, after_seq=2) == []
-    assert [row["message_id"] for row in store.read_tail(sid, after_seq=1)] == ["m2"]
-    offset = store.offset_after(sid, 1)
-    assert [row["message_id"] for row in store.read_tail(sid, after_seq=1, offset=offset)] == ["m2"]
-    assert json.loads(store.ledger_path(sid).read_text().splitlines()[0])["seq"] == 1
+        files.session_dir("../../escape")
+    assert files.append(SID, "one", message("hello"), turn_id="t") == (1, True)
+    assert files.append(SID, "two", message("world"), turn_id="t") == (2, True)
+    assert files.append(SID, "one", message("hello"), turn_id="t") == (1, False)
+    for content, turn in (("changed", "t"), ("hello", "other")):
+        with pytest.raises(ValueError, match="conflict"):
+            files.append(SID, "one", message(content), turn_id=turn)
+    assert files.row_at(SID, 1)["message_id"] == "one"
+    assert files.row_at(SID, 3) is None
+    assert files.read_tail(SID, after_seq=1, offset=999)[0]["seq"] == 2
 
 
-def test_append_messages_assigns_stable_ids(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000002"
-    store.append_messages(sid, "run-1", [HumanMessage(content="hello")], scope=scope(sid))
-    store.append_messages(sid, "run-1", [HumanMessage(content="hello")], scope=scope(sid))
-    assert len(store.read(sid)) == 1
+def test_missing_and_repeated_vendor_ids_remain_distinct(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    messages = [AIMessage(content="same", id="run--vendor"), AIMessage(content="same", id="run--vendor"), HumanMessage(content="same")]
+    files.append_messages(SID, "t", messages)
+    files.append_messages(SID, "t", messages)
+    rows = files.read(SID)
+    assert len(rows) == len({r["message_id"] for r in rows}) == 3
+    assert [r["message"].get("id") for r in rows] == ["run--vendor", "run--vendor", None]
+    assert all(r["timestamp"] > 1_000_000_000_000 and "scope" not in r and "origin" not in r for r in rows)
+    files.append_messages(SID, "t", files.messages(SID))
+    assert files.latest_seq(SID) == 3
 
 
-def test_new_rows_keep_vendor_id_separate_and_reject_missing_scope(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000011"
-    assistant = AIMessage(content="answer", id="run--vendor-message")
-    store.append_messages(sid, "actual-run", [assistant], scope=scope(sid, "actual-run"))
-    row = store.read(sid)[0]
-    assert row["scope"]["run_id"] == "actual-run"
-    assert row["origin"] == "assistant"
-    assert row["message_id"] != "run--vendor-message"
-    assert row["message"]["data"]["id"] == "run--vendor-message"
-    assert set(row) == {"seq", "message_id", "scope", "origin", "message"}
-    bad = {key: value for key, value in row.items() if key != "scope"}
-    store.ledger_path(sid).write_text(json.dumps(bad) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="格式无效"):
-        SessionConversationFiles(tmp_path).read(sid)
+def test_content_calls_invalid_parameters_usage_extensions_roundtrip(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    content = [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "https://example.test/image"}}, {"type": "vendor_unknown", "payload": {"nested": [1, 2]}}]
+    original = AIMessage(content=content, id="run--original", tool_calls=[{"id": "c", "name": "read_file", "args": {"path": "a.txt"}}],
+                         invalid_tool_calls=[{"id": "bad", "name": "broken", "args": "{bad json", "error": "invalid", "type": "invalid_tool_call"}],
+                         usage_metadata={"input_tokens": 3, "output_tokens": 0, "total_tokens": 3, "output_token_details": {"reasoning": 0}},
+                         additional_kwargs={"request_id": "request1", "vendor_extension": {"enabled": True}}, response_metadata={"finish_reason": "tool_calls"})
+    files.append_messages(SID, "t", [original])
+    row = files.read(SID)[0]
+    assert row["message"]["content"] == content
+    assert row["message"]["tool_calls"] == [{"id": "c", "name": "read_file", "arguments": {"path": "a.txt"}}]
+    assert "total_tokens" not in row["model"]["usage"]
+    assert row["model"]["usage"]["output_token_details"]["reasoning"] == 0
+    restored = files.messages(SID)[0]
+    assert (restored.id, restored.content, restored.tool_calls, restored.invalid_tool_calls, restored.usage_metadata) == (original.id, original.content, original.tool_calls, original.invalid_tool_calls, original.usage_metadata)
+    assert restored.additional_kwargs["vendor_extension"] == {"enabled": True}
+    files.append_messages(SID, "t", [restored])
+    assert files.latest_seq(SID) == 1
 
 
-def test_projection_read_deduplicates_repeated_message_id(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000014"
-    store.append_messages(sid, "run-1", [HumanMessage(content="hello")], scope=scope(sid))
-    row = store.read(sid)[0]
-    with store.ledger_path(sid).open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({**row, "seq": 2}) + "\n")
-    assert len(SessionConversationFiles(tmp_path).read(sid)) == 1
+def test_metadata_versions_containers_and_old_data_fail_closed(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    with pytest.raises(ValueError, match="metadata"):
+        files.read(SID)
+    files.ensure_metadata(SID)
+    assert files.read_metadata(SID) == {"schema_version": 2, "workspace_id": files.workspace_id, "session_id": SID}
+    with pytest.raises(ValueError, match="identity"):
+        SessionConversationFiles(tmp_path, "different").read(SID)
+    meta = files.metadata_path(SID)
+    meta.write_text(json.dumps({"schema_version": 99, "workspace_id": files.workspace_id, "session_id": SID}))
+    with pytest.raises(ValueError, match="version"):
+        files.append(SID, "one", message("hello"), turn_id="t")
+    assert json.loads(meta.read_text())["schema_version"] == 99
+    old = files.ledger_path(OTHER)
+    old.parent.mkdir()
+    old.write_text('{"seq":1,"scope":{"run_id":"old"},"message":{}}\n')
+    before = old.read_bytes()
+    with pytest.raises(ValueError, match="metadata"):
+        files.read(OTHER)
+    with pytest.raises(ValueError, match="metadata"):
+        files.append(OTHER, "new", message("new"), turn_id="t")
+    assert old.read_bytes() == before and not files.metadata_path(OTHER).exists()
 
 
-def test_backend_documentation_ledger_example_uses_contract_fields():
-    from pathlib import Path
-
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    example = readme.split("例如：\n\n```json\n", 1)[1].split("\n```", 1)[0]
-    row = validate_row(json.loads(example))
-    assert row["scope"]["request_id"] is None
-    assert row["origin"] == "user"
-
-
-def test_rebuilt_system_prompt_is_not_a_ledger_event(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000012"
-    for index in range(3):
-        store.append_messages(sid, "run-1", [
-            SystemMessage(content="bootstrap", additional_kwargs={"context_bootstrap": True}),
-            AIMessage(content=f"answer {index}"),
-        ], scope={**scope(sid), "step_id": f"step-{index}"})
-    assert [row["origin"] for row in store.read(sid)] == ["assistant"] * 3
+@pytest.mark.parametrize("damage", ["bad-json", "wrong-seq", "duplicate-id", "old-scope"])
+def test_complete_line_damage_is_not_rewritten(tmp_path, damage):
+    files = SessionConversationFiles(tmp_path)
+    files.append(SID, "one", message("hello"), turn_id="t")
+    row = files.read(SID)[0]
+    damaged = {**row, "seq": 4 if damage == "wrong-seq" else 2}
+    if damage == "old-scope":
+        damaged["scope"] = {"run_id": "old"}
+    with files.ledger_path(SID).open("a") as stream:
+        stream.write("broken\n" if damage == "bad-json" else json.dumps(damaged) + "\n")
+    before = files.ledger_path(SID).read_bytes()
+    with pytest.raises(ValueError):
+        SessionConversationFiles(tmp_path).read(SID)
+    assert files.ledger_path(SID).read_bytes() == before
 
 
-def test_explicit_maintenance_event_has_its_own_origin(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000013"
-    maintenance = SystemMessage(content="configuration changed", additional_kwargs={"system_maintenance": True, "kind": "config_change"})
-    store.append_messages(sid, "run-1", [maintenance], scope=scope(sid))
-    assert store.read(sid)[0]["origin"] == "system_maintenance"
-
-
-def test_separate_instances_share_append_sequence_and_tail_index(tmp_path):
-    first = SessionConversationFiles(tmp_path)
-    second = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000008"
-
-    first.append_messages(sid, "run-1", [HumanMessage(content="first", id="m1")], scope=scope(sid, "run-1"))
-    second.append_messages(sid, "run-2", [HumanMessage(content="second", id="m2")], scope=scope(sid, "run-2"))
-    first.append_messages(sid, "run-3", [HumanMessage(content="third", id="m3")], scope=scope(sid, "run-3"))
-
-    rows = second.read(sid)
-    assert [row["seq"] for row in rows] == [1, 2, 3]
-    offset = first.offset_after(sid, 2)
-    assert [row["message"]["data"]["content"] for row in first.read_tail(sid, after_seq=2, offset=offset)] == ["third"]
-
-
-def test_old_format_rows_are_rejected(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000009"
-    path = store.ledger_path(sid)
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        '{"seq":1,"message_id":"m1","message":{"content":"one"}}\n'
-        '{"seq":1,"message_id":"m2","message":{"content":"two"}}\n',
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="格式无效"):
-        store.read(sid)
-    with pytest.raises(ValueError, match="格式无效"):
-        store.append(sid, "m3", encoded("three"), scope=scope(sid), origin="user")
-
-
-def test_deleting_one_session_preserves_other_session_files(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    first = "00000000-0000-4000-8000-000000000003"
-    second = "00000000-0000-4000-8000-000000000004"
-    store.append(first, "m1", encoded("one"), scope=scope(first), origin="user")
-    store.append(second, "m2", encoded("two"), scope=scope(second), origin="user")
-    store.write_summary(second, "s1", {"content": "summary"})
-    store.delete_session(first)
-    assert not store.session_dir(first).exists()
-    assert store.ledger_path(second).exists()
-    assert store.summary_path(second, "s1").exists()
-
-
-def test_summary_pointer_is_resolved_and_missing_summary_fails_closed(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000005"
-    pointer = store.write_summary(sid, "summary-1", {"content": "durable summary"})
-    restarted = SessionConversationFiles(tmp_path)
-    assert restarted.read_summary(sid, pointer)["content"] == "durable summary"
-    with pytest.raises(ValueError, match="不可用"):
-        restarted.read_summary(sid, "summaries/missing.json")
-
-
-def test_successive_compression_summaries_keep_independent_pointers(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from langchain_core.messages import HumanMessage
-
-    from app.agent.state import new_agent_state, to_runtime_view
-
-    sid = "00000000-0000-4000-8000-000000000007"
-    store = SessionConversationFiles(tmp_path)
-    first = store.write_summary(sid, "summary-1", {"summary_id": "summary-1", "content": "first window"})
-    second = store.write_summary(sid, "summary-2", {"summary_id": "summary-2", "content": "merged window"})
-    monkeypatch.setattr("app.core.settings.get_settings", lambda: SimpleNamespace(workspace_path=tmp_path))
-    state = new_agent_state(
-        workspace_id="workspace", session_id=sid, message=HumanMessage(content="current"),
-    )
-    state["context"]["compression_count"] = 2
-    state["context"]["summary_pointer"] = second
-
-    assert store.read_summary(sid, first)["content"] == "first window"
-    assert to_runtime_view(state)["context_summary"] == "merged window"
-    assert state["context"]["window_size_tokens"] > 0
-
-
-def test_append_recovers_an_unterminated_crash_fragment_before_next_message(tmp_path):
-    store = SessionConversationFiles(tmp_path)
-    sid = "00000000-0000-4000-8000-000000000006"
-    store.append(sid, "m1", encoded("durable"), scope=scope(sid), origin="user")
-    with store.ledger_path(sid).open("ab") as stream:
+def test_unterminated_crash_tail_is_repaired(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    files.append(SID, "one", message("hello"), turn_id="t")
+    with files.ledger_path(SID).open("ab") as stream:
         stream.write(b'{"seq":2,"message_id":"torn"')
-
     restarted = SessionConversationFiles(tmp_path)
-    assert restarted.append(sid, "m2", encoded("recovered"), scope=scope(sid), origin="user") == (2, True)
-    assert [row["message_id"] for row in restarted.read(sid)] == ["m1", "m2"]
+    assert len(restarted.read(SID)) == 1
+    assert restarted.append(SID, "two", message("after"), turn_id="t") == (2, True)
+
+
+def test_parallel_duplicate_submissions_share_original_sequence(tmp_path):
+    files = [SessionConversationFiles(tmp_path) for _ in range(2)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda n: files[n % 2].append(SID, "same", message("same"), turn_id="t"), range(16)))
+    assert {seq for seq, _ in results} == {1}
+    assert sum(added for _, added in results) == 1
+    files[1].append(SID, "next", message("next"), turn_id="t")
+    assert files[0].latest_seq(SID) == 2
+
+
+def test_full_reference_integrity_export_and_delete_isolation(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    full = "first\n" + "x" * (INLINE_CONTENT_BYTES + 1)
+    files.append_messages(SID, "t", [ToolMessage(content=full, tool_call_id="c")])
+    reference = files.read(SID)[0]["message"]["content"][0]
+    assert files.read_reference(SID, reference).decode() == files.messages(SID)[0].content == full
+    summary = files.write_summary(SID, "s1", {"content": "summary"})
+    exported = files.export_files(SID)
+    assert {"ledger_meta.json", "ledger.jsonl", reference["path"], summary}.issubset(exported)
+    assert "workspace_id" not in json.loads(exported["ledger.jsonl"].splitlines()[0])
+    with pytest.raises(ValueError, match="outside"):
+        files.write_content(SID, "../escape.txt", "bad")
+    files.append(OTHER, "other", message("preserved"), turn_id="t")
+    shared = tmp_path / "checkpoint.sqlite"
+    shared.write_text("keep")
+    resource = files.session_dir(SID) / reference["path"]
+    resource.write_text("damaged")
+    with pytest.raises(ValueError, match="integrity"):
+        files.messages(SID)
+    resource.unlink()
+    with pytest.raises(ValueError, match="unavailable"):
+        files.read(SID)
+    files.delete_session(SID)
+    assert files.ledger_path(OTHER).exists() and shared.read_text() == "keep"
+
+
+def test_reference_must_be_complete_before_ledger_commit(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    result = {"role": "tool", "tool_call_id": "c", "content": [{"type": "reference", "path": "tool-results/missing.txt", "media_type": "text/plain", "bytes": 1, "sha256": "0" * 64}]}
+    with pytest.raises(ValueError, match="unavailable"):
+        files.append(SID, "one", result, turn_id="t", execution={"status": "succeeded"})
+    assert files.latest_seq(SID) == 0
+
+
+def test_audit_and_rebuilt_prompts_do_not_enter_model_window(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    files.append_messages(SID, "t", [SystemMessage(content="bootstrap", additional_kwargs={"context_bootstrap": True}), AIMessage(content="hello")])
+    files.append(SID, "audit", {"role": "system", "content": [{"type": "lifecycle", "subject": "turn"}]}, turn_id="t", execution={"status": "completed"})
+    assert len(files.read(SID)) == 2 and [m.content for m in files.messages(SID)] == ["hello"]
+    assert len(files.messages(SID, include_audit=True)) == 2
+
+
+def test_privacy_keeps_zero_usage_but_removes_hidden_reasoning_and_secrets(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    original = AIMessage(content=[{"type": "text", "text": "password=abc"}, {"type": "reasoning", "text": "private"}], additional_kwargs={"reasoning_content": "private", "request_id": "req"},
+                         tool_calls=[{"id": "c", "name": "shell", "args": {"api_key": "SECRET", "command": "echo ok"}}], usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "output_token_details": {"reasoning": 0}})
+    files.append_messages(SID, "t", [original])
+    encoded = files.ledger_path(SID).read_text()
+    assert "private" not in encoded and "SECRET" not in encoded and "abc" not in encoded
+    assert files.read(SID)[0]["model"]["usage"]["output_token_details"]["reasoning"] == 0
+
+
+def test_summary_missing_and_path_escape_fail_closed(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    one = files.write_summary(SID, "s1", {"content": "one"})
+    two = files.write_summary(SID, "s2", {"content": "two"})
+    assert files.read_summary(SID, one)["content"] == "one"
+    assert files.read_summary(SID, two)["content"] == "two"
+    with pytest.raises(ValueError):
+        files.read_summary(SID, "summaries/missing.json")
+    with pytest.raises(ValueError):
+        files.read_summary(SID, "../missing.json")
+
+
+def test_execution_domains_and_duplicate_aliases_are_strict():
+    row = {"seq": 1, "message_id": "m", "turn_id": "t", "timestamp": 0, "message": {"role": "tool", "tool_call_id": "c", "content": ""}, "execution": {"status": "succeeded"}}
+    validate_row(row)
+    with pytest.raises(ValueError, match="tool execution"):
+        validate_row({**row, "execution": {"status": "completed"}})
+    with pytest.raises(ValueError, match="tool execution"):
+        validate_row({**row, "interaction": {"id": "i", "kind": "approval"}, "execution": {"status": "completed"}})
+    with pytest.raises(ValueError, match="unexecuted"):
+        validate_row({**row, "execution": {"status": "denied", "attempt": 1}})
+    with pytest.raises(ValueError):
+        validate_row({**row, "scope": {"run_id": "old"}})
+
+
+def test_index_refresh_reads_only_new_lines_and_offset_cannot_skip_tail(tmp_path, monkeypatch):
+    first, second = SessionConversationFiles(tmp_path), SessionConversationFiles(tmp_path)
+    first.append(SID, "one", message("hello"), turn_id="t")
+    assert second.latest_seq(SID) == 1
+    first.append(SID, "two", message("world"), turn_id="t")
+    import app.storage.conversation_files as module
+    original = module.validate_row
+    validated = []
+    def counted(row):
+        validated.append(row["seq"])
+        return original(row)
+    monkeypatch.setattr(module, "validate_row", counted)
+    assert second.latest_seq(SID) == 2
+    assert validated == [2]
+    assert second.read_tail(SID, after_seq=1, offset=second.offset_after(SID, 2))[0]["seq"] == 2
+
+
+@pytest.mark.parametrize("pointer", ["../escape.txt", "/absolute.txt", "C:/escape.txt", "tool-results/../../escape.txt", "tool-results\\escape.txt", "summaries/escape.txt"])
+def test_content_reference_paths_are_restricted(tmp_path, pointer):
+    with pytest.raises(ValueError):
+        SessionConversationFiles(tmp_path).write_content(SID, pointer, "bad")
+
+
+@pytest.mark.parametrize("domain,status", [("tool", "completed"), ("turn", "succeeded"), ("step", "unknown"), ("model_request", "denied")])
+def test_lifecycle_domains_reject_foreign_statuses(domain, status):
+    row = {"seq": 1, "message_id": "m", "timestamp": 1, "turn_id": "t", "message": {"role": "system", "content": [{"type": "lifecycle", "subject": domain}]}, "execution": {"status": status}}
+    if domain == "tool":
+        row["message"]["tool_call_id"] = "c"
+    if domain == "model_request":
+        row["model"] = {"request_id": "req"}
+    with pytest.raises(ValueError, match="execution status"):
+        validate_row(row)
+
+
+def test_reference_inline_conflict_and_wrong_checksum_fail(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    reference = files.write_content(SID, "content/data.txt", "complete")
+    row = {"seq": 1, "message_id": "m", "timestamp": 1, "turn_id": "t", "message": {"role": "user", "content": [reference, {"type": "text", "text": "preview"}]}}
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_row(row)
+    with pytest.raises(ValueError, match="integrity"):
+        files.read_reference(SID, {**reference, "sha256": "0" * 64})
+
+
+def test_old_summaries_only_session_never_gets_new_metadata(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    directory = files.session_dir(SID) / "summaries"
+    directory.mkdir(parents=True)
+    (directory / "old.json").write_text('{"content":"old"}')
+    with pytest.raises(ValueError, match="metadata"):
+        files.ensure_metadata(SID)
+    assert not files.metadata_path(SID).exists()
+
+
+def test_original_vendor_identifier_is_never_sanitized_or_reinterpreted(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    original_id = "run--password=vendor-identifier"
+    files.append_messages(SID, "t", [AIMessage(content="hello", id=original_id)])
+    assert files.read(SID)[0]["message"]["id"] == files.messages(SID)[0].id == original_id
+
+
+def test_summary_maintenance_cannot_claim_missing_content(tmp_path):
+    files = SessionConversationFiles(tmp_path)
+    with pytest.raises(ValueError, match="不可用"):
+        files.append(SID, "m", {"role": "system", "content": [{"type": "lifecycle", "subject": "context"}]},
+                     extensions={"context": {"summary_ref": "summaries/missing.json", "covered_seq": [1, 1]}},
+                     execution={"status": "completed"})
+    assert files.latest_seq(SID) == 0

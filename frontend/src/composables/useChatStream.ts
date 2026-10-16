@@ -28,7 +28,10 @@ import {
   upsertToolExecution,
 } from '@/utils/agentStateStream'
 import { StreamEventInbox } from '@/utils/streamEventInbox'
-import { toolResultLooksLikeError } from '@/utils/toolDisplay'
+import { toolOutcome, displayContent } from '@/utils/historyProjection'
+import { sessionApi } from '@/api/session'
+import { isCanonicalAgentState, rejectLegacyTurnFields } from '@/utils/canonicalAgentState'
+import { normalizeInteractionRejection, terminalOutcome } from '@/utils/streamProtocol'
 
 export interface ChatStreamState {
   messages: Ref<ChatUiMessage[]>
@@ -50,10 +53,10 @@ export interface ChatStreamState {
 }
 
 interface StreamGuard {
-  runId: string | null
+  turnId: string | null
   lastSeq: number
   eventIds: Set<string>
-  retiredRunIds: Set<string>
+  retiredTurnIds: Set<string>
   lastRevision: number
   terminal: boolean
 }
@@ -61,20 +64,24 @@ interface StreamGuard {
 const streamGuards = new WeakMap<object, StreamGuard>()
 
 function acceptAgentEvent(ctx: ChatStreamState, event: StreamEvent): boolean {
-  const runId = event.run_id || event.state?.scope.run_id || null
+  const sessionId = event.session_id || event.state?.scope.session_id
+  if (sessionId && ctx.currentSessionId.value && sessionId !== ctx.currentSessionId.value) return false
+  rejectLegacyTurnFields(event as unknown as Record<string, unknown>)
+  if (event.state && !isCanonicalAgentState(event.state)) throw new Error('不支持的 checkpoint 协议')
+  const turnId = event.turn_id || event.state?.scope.turn_id || null
   const guard = streamGuards.get(ctx) || {
-    runId,
+    turnId,
     lastSeq: 0,
     eventIds: new Set<string>(),
-    retiredRunIds: new Set<string>(),
+    retiredTurnIds: new Set<string>(),
     lastRevision: -1,
     terminal: false,
   }
 
-  if (guard.runId && runId && guard.runId !== runId) {
-    if (event.type === 'session' && !guard.retiredRunIds.has(runId)) {
-      guard.retiredRunIds.add(guard.runId)
-      guard.runId = runId
+  if (guard.turnId && turnId && guard.turnId !== turnId) {
+    if (event.type === 'session' && !guard.retiredTurnIds.has(turnId)) {
+      guard.retiredTurnIds.add(guard.turnId)
+      guard.turnId = turnId
       guard.lastSeq = 0
       guard.eventIds.clear()
       guard.lastRevision = -1
@@ -84,10 +91,15 @@ function acceptAgentEvent(ctx: ChatStreamState, event: StreamEvent): boolean {
     }
   }
   const eventId = event.event_id
-  if (eventId && guard.eventIds.has(eventId)) return false
   if (guard.terminal) return false
   const revision = event.state?.state_revision
   if (typeof revision === 'number' && revision < guard.lastRevision) return false
+  if (event.type === 'state_sync' && event.state) {
+    guard.lastSeq = typeof event.seq === 'number' ? event.seq : 0
+    guard.eventIds.clear()
+  }
+  if (eventId && guard.eventIds.has(eventId)) return false
+  if (typeof revision === 'number' && guard.lastRevision >= 0 && revision > guard.lastRevision + 1 && event.type !== 'state_sync') event.gap_detected = true
 
   const seq = typeof event.seq === 'number' ? event.seq : undefined
   if (seq !== undefined && seq > guard.lastSeq + 1 && guard.lastSeq > 0) {
@@ -95,11 +107,11 @@ function acceptAgentEvent(ctx: ChatStreamState, event: StreamEvent): boolean {
   }
   if (seq !== undefined && seq < guard.lastSeq) return false
 
-  guard.runId = runId || guard.runId
+  guard.turnId = turnId || guard.turnId
   if (seq !== undefined) guard.lastSeq = Math.max(guard.lastSeq, seq)
   if (typeof revision === 'number') guard.lastRevision = Math.max(guard.lastRevision, revision)
   if (eventId) guard.eventIds.add(eventId)
-  if (event.type === 'done' || event.type === 'error') guard.terminal = true
+  if (event.type === 'error' || (event.type === 'state_sync' && terminalOutcome(event)) || (event.type === 'done' && (!ctx.pendingApproval.value && !ctx.pendingAskUser.value || event.cancelled || event.handoff))) guard.terminal = true
   streamGuards.set(ctx, guard)
   return true
 }
@@ -110,13 +122,10 @@ function ensureAgentState(ctx: ChatStreamState, event: StreamEvent): AgentStateS
   if (!shouldAcceptAgentEvent(state, event)) return null
   const nextStatus = mapStreamEventToAgentStatus(event)
   if (isTerminalAgentStatus(state.status) && !isTerminalAgentStatus(nextStatus)) return null
-  if (event.run_id && !state.runId) state.runId = event.run_id
-  const confirmedSeq = typeof event.state?.state_revision === 'number'
-    ? event.state.state_revision
-    : typeof event.seq === 'number'
-      ? event.seq
-      : undefined
-  if (typeof confirmedSeq === 'number') state.confirmedSeq = confirmedSeq
+  if (event.turn_id && !state.turnId) state.turnId = event.turn_id
+  if (typeof event.state?.state_revision === 'number') state.confirmedRevision = event.state.state_revision
+  if (typeof event.seq === 'number') state.transportSeq = event.seq
+  if (typeof event.state?.ledger_pointer?.applied_seq === 'number') state.ledgerSeq = event.state.ledger_pointer.applied_seq
   if (typeof event.step === 'number') state.currentStep = event.step
   if (typeof event.max_steps === 'number') state.maxSteps = event.max_steps
   return state
@@ -128,10 +137,13 @@ function projectCanonicalState(ctx: ChatStreamState, event: StreamEvent, state: 
   const step = canonical.current_step
   if (state) {
     if (typeof step.index === 'number') state.currentStep = step.index
-    state.maxSteps = canonical.max_step_every_run
+    state.maxSteps = canonical.max_step_every_turn
+    state.currentTask = canonical.current_task
+    state.currentStepId = step.step_id
+    state.requestId = step.model?.request_id || null
     if (canonical.terminal_reason) state.terminalLabel = canonical.terminal_reason
-    if (canonical.run_status === 'waiting_user') state.requiresUserAction = true
-    const stepId = canonical.scope.step_id
+    if (canonical.turn_status === 'waiting_user') state.requiresUserAction = true
+    const stepId = canonical.current_step.step_id
     if (!stepId) return
     const nodeId = `checkpoint:${stepId}`
     const stepName = typeof step.step_name === 'string' ? step.step_name : 'agent'
@@ -147,7 +159,7 @@ function projectCanonicalState(ctx: ChatStreamState, event: StreamEvent, state: 
         kind: stepName === 'tools' ? 'tool' : 'phase',
         status: stepStatus,
         label: stepName === 'tools' ? '工具执行' : 'Agent 执行',
-        startedAt: typeof step.started_at === 'number' ? step.started_at * 1000 : Date.now(),
+        startedAt: typeof step.started_at === 'number' ? step.started_at : Date.now(),
         active: !stepStatusIsTerminal(step.step_status),
       }
       state.nodes.push(checkpointNode)
@@ -155,7 +167,7 @@ function projectCanonicalState(ctx: ChatStreamState, event: StreamEvent, state: 
     checkpointNode.status = stepStatus
     checkpointNode.active = !stepStatusIsTerminal(step.step_status)
     checkpointNode.summary = typeof step.input_summary === 'string' ? step.input_summary.slice(0, 500) : checkpointNode.summary
-    if (typeof step.ended_at === 'number') checkpointNode.endedAt = step.ended_at * 1000
+    if (typeof step.ended_at === 'number') checkpointNode.endedAt = step.ended_at
     if (typeof step.duration_ms === 'number') checkpointNode.durationMs = step.duration_ms
     const currentNode = state.nodes[state.nodes.length - 1]
     if (currentNode && currentNode.active && currentNode.summary === undefined) {
@@ -164,26 +176,29 @@ function projectCanonicalState(ctx: ChatStreamState, event: StreamEvent, state: 
     for (const call of Array.isArray(step.tool_calls) ? step.tool_calls : []) {
       if (!call || typeof call !== 'object') continue
       const item = call as Record<string, unknown>
-      if (typeof item.call_id !== 'string' || typeof item.tool_name !== 'string') continue
+      if (typeof item.call_id !== 'string') continue
+      const existing = state.toolExecutions.find(call => call.toolId === item.call_id && call.stepId === stepId)
       const startedAt = typeof item.started_at === 'number' ? item.started_at : Date.now()
-      const status = item.status === 'success' ? 'done'
-        : item.status === 'failed' ? 'error'
-          : item.status === 'cancelled' ? 'cancelled'
-            : item.status === 'denied' ? 'policy_denied' : 'running'
+      const status = toolOutcome(item.status)
       upsertToolExecution(state, {
         toolId: item.call_id,
-        toolName: item.tool_name,
+        toolName: typeof item.tool_name === 'string' ? item.tool_name : existing?.toolName || '工具',
+        stepId, definitionSeq: typeof item.definition_seq === 'number' ? item.definition_seq : undefined,
+        resultSeq: typeof item.result_seq === 'number' ? item.result_seq : undefined,
+        attempt: typeof item.attempt === 'number' ? item.attempt : undefined,
         status,
-        inputs: redactToolInputs(item.input && typeof item.input === 'object' ? item.input as Record<string, unknown> : undefined),
+        inputs: existing?.inputs || {},
         outputs: typeof item.output_summary === 'string' ? item.output_summary.slice(0, 500) : null,
         progressMessage: null,
         startedAt,
         endedAt: typeof item.ended_at === 'number' ? item.ended_at : undefined,
         redacted: true,
       })
+      resolveToolReferences(ctx, state, stepId, item)
     }
   }
-  const todos = canonical.task_details?.todos
+  const runtime = canonical.task_details?._runtime as { todos?: unknown } | undefined
+  const todos = runtime?.todos
   if (Array.isArray(todos)) {
     ctx.sessionTodos.value = todos as SessionTodoItem[]
     if (state) {
@@ -198,6 +213,50 @@ function projectCanonicalState(ctx: ChatStreamState, event: StreamEvent, state: 
 
 function stepStatusIsTerminal(value: unknown): boolean {
   return ['completed', 'failed', 'cancelled', 'skipped'].includes(String(value || ''))
+}
+
+const referenceLoads = new WeakMap<AgentStateStream, Set<string>>()
+function resolveToolReferences(ctx: ChatStreamState, state: AgentStateStream, stepId: string, call: Record<string, unknown>) {
+  const sessionId = ctx.currentSessionId.value
+  const turnId = state.turnId
+  const callId = String(call.call_id)
+  if (!sessionId || !turnId) return
+  const loaded = referenceLoads.get(state) || new Set<string>()
+  referenceLoads.set(state, loaded)
+  for (const [kind, seq] of [['definition', call.definition_seq], ['result', call.result_seq]] as const) {
+    if (typeof seq !== 'number') continue
+    const key = `${stepId}:${callId}:${kind}:${seq}`
+    if (loaded.has(key)) continue
+    loaded.add(key)
+    sessionApi.getLedgerMessage(sessionId, seq).then(payload => {
+      if (ctx.currentSessionId.value !== sessionId || ctx.agentState?.value !== state || state.turnId !== turnId) return
+      const row = payload.message
+      if (payload.session_id !== sessionId || row.turn_id !== turnId || row.seq !== seq) throw new Error('工具引用归属不一致')
+      const execution = state.toolExecutions.find(item => item.toolId === callId && item.stepId === stepId)
+      if (!execution) return
+      if (kind === 'definition') {
+        const definition = row.message.tool_calls?.find(item => item.id === callId)
+        if (!definition) throw new Error('工具调用定义不可用')
+        execution.toolName = definition.name
+        execution.inputs = redactToolInputs(definition.arguments)
+      } else {
+        if (row.message.tool_call_id !== callId) throw new Error('工具结果配对不一致')
+        execution.outputs = displayContent(row.message.content).slice(0, 500) || '完整结果已保存，展开查看'
+        execution.status = toolOutcome(row.execution?.status)
+      }
+      const segment = ctx.messages.value.filter(message => message.turnId === turnId).flatMap(message => message.segments || []).find((item): item is ToolSegment => item.type === 'tool' && item.toolCallId === callId && (!item.stepId || item.stepId === stepId))
+      if (segment) {
+        segment.tool = execution.toolName; segment.args = execution.inputs
+        segment.definitionSeq = typeof call.definition_seq === 'number' ? call.definition_seq : undefined
+        segment.resultSeq = typeof call.result_seq === 'number' ? call.result_seq : undefined
+      }
+    }).catch(error => {
+      loaded.delete(key)
+      if (ctx.currentSessionId.value !== sessionId || ctx.agentState?.value !== state) return
+      const execution = state.toolExecutions.find(item => item.toolId === callId && item.stepId === stepId)
+      if (execution) execution.outputs = error instanceof Error ? error.message : '工具内容不可用'
+    })
+  }
 }
 
 function syncAgentStatus(ctx: ChatStreamState, event: StreamEvent, summary?: string): AgentStateStream | null {
@@ -242,11 +301,24 @@ export function applyChatStreamEvent(
   },
   options: { skipEnvelopeGuard?: boolean } = {},
 ): { assistantMsgIndex: number; currentTextSegmentId: number } {
+  event = normalizeInteractionRejection(event)
   if (!options.skipEnvelopeGuard && !acceptAgentEvent(ctx, event)) return session
   if (event.type === 'state_sync' && event.state) {
     const state = ensureAgentState(ctx, event)
     projectCanonicalState(ctx, event, state)
     if (state) setAgentStateSyncing(state, false)
+    const status = event.state.turn_status
+    const waiting = status === 'waiting_user'
+    if (state) state.requiresUserAction = waiting
+    if (!waiting) { ctx.pendingApproval.value = null; ctx.pendingAskUser.value = null }
+    if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'handoff') {
+      const terminal = status === 'failed' ? 'error' : status
+      ctx.markRunTerminal(terminal === 'completed' ? 'done' : terminal)
+      if (state) finalizeAgentState(state, terminal, event.state.terminal_reason || (terminal === 'completed' ? '本轮完成' : '本轮已结束'))
+      ctx.activeStage.value = null
+    } else if (state) {
+      advanceAgentState(state, waiting ? 'awaiting_user' : status === 'created' ? 'initializing' : event.state.current_step.step_name === 'tools' ? 'tool_calling' : 'reasoning')
+    }
     if (ctx.activeStage.value === 'synchronizing') ctx.activeStage.value = null
     return session
   }
@@ -266,6 +338,7 @@ export function applyChatStreamEvent(
         role: 'assistant',
         content: '',
         timestamp: new Date(),
+        turnId: event.turn_id || event.state?.scope.turn_id,
         segments: currentSegments,
       })
     } else {
@@ -282,8 +355,15 @@ export function applyChatStreamEvent(
       ctx.currentSessionId.value = event.session_id
       ctx.saveCurrentSession(event.session_id)
     }
+    const user = [...ctx.messages.value].reverse().find(message => message.role === 'user')
+    if (user && !user.turnId) user.turnId = event.turn_id || event.state?.scope.turn_id
   } else if (event.type === 'stage') {
     syncAgentStatus(ctx, event)
+    if (event.stage === 'interaction_timeout') {
+      ctx.pendingApproval.value = null; ctx.pendingAskUser.value = null
+      if (event.error) message.warning(event.error)
+    }
+    if (event.stage === 'interaction_rejected' && event.error) message.warning(event.error)
     const status = event.status || 'started'
     if (status === 'started' || status === 'background' || status === 'degraded') {
       ctx.activeStage.value = event.stage || null
@@ -295,8 +375,8 @@ export function applyChatStreamEvent(
     ctx.activeStage.value = 'model_stream'
     for (const seg of currentSegments) {
       if (seg.type === 'tool' && seg.status === 'running') {
-        seg.status = 'done'
-        if (!seg.result) seg.result = '（已结束）'
+        seg.status = 'unknown'
+        if (!seg.result) seg.result = '工具实际结果未知'
       }
     }
     currentTextSegmentId = Date.now()
@@ -331,8 +411,9 @@ export function applyChatStreamEvent(
       type: 'tool' as const,
       id: Date.now(),
       tool: event.tool || '',
-      args: event.args || {},
+      args: redactToolInputs(event.args),
       toolCallId,
+      stepId: event.step_id || event.state?.current_step.step_id || undefined,
       startedAt,
       status: 'running' as const,
     }
@@ -341,6 +422,7 @@ export function applyChatStreamEvent(
       upsertToolExecution(state, {
         toolId: toolCallId,
         toolName: event.tool || '',
+        stepId: event.step_id || event.state?.current_step.step_id || undefined,
         status: 'running',
         inputs: redactToolInputs(event.args),
         outputs: null,
@@ -360,7 +442,6 @@ export function applyChatStreamEvent(
     const resultText = event.result || ''
     const snapshotMatch = resultText.match(/\[snapshot_id=([0-9a-f]+)\]/i)
     const snapshotId = snapshotMatch?.[1] || null
-    const policyDenied = /\[policy_denied\]/i.test(resultText)
     let undoStatus: ToolSegment['undoStatus'] = snapshotId ? 'available' : null
     if (/跨 session|其他会话/i.test(resultText)) undoStatus = 'cross_session'
     else if (/冲突/i.test(resultText)) undoStatus = 'conflict'
@@ -379,12 +460,9 @@ export function applyChatStreamEvent(
       lastToolSegment.endedAt = Date.now()
       lastToolSegment.reasonCode = event.reason_code || null
       lastToolSegment.toolResultRef = event.result_ref || null
+      lastToolSegment.resultSeq = event.result_seq || lastToolSegment.resultSeq
       lastToolSegment.toolResultTruncated = Boolean(event.result_truncated)
-      lastToolSegment.status = policyDenied
-        ? 'policy_denied'
-        : toolResultLooksLikeError(event.result)
-          ? 'error'
-          : 'done'
+      lastToolSegment.status = toolOutcome(event.execution?.status || event.status)
       lastToolSegment.snapshotId = snapshotId
       lastToolSegment.undoStatus = undoStatus
       if (state) upsertToolExecution(state, toolExecutionFromSegment(lastToolSegment))
@@ -400,11 +478,8 @@ export function applyChatStreamEvent(
         startedAt: endedAt,
         endedAt,
         reasonCode: event.reason_code || null,
-        status: policyDenied
-          ? 'policy_denied'
-          : toolResultLooksLikeError(event.result)
-            ? 'error'
-            : 'done',
+        resultSeq: event.result_seq,
+        status: toolOutcome(event.execution?.status || event.status),
         snapshotId,
         undoStatus,
       })
@@ -454,13 +529,13 @@ export function applyChatStreamEvent(
       const mode =
         event.mode === 'handoff_and_stop' ? 'handoff_and_stop' : 'answer_and_continue'
       ctx.pendingAskUser.value = {
-        runId: event.run_id || '',
+        turnId: event.turn_id || event.state?.scope.turn_id || '',
+        interruptId: event.interrupt_id || (event.state?.pending_interaction?.id as string | undefined),
         prompt: event.prompt || event.reason || '需要你补充一点信息',
         options: event.options || [],
         allowMultiple: Boolean(event.allow_multiple),
-        interruptId: event.interrupt_id,
         toolCallId: event.tool_call_id,
-        stepId: event.state?.scope.step_id ?? undefined,
+        stepId: event.state?.current_step.step_id ?? undefined,
         mode,
         terminalOnAck: Boolean(event.terminal_on_ack) || mode === 'handoff_and_stop',
       }
@@ -468,12 +543,13 @@ export function applyChatStreamEvent(
       ctx.pendingAskUser.value = null
       const preview = event.preview as PendingApproval['preview'] | undefined
       ctx.pendingApproval.value = {
-        runId: event.run_id || '',
+        turnId: event.turn_id || event.state?.scope.turn_id || '',
+        interruptId: event.interrupt_id || (event.state?.pending_interaction?.id as string | undefined),
         tool: event.tool || '未知工具',
-        args: event.args || {},
+        args: redactToolInputs(event.args),
         reason: event.reason || '此工具需要您的确认',
         toolCallId: event.tool_call_id,
-        stepId: event.state?.scope.step_id ?? undefined,
+        stepId: event.state?.current_step.step_id ?? undefined,
         reasonCode: event.reason_code,
         preview: preview || null,
       }
@@ -501,17 +577,15 @@ export function applyChatStreamEvent(
     const isHandoffDone = Boolean(event.handoff || event.terminal_reason === 'handoff')
     if (
       (ctx.pendingApproval.value || ctx.pendingAskUser.value) &&
+      !['completed', 'failed', 'cancelled', 'handoff'].includes(event.state?.turn_status || '') &&
       !event.cancelled &&
       !isHandoffDone
     ) {
       return { assistantMsgIndex, currentTextSegmentId }
     }
     const state = syncAgentStatus(ctx, event)
-    const terminal = event.cancelled
-      ? 'cancelled'
-      : isHandoffDone
-        ? 'handoff'
-        : 'done'
+    const resolvedTerminal = terminalOutcome(event)
+    const terminal = resolvedTerminal === 'completed' || !resolvedTerminal ? 'done' : resolvedTerminal
     ctx.markRunTerminal(terminal)
     ctx.finalizeRunningToolSegments(currentSegments)
     if (event.content) {
@@ -534,6 +608,7 @@ export function applyChatStreamEvent(
             role: 'assistant',
             content: '',
             timestamp: new Date(),
+            turnId: event.turn_id || event.state?.scope.turn_id,
             segments: currentSegments,
           })
         }
@@ -558,8 +633,8 @@ export function applyChatStreamEvent(
     if (state) {
       finalizeAgentState(
         state,
-        event.cancelled ? 'cancelled' : isHandoffDone ? 'handoff' : 'completed',
-        isHandoffDone ? '已交还用户' : event.cancelled ? '本轮已取消' : '本轮完成',
+        resolvedTerminal || 'completed',
+        resolvedTerminal === 'error' ? (event.state?.terminal_reason || '本轮失败') : isHandoffDone ? '已交还用户' : event.cancelled ? '本轮已取消' : '本轮完成',
       )
     }
   }
@@ -582,6 +657,7 @@ const BATCHABLE_EVENT_TYPES = new Set<StreamEvent['type']>([
 
 export function createChatStreamEventBatcher(
   ctx: ChatStreamState,
+  initial?: { assistantMsgIndex: number; currentSegments: MessageSegment[]; currentTextSegmentId: number },
 ): {
   handle: (event: StreamEvent) => void
   flush: () => void
@@ -589,9 +665,9 @@ export function createChatStreamEventBatcher(
   const inbox = new StreamEventInbox()
   const readyQueue: StreamEvent[] = []
   const session = {
-    assistantMsgIndex: -1,
-    currentSegments: [] as MessageSegment[],
-    currentTextSegmentId: -1,
+    assistantMsgIndex: initial?.assistantMsgIndex ?? -1,
+    currentSegments: initial?.currentSegments || [] as MessageSegment[],
+    currentTextSegmentId: initial?.currentTextSegmentId ?? -1,
   }
   let scheduled = false
   let gapTimer: ReturnType<typeof setTimeout> | null = null
@@ -604,11 +680,11 @@ export function createChatStreamEventBatcher(
       if (ctx.agentState?.value) setAgentStateSyncing(ctx.agentState.value, true)
     }
     if (drain.gapDetected && !syncRequested) {
-      const runId = inbox.currentRunId
+      const turnId = inbox.currentTurnId
       const sessionId = ctx.currentSessionId.value
-      if (runId && sessionId) {
+      if (turnId && sessionId) {
         syncRequested = true
-        chatWs.requestStateSync(runId, sessionId)
+        chatWs.requestStateSync(turnId, sessionId)
       }
     }
   }
@@ -696,6 +772,8 @@ export function createChatStreamEventBatcher(
   }
 
   const handle = (event: StreamEvent) => {
+    const sessionId = event.session_id || event.state?.scope.session_id
+    if (sessionId && ctx.currentSessionId.value && sessionId !== ctx.currentSessionId.value) return
     if (event.type === 'session') syncRequested = false
     const drain = inbox.push(event)
     enqueueDrain(drain)

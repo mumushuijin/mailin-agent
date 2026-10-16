@@ -14,7 +14,8 @@ from app.services.chat_service import ChatService
 
 
 @pytest.mark.asyncio
-async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_path):
+@pytest.mark.parametrize("tool_status", ["succeeded", "failed", "cancelled", "denied", "skipped", "unknown"])
+async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_path, tool_status):
     settings = Settings(runtime_root=tmp_path / "runtime", openai_api_key="test-key")
     init_workspace(settings)
     project = tmp_path / "project"
@@ -43,7 +44,7 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
 
     async def tools(state, _config):
         calls.append("tools")
-        return {"messages": [ToolMessage(content="contents", tool_call_id="call-1", name="read_file")]}
+        return {"messages": [ToolMessage(content="contents", tool_call_id="call-1", name="read_file", additional_kwargs={"tool_status": tool_status})]}
 
     monkeypatch.setattr(graph_module, "call_agent", agent)
     monkeypatch.setattr(graph_module, "call_tools", tools)
@@ -56,14 +57,15 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     chat = ChatService()
     chat._schedule_background = lambda _name, _factory: None
     sid = chat.session_store.create(str(project))
-    events = [event async for event in chat.iter_chat_events("question", sid, run_id="run-1")]
+    events = [event async for event in chat.iter_chat_events("question", sid, turn_id="run-1")]
 
-    assert calls == ["agent", "tools", "agent"]
+    assert calls == (["agent", "tools"] if tool_status == "unknown" else ["agent", "tools", "agent"])
     assert any(event.type == "step_start" for event in events)
     assert any(event.type == "step_finish" for event in events)
     assert any(event.type == "tool_start" for event in events)
     assert any(event.type == "tool_finish" for event in events)
-    assert any(event.type == "done" and event.data.get("content") == "final answer" for event in events)
+    if tool_status != "unknown":
+        assert any(event.type == "done" and event.data.get("content") == "final answer" for event in events)
     for event in events:
         ws = to_ws(event)
         sse = to_sse(event)
@@ -72,17 +74,25 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
 
     snapshot = await graph.aget_state(make_thread_config(sid))
     state = dict(snapshot.values)
-    assert state["run_status"] == "completed"
-    assert state["context"]["working_message"][-1].content == "final answer"
+    expected_turn_status = "failed" if tool_status == "unknown" else "completed"
+    assert state["turn_status"] == expected_turn_status
+    if tool_status != "unknown":
+        assert state["context"]["working_message"][-1].content == "final answer"
     rows = chat.conversation_files.read(sid)
-    assert rows and rows[-1]["message"]["data"]["content"] == "final answer"
-    assert [row["origin"] for row in rows] == ["user", "assistant", "tool", "assistant"]
-    assert len({row["scope"]["run_id"] for row in rows}) == 1
-    assert rows[0]["scope"]["request_id"] is None
-    assert rows[1]["scope"]["request_id"] != rows[3]["scope"]["request_id"]
-    assert rows[2]["scope"]["request_id"] is None
-    assert rows[1]["scope"]["step_id"] != rows[2]["scope"]["step_id"] != rows[3]["scope"]["step_id"]
-    assert not any(row["message"]["type"] == "system" for row in rows)
+    conversation = [row for row in rows if row["message"]["role"] != "system"]
+    if tool_status != "unknown":
+        assert conversation[-1]["message"]["content"] == "final answer"
+    assert [row["message"]["role"] for row in conversation] == (["user", "assistant", "tool"] if tool_status == "unknown" else ["user", "assistant", "tool", "assistant"])
+    outcome_row = next(row for row in conversation if row["message"]["role"] == "tool")
+    finish = next(event for event in events if event.type == "tool_finish")
+    assert finish.data["status"] == finish.data["execution"]["status"] == outcome_row["execution"]["status"] == tool_status
+    assert finish.data["result_seq"] == outcome_row["seq"]
+    assert {row["turn_id"] for row in rows} == {"run-1"}
+    assert "model" not in conversation[0] and "model" not in conversation[2]
+    if tool_status != "unknown":
+        assert conversation[1]["model"]["request_id"] != conversation[3]["model"]["request_id"]
+    assert rows[-1]["execution"]["status"] == expected_turn_status
+    assert not any("scope" in row or "origin" in row for row in rows)
     old_fingerprint = state["context"].get("bootstrap_fingerprint")
     monkeypatch.setattr(chat, "_bootstrap_fingerprint", lambda _session: "new-bootstrap-version")
     refreshed = chat._refresh_stale_context(sid, state)
@@ -92,11 +102,23 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     pointer = chat.conversation_files.write_summary(sid, "summary-1", {"content": "saved summary"})
     assert chat.conversation_files.read_summary(sid, pointer)["content"] == "saved summary"
     chat.conversation_files.append(
-        sid, "tail-1", {"type": "human", "data": {"content": "tail"}},
-        scope={**state["scope"], "request_id": None, "step_id": None}, origin="user",
+        sid, "tail-1", {"role": "user", "content": "tail"},
+        turn_id=state["scope"]["turn_id"],
     )
     recovered = chat._recover_ledger_tail(sid, state)
     assert recovered["ledger_pointer"]["applied_seq"] == rows[-1]["seq"] + 1
+    events2 = [event async for event in chat.iter_chat_events("hello again", sid, turn_id="turn-2")]
+    assert any(event.type == "done" for event in events2)
+    next_state = dict((await graph.aget_state(make_thread_config(sid))).values)
+    assert next_state["scope"]["turn_id"] == "turn-2"
+    assert next_state["turn_status"] == "completed"
+    assert next_state["tasks"] == [] and next_state["current_task"] is None
+    assert next_state["checkpoint_uid"] != state["checkpoint_uid"]
+    assert not any(message.type == "system" for message in next_state["context"]["working_message"])
+    frames = [event.state for event in events if event.state]
+    assert [frame["state_revision"] for frame in frames] == sorted(frame["state_revision"] for frame in frames)
+    steps = [frame["current_step"]["step_id"] for frame in frames if frame["current_step"]["step_name"] == "agent"]
+    assert len(set(steps)) == (1 if tool_status == "unknown" else 2)
 
 
 async def _done():

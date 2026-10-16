@@ -8,17 +8,17 @@ import { advanceAgentState, createAgentStateStream, finalizeAgentState } from '@
 import type { AgentStateStream, ChatUiMessage } from '@/types/chat-ui'
 
 const createCompletedState = (
-  turnId: number,
-  runId: string,
+  turnKey: number,
+  turnId: string,
   terminalStatus: 'completed' | 'error',
   terminalLabel: string,
 ): AgentStateStream => {
-  const state = createAgentStateStream(turnId, runId, turnId * 100)
-  advanceAgentState(state, 'planning', turnId * 100 + 10)
-  advanceAgentState(state, 'tool_calling', turnId * 100 + 20)
-  advanceAgentState(state, 'observing', turnId * 100 + 30)
-  finalizeAgentState(state, terminalStatus, terminalLabel, turnId * 100 + 40)
-  state.currentStep = turnId
+  const state = createAgentStateStream(turnKey, turnId, turnKey * 100)
+  advanceAgentState(state, 'planning', turnKey * 100 + 10)
+  advanceAgentState(state, 'tool_calling', turnKey * 100 + 20)
+  advanceAgentState(state, 'observing', turnKey * 100 + 30)
+  finalizeAgentState(state, terminalStatus, terminalLabel, turnKey * 100 + 40)
+  state.currentStep = turnKey
   state.todoCompleted = terminalStatus === 'completed' ? 2 : 1
   state.todoTotal = 2
   return state
@@ -37,7 +37,7 @@ const createProgress = (state: AgentStateStream) => ({
 const createAssistantMessage = (
   id: number,
   result: string,
-  status: 'done' | 'error',
+  status: 'succeeded' | 'failed',
 ): ChatUiMessage => ({
   id,
   role: 'assistant',
@@ -58,7 +58,7 @@ const createAssistantMessage = (
       tool: 'run_shell',
       args: { command: 'npm test' },
       result: '第二个工具独立完成。',
-      status: 'done',
+      status: 'succeeded',
     },
     {
       type: 'text',
@@ -72,8 +72,8 @@ describe('Agent state stream chat integration', () => {
   it('keeps consecutive turns, tool ordering, todo counts, and terminal summaries distinct', async () => {
     const firstState = createCompletedState(1, 'run-1', 'completed', '已完成')
     const secondState = createCompletedState(2, 'run-2', 'error', '执行失败')
-    const firstMessage = createAssistantMessage(11, '读取成功。', 'done')
-    const secondMessage = createAssistantMessage(12, `${'Error: stack trace\n'.repeat(40)}secret-token`, 'error')
+    const firstMessage = createAssistantMessage(11, '读取成功。', 'succeeded')
+    const secondMessage = createAssistantMessage(12, `${'Error: stack trace\n'.repeat(40)}secret-token`, 'failed')
 
     const app = createSSRApp({
       render: () => h('main', [
@@ -99,7 +99,7 @@ describe('Agent state stream chat integration', () => {
 
   it('keeps narrow-layout contracts on the actual timeline and message components', async () => {
     const state = createCompletedState(3, 'run-3', 'completed', '已完成')
-    const message = createAssistantMessage(13, '短结果', 'done')
+    const message = createAssistantMessage(13, '短结果', 'succeeded')
     const app = createSSRApp({
       render: () => h('section', [
         h(AgentStateTimeline, { progress: createProgress(state), state }),

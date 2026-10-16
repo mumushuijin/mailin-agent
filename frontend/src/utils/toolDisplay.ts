@@ -138,7 +138,7 @@ export interface ToolActionDisplay {
   targetKind?: 'path' | 'command' | 'value'
 }
 
-type ToolActionStatus = 'running' | 'done' | 'error' | 'cancelled' | 'policy_denied'
+type ToolActionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'denied' | 'skipped' | 'unknown'
 
 const COMMAND_KEYS = new Set(['command', 'cmd', 'script', 'shell'])
 const PATH_KEYS = new Set(['path', 'file_path', 'file', 'filename', 'directory', 'dir', 'source', 'src', 'destination', 'dest'])
@@ -230,14 +230,14 @@ export function formatToolArgs(args: Record<string, unknown>): string {
 }
 
 // 格式化工具结果显示
-export function formatToolResult(result: string | undefined): string {
+export function formatToolResult(result: string | undefined, maxLength = 500): string {
   if (!result) return ''
   const redacted = result.replace(
     /(authorization|token|secret|password|api[-_]?key|private[-_]?key)\s*[:=]\s*([^\s,;]+)/gi,
     '$1: [已脱敏]',
   )
   // 截断长结果
-  return redacted.length > 500 ? redacted.slice(0, 497) + '...' : redacted
+  return redacted.length > maxLength ? redacted.slice(0, maxLength - 3) + '...' : redacted
 }
 
 export function toolResultLooksLikeError(result?: string): boolean {

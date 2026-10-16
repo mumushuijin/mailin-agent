@@ -3,8 +3,9 @@ import { ref, watch, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { Input, Button, message, Tag } from 'ant-design-vue'
 import { SendOutlined, PlusOutlined, LoadingOutlined, FolderOpenOutlined } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
-import { sessionApi, type ChatMessage as ApiChatMessage, type Session } from '@/api/session'
-import { chatApi, type ApiUsage, type ContextUsage } from '@/api/chat'
+import { sessionApi, type ChatMessage as ApiChatMessage, type Session, type TurnTimeline } from '@/api/session'
+import { buildHistoryMessages, buildHistoryTimelines, displayContent } from '@/utils/historyProjection'
+import { chatApi, type ApiUsage, type ContextUsage, type StreamEvent } from '@/api/chat'
 import { chatWs } from '@/api/ws'
 import { configApi } from '@/api/config'
 import { formatMessageTime } from '@/utils/markdown'
@@ -72,7 +73,7 @@ const contextCompressing = ref(false)
 const activeStage = ref<string | null>(null)
 const agentState = ref<AgentStateStream | null>(null)
 const turnAgentStates = ref<Record<number, AgentStateStream>>({})
-const activeRunId = ref<string | null>(null)
+const activeTurnId = ref<string | null>(null)
 const historyNextCursor = ref<string | null>(null)
 const hasMoreHistory = ref(false)
 const wsConnectionState = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('idle')
@@ -106,6 +107,10 @@ const bindingFolder = ref(false)
 
 let unsubConfig: (() => void) | null = null
 let unsubConnection: (() => void) | null = null
+let unsubSessionStream: (() => void) | null = null
+let subscribedBatcher: ReturnType<typeof createChatStreamEventBatcher> | null = null
+let subscribedTurnId: string | null = null
+const pendingSubscribedEvents: StreamEvent[] = []
 
 // 窗口化渲染：初始只渲染最近 RENDER_WINDOW 条消息，向上滚动时分批补载，
 // 避免一次性把全部历史塞进 DOM 导致打开会话卡顿。
@@ -452,41 +457,8 @@ const getLastSession = (): string | null => {
   return null
 }
 
-// 根据后端时间戳或会话时间范围估算消息时间（兼容旧数据）
-const resolveMessageTimestamp = (
-  backendTs: number | undefined,
-  index: number,
-  total: number,
-  sessionCreatedAt: number,
-  sessionUpdatedAt: number,
-): Date => {
-  if (backendTs) return new Date(backendTs * 1000)
-  if (total <= 1) return new Date(sessionUpdatedAt * 1000)
-  const start = sessionCreatedAt * 1000
-  const end = sessionUpdatedAt * 1000
-  const ratio = index / (total - 1)
-  return new Date(start + (end - start) * ratio)
-}
-
 let historyLoadSeq = 0
-
-interface ToolResultDisplay {
-  content?: string
-  ref?: string | null
-  preview?: string | null
-  truncated?: boolean
-  status?: string | null
-}
-
-const safeJsonArgs = (raw: string): Record<string, unknown> => {
-  try {
-    const parsed = JSON.parse(raw || '{}')
-    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
-  } catch {
-    return {}
-  }
-}
-
+const historyTimelines = ref<TurnTimeline[]>([])
 const applySessionMetadata = (sessionRes: Session) => {
   boundWorkspacePath.value = sessionRes.workspace_path || null
   if (sessionRes.workspace_path) {
@@ -495,122 +467,9 @@ const applySessionMetadata = (sessionRes: Session) => {
   }
   setCurrentSession(sessionRes)
 }
-
-const buildDisplayMessages = (
-  rawMessages: ApiChatMessage[],
-  sessionCreatedAt: number,
-  sessionUpdatedAt: number,
-): Message[] => {
-  const now = Date.now()
-  const toolResults: Map<string, ToolResultDisplay> = new Map()
-
-  for (const msg of rawMessages) {
-    if (msg.role === 'tool' && msg.tool_call_id) {
-      toolResults.set(msg.tool_call_id, {
-        content: msg.content,
-        ref: msg.tool_result_ref,
-        preview: msg.tool_result_preview,
-        truncated: Boolean(msg.tool_result_truncated),
-        status: msg.tool_status,
-      })
-    }
-  }
-
-  const displayMessages: Message[] = []
-  let pendingAssistant: Message | null = null
-
-  for (let i = 0; i < rawMessages.length; i++) {
-    const msg = rawMessages[i]!
-
-    if (msg.role === 'user') {
-      if (pendingAssistant) {
-        displayMessages.push(pendingAssistant)
-        pendingAssistant = null
-      }
-      displayMessages.push({
-        id: now + i,
-        role: 'user',
-        content: msg.content || '',
-        timestamp: resolveMessageTimestamp(
-          msg.timestamp,
-          i,
-          rawMessages.length,
-          sessionCreatedAt,
-          sessionUpdatedAt,
-        ),
-      })
-    } else if (msg.role === 'assistant') {
-      if (msg.tool_calls && msg.tool_calls.length > 0) {
-        const segments: MessageSegment[] = []
-
-        msg.tool_calls.forEach((tc, tcIndex) => {
-          const result = toolResults.get(tc.id)
-          segments.push({
-            type: 'tool',
-            id: now + i * 1000 + tcIndex,
-            tool: tc.function.name,
-            args: safeJsonArgs(tc.function.arguments),
-            toolCallId: tc.id,
-            result: result?.content,
-            toolResultRef: result?.ref,
-            toolResultTruncated: result?.truncated,
-            status: result?.status && ['failed', 'cancelled', 'skipped'].includes(result.status)
-              ? 'error'
-              : result?.content && toolResultLooksLikeError(result.content) ? 'error' : 'done',
-          })
-        })
-
-        const nextMsg = rawMessages[i + 1]
-        if (nextMsg && nextMsg.role === 'assistant' && !nextMsg.tool_calls && nextMsg.content) {
-          segments.push({
-            type: 'text',
-            id: now + i * 1000 + 100,
-            content: nextMsg.content
-          })
-          i++
-        }
-
-        pendingAssistant = {
-          id: now + i,
-          role: 'assistant',
-          content: '',
-          timestamp: resolveMessageTimestamp(
-            msg.timestamp,
-            i,
-            rawMessages.length,
-            sessionCreatedAt,
-            sessionUpdatedAt,
-          ),
-          segments
-        }
-      } else if (msg.content) {
-        if (pendingAssistant) {
-          if (!pendingAssistant.segments) pendingAssistant.segments = []
-          pendingAssistant.segments.push({
-            type: 'text',
-            id: now + i,
-            content: msg.content
-          })
-        } else {
-          displayMessages.push({
-            id: now + i,
-            role: 'assistant',
-            content: msg.content,
-            timestamp: resolveMessageTimestamp(
-              msg.timestamp,
-              i,
-              rawMessages.length,
-              sessionCreatedAt,
-              sessionUpdatedAt,
-            ),
-          })
-        }
-      }
-    }
-  }
-
-  if (pendingAssistant) displayMessages.push(pendingAssistant)
-  return displayMessages
+const buildDisplayMessages = (rawMessages: ApiChatMessage[], _createdAt: number, _updatedAt: number): Message[] => buildHistoryMessages(rawMessages, historyTimelines.value)
+const restoreHistoryTimelines = () => {
+  turnAgentStates.value = buildHistoryTimelines(messages.value, historyTimelines.value)
 }
 
 // 加载最近一页会话历史（按照 OpenAI 标准格式解析）
@@ -623,7 +482,7 @@ const loadSessionHistory = async (sessionId: string) => {
   apiUsage.value = null
   contextCompressing.value = false
   activeStage.value = 'history_load'
-  activeRunId.value = null
+  activeTurnId.value = null
   historyNextCursor.value = null
   hasMoreHistory.value = false
   renderLimit.value = RENDER_WINDOW
@@ -631,12 +490,14 @@ const loadSessionHistory = async (sessionId: string) => {
     const historyRes = await sessionApi.getHistoryPage(sessionId, { limit: RENDER_WINDOW })
     const sessionRes = historyRes.session
     const rawMessages = historyRes.messages
-    sessionTodos.value = (historyRes.todos || []) as SessionTodoItem[]
     const sessionCreatedAt = sessionRes.created_at
     const sessionUpdatedAt = sessionRes.updated_at
     if (seq !== historyLoadSeq) return
+    historyTimelines.value = historyRes.timelines || []
+    sessionTodos.value = (historyRes.todos || []) as SessionTodoItem[]
     applySessionMetadata(sessionRes)
     messages.value = buildDisplayMessages(rawMessages, sessionCreatedAt, sessionUpdatedAt)
+    restoreHistoryTimelines()
     historyNextCursor.value = historyRes.next_cursor || null
     hasMoreHistory.value = historyRes.has_more
     if (historyRes.context_usage) {
@@ -647,6 +508,8 @@ const loadSessionHistory = async (sessionId: string) => {
     }
   } catch (error) {
     if (seq !== historyLoadSeq) return
+    const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    message.error(detail || (error instanceof Error ? error.message : '历史加载失败'))
     // 会话不存在或加载失败，清空消息
     messages.value = []
     boundWorkspacePath.value = null
@@ -654,6 +517,7 @@ const loadSessionHistory = async (sessionId: string) => {
   } finally {
     if (seq === historyLoadSeq) {
       historyLoading.value = false
+      for (const event of pendingSubscribedEvents.splice(0)) handleSubscribedEvent(event)
       activeStage.value = null
     }
   }
@@ -727,7 +591,7 @@ watch(
       pendingApproval.value = null
       pendingAskUser.value = null
       activeStage.value = null
-      activeRunId.value = null
+      activeTurnId.value = null
     }
     currentSessionId.value = sessionId
     saveCurrentSession(sessionId)
@@ -764,6 +628,7 @@ watch(
 
 // 组件挂载时初始化会话
 onMounted(async () => {
+  unsubSessionStream = chatWs.onSessionStream(handleSubscribedEvent)
   unsubConnection = chatWs.onConnectionState((state) => {
     wsConnectionState.value = state
   })
@@ -779,10 +644,13 @@ onMounted(async () => {
 onUnmounted(() => {
   unsubConfig?.()
   unsubConnection?.()
+  unsubSessionStream?.()
   stopRunClock()
 })
 
 watch(currentSessionId, (sid) => {
+  subscribedBatcher = null; subscribedTurnId = null
+  pendingSubscribedEvents.splice(0)
   if (sid) chatWs.subscribeSession(sid)
 }, { immediate: true })
 
@@ -825,18 +693,23 @@ const loadMoreMessages = async () => {
   loadingMore.value = true
   const prevHeight = el.scrollHeight
   const prevTop = el.scrollTop
+  const sessionId = currentSessionId.value
+  const loadSeq = historyLoadSeq
   try {
     if (hasMoreHistory.value && historyNextCursor.value && currentSessionId.value) {
       const page = await sessionApi.getHistoryPage(currentSessionId.value, {
         limit: RENDER_BATCH,
         before: historyNextCursor.value,
       })
+      if (currentSessionId.value !== sessionId || historyLoadSeq !== loadSeq) return
+      historyTimelines.value = [...historyTimelines.value.filter(turn => !(page.timelines || []).some(incoming => incoming.turn_id === turn.turn_id)), ...(page.timelines || [])]
       const older = buildDisplayMessages(
         page.messages,
         page.session.created_at,
         page.session.updated_at,
       )
       messages.value = [...older, ...messages.value]
+      restoreHistoryTimelines()
       renderLimit.value = Math.min(messages.value.length, renderLimit.value + older.length)
       historyNextCursor.value = page.next_cursor || null
       hasMoreHistory.value = page.has_more
@@ -874,24 +747,39 @@ const loadFullToolResult = async (toolId: number) => {
   const found = findToolSegment(toolId)
   if (!found || !currentSessionId.value) return
   const { msgIndex, segment, segments } = found
-  if (!segment.toolResultTruncated || !segment.toolResultRef || segment.fullResultLoading) return
+  const ownerMessage = messages.value[msgIndex]
+  if ((!segment.resultSeq && !segment.toolResultRef) || segment.fullResultLoading) return
+  const sessionId = currentSessionId.value
+  const loadSeq = historyLoadSeq
 
   segment.fullResultLoading = true
   updateMessageSegments(msgIndex, segments)
   try {
-    const payload = await sessionApi.getToolResult(currentSessionId.value, segment.toolResultRef)
+    let inlineContent: string | undefined
+    let referenced = Boolean(segment.toolResultRef)
+    if (segment.resultSeq) {
+      const resource = await sessionApi.getLedgerMessage(sessionId, segment.resultSeq)
+      if (currentSessionId.value !== sessionId || historyLoadSeq !== loadSeq) return
+      if (resource.session_id !== sessionId || resource.message.seq !== segment.resultSeq || resource.message.message.tool_call_id !== segment.toolCallId || (ownerMessage?.turnId && resource.message.turn_id !== ownerMessage.turnId)) throw new Error('工具结果引用归属不一致')
+      referenced = Array.isArray(resource.message.message.content) && resource.message.message.content.some(block => block.type === 'reference')
+      inlineContent = displayContent(resource.message.message.content)
+    }
+    const payload = referenced
+      ? await sessionApi.getToolResult(sessionId, segment.toolCallId || segment.toolResultRef || '', segment.resultSeq)
+      : { available: true, content: inlineContent, error: undefined }
+    if (currentSessionId.value !== sessionId || historyLoadSeq !== loadSeq || messages.value[msgIndex]?.id !== ownerMessage?.id) return
     if (payload.available && payload.content != null) {
       segment.result = payload.content
       segment.toolResultTruncated = false
-      segment.status = toolResultLooksLikeError(payload.content) ? 'error' : 'done'
+      segment.contentError = undefined
     } else {
-      segment.result = payload.error || '工具结果不可用'
-      segment.status = 'error'
+      segment.contentError = payload.error || '工具结果不可用'
     }
   } catch (error) {
-    segment.result = error instanceof Error ? error.message : '工具结果加载失败'
-    segment.status = 'error'
+    if (currentSessionId.value !== sessionId || historyLoadSeq !== loadSeq) return
+    segment.contentError = error instanceof Error ? error.message : '工具结果加载失败'
   } finally {
+    if (currentSessionId.value !== sessionId || historyLoadSeq !== loadSeq || messages.value[msgIndex]?.id !== ownerMessage?.id) return
     segment.fullResultLoading = false
     updateMessageSegments(msgIndex, segments)
   }
@@ -958,8 +846,8 @@ const isGroupWaiting = (group: MessageGroup): boolean => {
 const finalizeRunningToolSegments = (segments: MessageSegment[], cancelled = false) => {
   for (const seg of segments) {
     if (seg.type === 'tool' && seg.status === 'running') {
-      seg.status = cancelled ? 'cancelled' : 'done'
-      if (!seg.result) seg.result = cancelled ? '（已取消）' : '（已结束）'
+      seg.status = 'unknown'
+      if (!seg.result) seg.result = cancelled ? '本轮已取消，工具实际结果未知' : '工具实际结果未知'
     }
   }
 }
@@ -990,12 +878,13 @@ const stopGeneration = () => {
   pendingApproval.value = null
   pendingAskUser.value = null
   activeStage.value = null
-  activeRunId.value = null
+  activeTurnId.value = null
 }
 
 const handleApproval = (decision: 'allow' | 'deny') => {
   if (!pendingApproval.value) return
-  chatApi.approveTool(pendingApproval.value.runId, decision, {
+  chatApi.approveTool(pendingApproval.value.turnId, decision, {
+    interruptId: pendingApproval.value.interruptId,
     toolCallId: pendingApproval.value.toolCallId,
     stepId: pendingApproval.value.stepId,
     sessionId: currentSessionId.value || undefined,
@@ -1006,7 +895,7 @@ const handleApproval = (decision: 'allow' | 'deny') => {
 const handleAskUser = (answer: string | string[]) => {
   if (!pendingAskUser.value) return
   const pending = pendingAskUser.value
-  chatApi.answerAskUser(pending.runId, answer, {
+  chatApi.answerAskUser(pending.turnId, answer, {
     interruptId: pending.interruptId,
     stepId: pending.stepId,
     toolCallId: pending.toolCallId,
@@ -1019,7 +908,7 @@ const handleAskUser = (answer: string | string[]) => {
 const handleHandoffAck = () => {
   if (!pendingAskUser.value) return
   const pending = pendingAskUser.value
-  chatApi.ackHandoff(pending.runId, {
+  chatApi.ackHandoff(pending.turnId, {
     interruptId: pending.interruptId,
     stepId: pending.stepId,
     toolCallId: pending.toolCallId,
@@ -1039,12 +928,44 @@ const updateMessageSegments = (msgIndex: number, segments: MessageSegment[]) => 
   if (msgIndex >= 0 && msgIndex < messages.value.length) {
     const existingMsg = messages.value[msgIndex]!
     messages.value[msgIndex] = {
-      id: existingMsg.id,
-      role: existingMsg.role,
-      content: existingMsg.content,
-      timestamp: existingMsg.timestamp,
+      ...existingMsg,
       segments: [...segments]
     }
+  }
+}
+
+const createStreamContext = () => ({ messages, currentSessionId, contextUsage, apiUsage, contextCompressing,
+  activeStage, agentState, pendingApproval, pendingAskUser, sessionTodos, assistantName,
+  saveCurrentSession, updateMessageSegments, finalizeRunningToolSegments, markRunTerminal,
+  scrollToBottom: () => { void scrollToBottom() } })
+
+function handleSubscribedEvent(event: StreamEvent) {
+  const sessionId = event.session_id || event.state?.scope.session_id
+  const turnId = event.turn_id || event.state?.scope.turn_id
+  if (!turnId || !sessionId || sessionId !== currentSessionId.value) return
+  if (historyLoading.value) { pendingSubscribedEvents.push(event); return }
+    if (activeTurnId.value && activeTurnId.value !== turnId) return
+  if (!subscribedBatcher || subscribedTurnId !== turnId) {
+    if (event.type !== 'state_sync' && event.type !== 'interrupt') return
+    const user = messages.value.find(item => item.role === 'user' && item.turnId === turnId)
+    const prior = user ? turnAgentStates.value[user.id] : null
+    if (prior && isTerminalAgentStatus(prior.status) && !['completed', 'failed', 'cancelled', 'handoff'].includes(event.state?.turn_status || '')) return
+    const index = messages.value.findIndex(item => item.role === 'assistant' && item.turnId === turnId)
+    const segments = index >= 0 ? messages.value[index]?.segments || [] : []
+    agentState.value = prior ? cloneAgentState(prior) : createAgentStateStream(user?.id || 0, turnId, user?.timestamp.getTime())
+    activeTurnKey.value = user?.id || null
+    activeTurnId.value = turnId
+    subscribedTurnId = turnId
+    subscribedBatcher = createChatStreamEventBatcher(createStreamContext(), {
+      assistantMsgIndex: index, currentSegments: segments,
+      currentTextSegmentId: [...segments].reverse().find(item => item.type === 'text')?.id || -1,
+    })
+  }
+  subscribedBatcher.handle(event)
+  if (event.type === 'interrupt') loading.value = true
+  if (event.type === 'done' || event.type === 'error' || (event.type === 'state_sync' && ['completed', 'failed', 'cancelled', 'handoff'].includes(event.state?.turn_status || ''))) {
+    subscribedBatcher.flush(); finalizeRunSummary(event.type === 'error' ? 'error' : 'done')
+    loading.value = false; activeTurnId.value = null
   }
 }
 
@@ -1073,7 +994,7 @@ const sendMessage = async () => {
   loading.value = true
   contextCompressing.value = false
   activeStage.value = chatWs.isConnected ? 'thinking' : 'connecting'
-  activeRunId.value = null
+  activeTurnId.value = null
 
   abortController.value = new AbortController()
 
@@ -1107,9 +1028,9 @@ const sendMessage = async () => {
       currentSessionId.value || undefined,
       (event) => {
         if (startedSessionId && currentSessionId.value && currentSessionId.value !== startedSessionId) return
-        if (event.run_id) {
-          if (activeRunId.value && activeRunId.value !== event.run_id) return
-          activeRunId.value = event.run_id
+        if (event.turn_id) {
+          if (activeTurnId.value && activeTurnId.value !== event.turn_id) return
+          activeTurnId.value = event.turn_id
         }
         batcher.handle(event)
       },
@@ -1125,9 +1046,13 @@ const sendMessage = async () => {
     } else {
       console.error('发送消息失败:', error)
       markRunTerminal('error')
-      message.error('发送消息失败')
-      messages.value.pop()
-      discardTurnProgress = true
+      message.error(error instanceof Error ? error.message : '发送消息失败')
+      const executionStarted = (error as { executionStarted?: boolean }).executionStarted || Boolean(activeTurnId.value)
+      if (!executionStarted) {
+        messages.value = messages.value.filter(item => item.id !== userMsg.id)
+        inputMessage.value = userMessage
+        discardTurnProgress = true
+      }
     }
   } finally {
     batcher.flush()
@@ -1143,7 +1068,7 @@ const sendMessage = async () => {
     loading.value = false
     abortController.value = null
     activeStage.value = null
-    activeRunId.value = null
+    activeTurnId.value = null
     refreshSessions().catch(() => {})
   }
 }
@@ -1320,10 +1245,12 @@ const openWorkspaceFolder = async () => {
                       <Tag v-else-if="segment.fullResultLoading" color="processing" class="tool-tag">
                         <LoadingOutlined /> 载入中
                       </Tag>
-                      <Tag v-else-if="segment.status === 'error' || toolResultLooksLikeError(segment.result)" color="error" class="tool-tag">失败</Tag>
-                      <Tag v-else-if="segment.status === 'policy_denied'" color="warning" class="tool-tag">策略拒绝</Tag>
+                      <Tag v-else-if="segment.status === 'failed'" color="error" class="tool-tag">失败</Tag>
+                      <Tag v-else-if="segment.status === 'denied'" color="warning" class="tool-tag">策略拒绝</Tag>
                       <Tag v-else-if="segment.status === 'cancelled'" color="warning" class="tool-tag">已取消</Tag>
-                      <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
+                      <Tag v-else-if="segment.status === 'succeeded'" color="success" class="tool-tag">完成</Tag>
+                      <Tag v-else-if="segment.status === 'skipped'" class="tool-tag">跳过</Tag>
+                      <Tag v-else-if="segment.status === 'unknown'" color="warning" class="tool-tag">结果未知</Tag>
                       <code v-if="formatToolElapsed(segment)" class="tool-duration">{{ formatToolElapsed(segment) }}</code>
                       <span
                         v-if="segment.status !== 'running'"
@@ -1344,7 +1271,7 @@ const openWorkspaceFolder = async () => {
                       class="tool-progress-summary"
                     >{{ segment.progressMessage }}</p>
                     <div
-                      v-if="segment.snapshotId && segment.status === 'done'"
+                      v-if="segment.snapshotId && segment.status === 'succeeded'"
                       class="tool-undo-row"
                     >
                       <Button
@@ -1364,7 +1291,7 @@ const openWorkspaceFolder = async () => {
                       class="tool-error-preview"
                     ><span class="system-label">系统错误</span>{{ toolErrorPreview(segment.result) }}</p>
                     <p
-                      v-if="!isToolExpanded(segment.id) && (segment.status === 'error' || segment.status === 'policy_denied')"
+                      v-if="!isToolExpanded(segment.id) && (segment.status === 'failed' || segment.status === 'denied')"
                       class="tool-retry-note"
                     >请展开查看详情，确认后重新发起请求</p>
                     <!-- 展开后显示入参和结果 -->
@@ -1374,10 +1301,15 @@ const openWorkspaceFolder = async () => {
                         <div class="tool-detail-label">工具输入</div>
                         <pre class="tool-detail-content">{{ formatToolArgs(segment.args) }}</pre>
                       </div>
+                      <div v-if="segment.contentError" class="tool-error-preview">{{ segment.contentError }}</div>
+                      <div v-if="segment.reasonCode" class="tool-error-preview">{{ segment.reasonCode }}</div>
+                      <div v-if="segment.attempts && segment.attempts.length > 1" class="tool-detail-label">
+                        <div v-for="attempt in segment.attempts" :key="attempt.attempt">尝试 {{ attempt.attempt }}：{{ attempt.status }} {{ attempt.error?.code }}</div>
+                      </div>
                       <!-- 结果 -->
                       <div v-if="segment.result" class="tool-result-wrapper">
                         <div class="tool-detail-label">{{ segment.toolResultTruncated ? '系统返回预览' : '系统返回' }}</div>
-                        <pre class="tool-detail-content">{{ formatToolResult(segment.result) }}</pre>
+                        <pre class="tool-detail-content">{{ formatToolResult(segment.result, Number.MAX_SAFE_INTEGER) }}</pre>
                       </div>
                     </div>
                   </div>
@@ -2017,7 +1949,7 @@ const openWorkspaceFolder = async () => {
   background: color-mix(in srgb, var(--color-surface) 88%, #f0ad4e);
 }
 
-.tool-card.policy_denied {
+.tool-card.denied {
   border-color: color-mix(in srgb, var(--color-primary) 55%, #f0ad4e);
   background: color-mix(in srgb, var(--color-surface) 88%, #f0ad4e);
 }

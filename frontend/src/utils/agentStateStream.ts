@@ -1,4 +1,5 @@
 import type { StreamEvent } from '../api/chat'
+import { terminalOutcome } from './streamProtocol'
 import type {
   AgentStateNode,
   AgentStateNodeKind,
@@ -43,12 +44,10 @@ const TERMINAL_STATUS_PRIORITY: Record<Extract<AgentStatus, 'completed' | 'cance
 const normalizeStage = (stage?: string | null): string => (stage || '').trim().toLowerCase()
 
 export function mapStreamEventToAgentStatus(
-  event: Pick<StreamEvent, 'type' | 'stage' | 'status' | 'compression' | 'cancelled' | 'handoff' | 'terminal_reason'>,
+  event: Pick<StreamEvent, 'type' | 'stage' | 'status' | 'compression' | 'cancelled' | 'handoff' | 'terminal_reason' | 'state'>,
 ): AgentStatus | null {
   if (event.type === 'done') {
-    if (event.handoff || event.terminal_reason === 'handoff') return 'handoff'
-    if (event.cancelled) return 'cancelled'
-    return 'completed'
+    return terminalOutcome(event)
   }
   if (event.type === 'error') return event.cancelled ? 'cancelled' : 'error'
   if (event.type === 'interrupt') return 'awaiting_user'
@@ -75,13 +74,13 @@ export function mapStreamEventToAgentStatus(
 }
 
 export function createAgentStateStream(
-  turnId: number,
-  runId?: string | null,
+  turnKey: number,
+  turnId?: string | null,
   startedAt = Date.now(),
 ): AgentStateStream {
   const state: AgentStateStream = {
-    turnId,
-    runId: runId || null,
+    turnKey,
+    turnId: turnId || null,
     status: 'initializing',
     currentStep: 0,
     startedAt,
@@ -90,7 +89,7 @@ export function createAgentStateStream(
     todoCompleted: 0,
     todoTotal: 0,
     requiresUserAction: false,
-    confirmedSeq: null,
+    confirmedRevision: null,
     syncing: false,
     activeMessageId: null,
   }
@@ -100,9 +99,9 @@ export function createAgentStateStream(
 
 export function shouldAcceptAgentEvent(
   state: AgentStateStream,
-  event: Pick<StreamEvent, 'run_id'>,
+  event: Pick<StreamEvent, 'turn_id'>,
 ): boolean {
-  return !state.runId || !event.run_id || state.runId === event.run_id
+  return !state.turnId || !event.turn_id || state.turnId === event.turn_id
 }
 
 function nodeKindForStatus(status: AgentStatus): AgentStateNodeKind {
@@ -187,7 +186,7 @@ export function advanceAgentState(
 
   const meta = AGENT_STATUS_META[status]
   const node: AgentStateNode = {
-    id: `${state.turnId}:${status}:${state.nodes.length + 1}`,
+    id: `${state.turnKey}:${status}:${state.nodes.length + 1}`,
     kind: nodeKindForStatus(status),
     status,
     label: meta.label,
@@ -204,9 +203,9 @@ export function advanceAgentState(
   return node
 }
 
-export function setAgentStateSyncing(state: AgentStateStream, syncing: boolean, confirmedSeq?: number): void {
+export function setAgentStateSyncing(state: AgentStateStream, syncing: boolean, confirmedRevision?: number): void {
   state.syncing = syncing
-  if (typeof confirmedSeq === 'number') state.confirmedSeq = confirmedSeq
+  if (typeof confirmedRevision === 'number') state.confirmedRevision = confirmedRevision
 }
 
 export function attachAgentStateMessage(state: AgentStateStream, messageId: number): void {
@@ -233,7 +232,7 @@ export function upsertToolExecution(
   state: AgentStateStream,
   tool: ToolExecution,
 ): ToolExecution {
-  const index = state.toolExecutions.findIndex((item) => item.toolId === tool.toolId)
+  const index = state.toolExecutions.findIndex((item) => item.toolId === tool.toolId && (!tool.stepId || item.stepId === tool.stepId))
   if (index === -1) {
     state.toolExecutions.push(tool)
     return tool
@@ -285,6 +284,10 @@ export function toolExecutionFromSegment(segment: ToolSegment): ToolExecution {
     startedAt,
     endedAt: segment.endedAt,
     redacted: true,
+    stepId: segment.stepId,
+    definitionSeq: segment.definitionSeq,
+    resultSeq: segment.resultSeq,
+    attempts: segment.attempts,
   }
 }
 

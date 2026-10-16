@@ -29,7 +29,7 @@ def _state(*ids: str):
             {"id": call_id, "name": "protected_action", "args": {}}
             for call_id in ids
         ])],
-        "scope": {"run_id": "run-1"},
+        "scope": {"turn_id": "run-1"},
     }
 
 
@@ -184,5 +184,5 @@ def test_batch_executor_defaults_to_unapproved_and_scopes_grant_by_call_id(monke
 
     assert calls == ["ran"]
     assert [message.tool_call_id for message in results] == ["allowed", "unapproved"]
-    assert results[0].additional_kwargs["tool_status"] == "completed"
-    assert results[1].additional_kwargs["tool_status"] == "failed"
+    assert results[0].additional_kwargs["tool_status"] == "succeeded"
+    assert results[1].additional_kwargs["tool_status"] == "skipped"

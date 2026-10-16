@@ -156,13 +156,14 @@ def _memory_config(workspace) -> dict:
 
 def _invoke_llm_json(prompt: str, source: str) -> tuple[Any, list[dict]]:
     from app.resilience import CallContext, execute_sync, llm_agent_policy
+    from app.core.model_request import invoke_auxiliary_model
 
     api_usages: list[dict] = []
     model = get_chat_model()
     policy = llm_agent_policy(dependency_id=f"llm.memory.{source}")
     outcome = execute_sync(
         policy.dependency_id,
-        lambda: model.invoke([HumanMessage(content=prompt)]),
+        lambda: invoke_auxiliary_model(model, [HumanMessage(content=prompt)]),
         policy=policy,
         context=CallContext(metadata={"source": source}),
     )

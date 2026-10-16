@@ -11,7 +11,8 @@ from langgraph.types import interrupt
 from app.agent.approval import find_tool_card
 from app.agent.approval_context import approval_enabled
 from app.agent.hooks import dispatch_post_tool_call, dispatch_pre_tool_call
-from app.agent.state import AgentState
+from app.agent.state import AgentState, utc_now
+from app.agent.audit import get_runtime_audit, bind_runtime_audit
 from app.context.tool_cache import process_tool_message_for_cache
 from app.resilience import CallContext, execute_sync, tool_error_json
 from app.resilience.policies import agent_tools_batch_timeout
@@ -32,6 +33,28 @@ logger = logging.getLogger(__name__)
 
 ASK_USER_FAIL = "未获得用户回答。"
 ASK_USER_HANDOFF = "已交还用户，当前回合结束。"
+
+
+def _interaction_request(kind: str, call_id: str, *, prompt: str, mode: str | None = None, options: list | None = None, preview: dict | None = None):
+    audit = get_runtime_audit()
+    if not audit:
+        return f"interaction_{call_id}", None, None
+    identity = f"interaction_{audit.turn_id}_{call_id}"
+    # A LangGraph interrupt restarts the node. Reuse its immutable prompt row.
+    row = audit.files.message_by_id(audit.session_id, f"msg_{identity}")
+    if row:
+        return identity, row["seq"], audit.step_id
+    interaction = {"id": identity, "kind": kind}
+    if mode:
+        interaction["mode"] = mode
+    if options:
+        interaction["options"] = options
+    extensions = {"runtime": {"step_id": audit.step_id}}
+    if preview:
+        from app.agent.graph import _safe_tool_input
+        extensions["runtime"]["preview"] = _safe_tool_input(preview)
+    seq = audit.lifecycle("interaction", "waiting", message_id=f"msg_{identity}", call_id=call_id, interaction=interaction, extensions=extensions, detail=prompt)
+    return identity, seq, audit.step_id
 
 
 def _format_ask_user_resume(
@@ -96,7 +119,8 @@ def _resolve_effective_card_and_args(name: str, args: dict[str, Any]):
 async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
     """工具节点：执行热工具 / 桥接工具；策略 gate 在 handler 前做权威判定。"""
     session_id = config.get("configurable", {}).get("thread_id", "default")
-    run_id = config.get("configurable", {}).get("run_id") or (state.get("scope") or {}).get("run_id")
+    turn_id = config.get("configurable", {}).get("turn_id") or (state.get("scope") or {}).get("turn_id")
+    audit = get_runtime_audit()
     project_workspace = await abind_session_runtime(session_id)
 
     messages = state.get("messages") or []
@@ -153,7 +177,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                     tool_call_id=tc_id,
                     name=name,
                     additional_kwargs={
-                        "tool_status": "failed",
+                        "tool_status": "denied",
                         "reason_code": "pre_tool_blocked",
                     },
                 )
@@ -169,7 +193,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
             mode = str(tc_args.get("mode") or "answer_and_continue").strip()
             if mode not in {"answer_and_continue", "handoff_and_stop"}:
                 mode = "answer_and_continue"
-            interrupt_id = str(tc_args.get("interrupt_id") or _uuid.uuid4().hex)
+            interrupt_id, definition_seq, step_id = _interaction_request("ask_user", tc_id, prompt=str(tc_args.get("question") or tc_args.get("prompt") or ""), mode=mode, options=options)
             terminal_on_ack = mode == "handoff_and_stop"
             resume = interrupt(
                 {
@@ -181,7 +205,10 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                     "interrupt_id": interrupt_id,
                     "mode": mode,
                     "terminal_on_ack": terminal_on_ack,
-                    "run_id": run_id,
+                    "turn_id": turn_id,
+                    "step_id": step_id,
+                    "interaction_id": interrupt_id,
+                    "definition_seq": definition_seq,
                     "session_id": session_id,
                 }
             )
@@ -198,7 +225,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                     tool_call_id=tc_id,
                     name=name,
                     additional_kwargs={
-                        "tool_status": "completed" if formatted else "failed",
+                        "tool_status": "succeeded" if formatted else "failed",
                         "reason_code": (
                             "handoff"
                             if is_handoff and formatted
@@ -262,7 +289,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                 effective_args,
                 tool_call_id=tc_id,
                 session_id=session_id,
-                run_id=run_id,
+                turn_id=turn_id,
                 approval_granted=False,
                 allowlist_matched=allowlist_matched,
                 workspace_root=project_workspace,
@@ -275,7 +302,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                         tool_call_id=tc_id,
                         name=card.name if card else name,
                         additional_kwargs={
-                            "tool_status": "failed",
+                            "tool_status": "denied",
                             "reason_code": decision.reason_code or "policy_denied",
                         },
                     )
@@ -288,7 +315,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                         tool_call_id=tc_id,
                         name=card.name,
                         additional_kwargs={
-                            "tool_status": "failed",
+                            "tool_status": "denied",
                             "reason_code": "approval_required",
                         },
                     )
@@ -298,6 +325,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                 preview = decision.preview.to_public_dict() if decision.preview else {}
                 if shell_preview:
                     preview.update(shell_preview)
+                interaction_id, definition_seq, step_id = _interaction_request("approval", tc_id, prompt=str(decision.reason or "请确认是否执行此工具。"), preview=preview)
                 user_decision = interrupt(
                     {
                         "kind": "approval",
@@ -307,7 +335,11 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                         "reason": decision.reason,
                         "reason_code": decision.reason_code,
                         "preview": preview,
-                        "run_id": run_id,
+                        "turn_id": turn_id,
+                        "step_id": step_id,
+                        "interaction_id": interaction_id,
+                        "interrupt_id": interaction_id,
+                        "definition_seq": definition_seq,
                         "session_id": session_id,
                     }
                 )
@@ -318,7 +350,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                             tool_call_id=tc_id,
                             name=card.name,
                             additional_kwargs={
-                                "tool_status": "failed",
+                                "tool_status": "denied",
                                 "reason_code": "user_denied",
                             },
                         )
@@ -331,7 +363,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                         effective_args,
                         tool_call_id=tc_id,
                         session_id=session_id,
-                        run_id=run_id,
+                        turn_id=turn_id,
                         approval_granted=True,
                         allowlist_matched=allowlist_matched,
                         workspace_root=project_workspace,
@@ -344,7 +376,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                             tool_call_id=tc_id,
                             name=card.name,
                             additional_kwargs={
-                                "tool_status": "failed",
+                                "tool_status": "denied",
                             "reason_code": recheck.reason_code or "policy_denied",
                             },
                         )
@@ -363,6 +395,8 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
         result["terminal_reason"] = terminal_reason
 
     if not approved_calls:
+        for msg in denied_messages:
+            msg.additional_kwargs.setdefault("timestamp", utc_now())
         result["messages"] = denied_messages
         return result
 
@@ -372,15 +406,16 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
         bind_session_runtime(session_id)
         token = tool_todos.set(list(todos))
         try:
-            msgs = run_tool_calls(
-                approved_calls,
-                session_id,
-                process_for_cache=process_tool_message_for_cache,
-                run_id=run_id,
-                execution_grants=execution_grants,
-                timeout_seconds=max(0.1, batch_timeout - 0.25),
-                cancel_event=cancel_event,
-            )
+            with bind_runtime_audit(audit) if audit else __import__("contextlib").nullcontext():
+                msgs = run_tool_calls(
+                    approved_calls,
+                    session_id,
+                    process_for_cache=process_tool_message_for_cache,
+                    turn_id=turn_id,
+                    execution_grants=execution_grants,
+                    timeout_seconds=max(0.1, batch_timeout - 0.25),
+                    cancel_event=cancel_event,
+                )
             return msgs, list(tool_todos.get() or [])
         finally:
             tool_todos.reset(token)
@@ -402,8 +437,9 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
                     tool_call_id=tc.get("id") or "",
                     name=tc.get("name") or "tool",
                     additional_kwargs={
-                        "tool_status": "failed",
+                        "tool_status": "unknown" if audit and (tc.get("id") or "") in audit.started_attempts else "skipped",
                         "reason_code": reason_code,
+                        **({"attempt": audit.started_attempts[tc["id"]]} if audit and tc.get("id") in audit.started_attempts else {}),
                     },
                 )
                 for tc in approved_calls
@@ -443,6 +479,7 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
 
     args_by_id = {tc.get("id") or "": (tc.get("args") or {}) for tc in approved_calls}
     for msg in executed:
+        msg.additional_kwargs.setdefault("timestamp", utc_now())
         dispatch_post_tool_call(
             tool_name=msg.name or "tool",
             args=args_by_id.get(msg.tool_call_id or "", {}),
@@ -451,6 +488,9 @@ async def call_tools(state: AgentState, config: RunnableConfig) -> dict:
             session_id=session_id,
             duration_ms=duration_ms,
         )
+
+    for msg in denied_messages:
+        msg.additional_kwargs.setdefault("timestamp", utc_now())
 
     return {
         "messages": denied_messages + executed,

@@ -16,12 +16,18 @@ def pending_tool_message(state: AgentState) -> AIMessage | None:
     if not messages:
         return None
 
-    last = messages[-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return last
+    from langchain_core.messages import ToolMessage
+    settled = {message.tool_call_id for message in messages if isinstance(message, ToolMessage)}
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            if message.tool_calls and any(call["id"] not in settled for call in message.tool_calls):
+                return message
+            return None
 
     return None
 
 
 def should_continue(state: AgentState) -> str:
+    if state.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}:
+        return END
     return "tools" if pending_tool_message(state) else END

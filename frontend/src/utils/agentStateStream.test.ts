@@ -100,11 +100,11 @@ test('provides user-facing metadata for every supported status', () => {
 
 test('tracks confirmed sequence, syncing state, and message anchor on the normalized stream', () => {
   const state = createAgentStateStream(10, 'run-10', 100)
-  state.confirmedSeq = 4
+  state.confirmedRevision = 4
   state.syncing = true
   attachAgentStateMessage(state, 1001)
 
-  expect(state.confirmedSeq).toBe(4)
+  expect(state.confirmedRevision).toBe(4)
   expect(state.syncing).toBe(true)
   expect(state.activeMessageId).toBe(1001)
   expect(state.nodes.at(-1)?.messageId).toBe(1001)
@@ -126,8 +126,8 @@ test('matches a tool finish to its call id before falling back to tool order', (
 
 test('rejects late events from a different run id', () => {
   const state = createAgentStateStream(7, 'run-current', 100)
-  expect(shouldAcceptAgentEvent(state, { run_id: 'run-current' })).toBe(true)
-  expect(shouldAcceptAgentEvent(state, { run_id: 'run-old' })).toBe(false)
+  expect(shouldAcceptAgentEvent(state, { turn_id: 'run-current' })).toBe(true)
+  expect(shouldAcceptAgentEvent(state, { turn_id: 'run-old' })).toBe(false)
   expect(shouldAcceptAgentEvent(state, {})).toBe(true)
 })
 

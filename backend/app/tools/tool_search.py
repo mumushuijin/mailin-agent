@@ -25,7 +25,7 @@ from app.tools.exposure import to_langchain_tool, to_langchain_tools
 from app.resilience import execute_sync, tool_error_json, tool_policy
 
 logger = logging.getLogger(__name__)
-_tool_attempt_count: contextvars.ContextVar[int] = contextvars.ContextVar("tool_attempt_count", default=1)
+_tool_attempt_count: contextvars.ContextVar[int] = contextvars.ContextVar("tool_attempt_count", default=0)
 
 
 def get_last_tool_attempt_count() -> int:
@@ -722,7 +722,7 @@ def invoke_card(
     *,
     tool_call_id: str = "",
     session_id: str | None = None,
-    run_id: str | None = None,
+    turn_id: str | None = None,
     approval_granted: bool = False,
     allowlist_matched: bool = False,
     skip_policy_gate: bool = False,
@@ -735,7 +735,7 @@ def invoke_card(
             arguments,
             tool_call_id=tool_call_id,
             session_id=session_id,
-            run_id=run_id,
+            turn_id=turn_id,
             approval_granted=approval_granted,
             allowlist_matched=allowlist_matched,
         )
@@ -744,6 +744,21 @@ def invoke_card(
         if decision.outcome == "needs_approval":
             # 共同执行入口 fail-closed：未经 tools 节点审批不得进入 handler
             return tool_error_json(decision.to_tool_error_message())
+
+    from app.agent.audit import get_runtime_audit
+    audit = get_runtime_audit()
+    attempts = 0
+
+    def _started() -> None:
+        nonlocal attempts
+        attempts += 1
+        _tool_attempt_count.set(attempts)
+        if audit and tool_call_id:
+            audit.tool_started(tool_call_id, attempts)
+
+    def _retry_failed(attempt: int, error: BaseException) -> None:
+        if audit and tool_call_id:
+            audit.tool_retry_failed(tool_call_id, attempt, str(error))
 
     def _run() -> str:
         if card.source == "plugin":
@@ -760,6 +775,7 @@ def invoke_card(
     # MCP handler 内已有 execute_sync（mcp:{server}），此处不再套 tool:{name} 层，避免熔断/超时嵌套。
     if card.package.startswith("mcp-"):
         try:
+            _started()
             return _run()
         except Exception as exc:
             return tool_error_json(str(exc))
@@ -768,8 +784,10 @@ def invoke_card(
         f"tool:{card.name}",
         _run,
         policy=tool_policy(card.name),
+        pre_attempt=_started,
+        on_retry=_retry_failed,
     )
-    _tool_attempt_count.set(max(1, int(outcome.attempts or 1)))
+    _tool_attempt_count.set(attempts)
     if outcome.ok and outcome.value is not None:
         return outcome.value
     return tool_error_json(outcome.error or f"工具 '{card.name}' 调用失败")
@@ -817,7 +835,7 @@ def execute_single_tool_call(
     config: ToolSearchConfig | None = None,
     tool_call_id: str = "",
     session_id: str | None = None,
-    run_id: str | None = None,
+    turn_id: str | None = None,
     approval_granted: bool = False,
     allowlist_matched: bool = False,
 ) -> tuple[str, str]:
@@ -826,12 +844,12 @@ def execute_single_tool_call(
         cards, config = _cards_for_dispatch()
     elif config is None:
         config = load_tool_search_config()
-    _tool_attempt_count.set(1)
+    _tool_attempt_count.set(0)
 
     invoke_kwargs = {
         "tool_call_id": tool_call_id,
         "session_id": session_id,
-        "run_id": run_id,
+        "turn_id": turn_id,
         "approval_granted": approval_granted,
         "allowlist_matched": allowlist_matched,
     }
@@ -846,6 +864,12 @@ def execute_single_tool_call(
         return underlying or name, invoke_card(card, underlying_args, **invoke_kwargs)
 
     if is_bridge_tool(name):
+        from app.agent.audit import get_runtime_audit
+        audit = get_runtime_audit()
+        if name in {TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME}:
+            _tool_attempt_count.set(1)
+            if audit and tool_call_id:
+                audit.tool_started(tool_call_id, 1)
         if name == TOOL_SEARCH_NAME:
             return name, dispatch_tool_search(args, cards=cards, config=config)
         if name == TOOL_DESCRIBE_NAME:
@@ -903,7 +927,7 @@ def _execute_parsed_call(
     config: ToolSearchConfig,
     session_id: str,
     process_for_cache,
-    run_id: str | None = None,
+    turn_id: str | None = None,
     approval_granted: bool = False,
     allowlist_matched: bool = False,
 ) -> ToolMessage:
@@ -919,10 +943,11 @@ def _execute_parsed_call(
             config=config,
             tool_call_id=tool_call_id,
             session_id=session_id,
-            run_id=run_id,
+            turn_id=turn_id,
             approval_granted=approval_granted,
             allowlist_matched=allowlist_matched,
         )
+        content = getattr(content, "full_content", content)
 
         from app.agent.hooks import dispatch_transform_tool_result
 
@@ -936,7 +961,7 @@ def _execute_parsed_call(
         if transformed is not None:
             content = transformed
 
-        status = "completed"
+        status = "succeeded"
         reason_code = "ok"
         try:
             parsed_content = json.loads(content) if isinstance(content, str) else None
@@ -945,12 +970,18 @@ def _execute_parsed_call(
         if isinstance(parsed_content, dict) and parsed_content.get("error"):
             status = "failed"
             reason_code = str(parsed_content.get("reason_code") or "tool_error")
+            if get_last_tool_attempt_count() == 0:
+                status = "denied" if reason_code in {"approval_required", "policy_denied", "denied"} else "skipped"
+            elif "超时" in str(parsed_content["error"]) or "timed out" in str(parsed_content["error"]).lower():
+                status = "unknown"
+                reason_code = "execution_outcome_unknown"
 
         extra_kwargs: dict[str, Any] = {
             "tool_status": status,
             "reason_code": reason_code,
-            "attempt": get_last_tool_attempt_count(),
         }
+        if get_last_tool_attempt_count() > 0:
+            extra_kwargs["attempt"] = get_last_tool_attempt_count()
         if display_name == "read_file":
             file_path = args.get("file_path")
             if isinstance(file_path, str) and is_tool_results_path(file_path):
@@ -961,6 +992,10 @@ def _execute_parsed_call(
             name=display_name,
             additional_kwargs=extra_kwargs,
         )
+        from app.agent.audit import get_runtime_audit
+        audit = get_runtime_audit()
+        if audit:
+            msg = audit.settle_tool(msg)
         return process_for_cache(msg, session_id)
     except Exception as exc:
         logger.exception(
@@ -969,13 +1004,16 @@ def _execute_parsed_call(
             tool_call_id,
             session_id,
         )
-        return _terminal_tool_message(
+        message = _terminal_tool_message(
             name,
             tool_call_id,
             status="failed",
             reason_code="tool_error",
             message=f"工具执行失败：{type(exc).__name__}",
         )
+        from app.agent.audit import get_runtime_audit
+        audit = get_runtime_audit()
+        return audit.settle_tool(message) if audit else message
 
 
 def run_tool_calls(
@@ -983,13 +1021,30 @@ def run_tool_calls(
     session_id: str,
     *,
     process_for_cache,
-    run_id: str | None = None,
+    turn_id: str | None = None,
     execution_grants: dict[str, dict[str, bool]] | None = None,
     timeout_seconds: float | None = None,
     cancel_event=None,
 ) -> list[ToolMessage]:
     """执行 AIMessage.tool_calls：连续 safe 调用并行，barrier 前 drain 且互不重叠。"""
     from concurrent.futures import ThreadPoolExecutor, wait
+    from app.agent.audit import get_runtime_audit
+    audit = get_runtime_audit()
+
+    def _unresolved(future, name: str, call_id: str, code: str) -> ToolMessage:
+        stopped_before_start = future.cancel()
+        attempt = (getattr(audit, "started_attempts", {}) or {}).get(call_id) if audit else None
+        status = ("cancelled" if code == "cancelled" else "skipped") if stopped_before_start else "unknown"
+        msg = _terminal_tool_message(
+            name, call_id, status=status,
+            reason_code=code if stopped_before_start else "execution_outcome_unknown",
+            message="工具调用未开始。" if stopped_before_start else "工具已启动，实际结果无法确认；禁止自动重放。",
+        )
+        if attempt and not stopped_before_start:
+            msg.additional_kwargs["attempt"] = attempt
+        # The worker's completion uses the same settlement lock. If timeout
+        # won, its eventual result becomes evidence, never a second tool row.
+        return audit.settle_tool(msg) if audit else msg
 
     cards, config = _cards_for_dispatch()
     parsed: list[tuple[str, dict[str, Any], str]] = [_parse_tool_call_args(tc) for tc in tool_calls]
@@ -1012,7 +1067,7 @@ def run_tool_calls(
         return None
 
     def _append_unstarted(start_index: int, reason_code: str) -> None:
-        status = "cancelled" if reason_code == "cancelled" else "failed"
+        status = "cancelled" if reason_code == "cancelled" else "skipped"
         message = "工具调用已取消。" if reason_code == "cancelled" else "工具批次超时，调用未开始。"
         for pending_name, _pending_args, pending_id in parsed[start_index:]:
             messages.append(
@@ -1089,7 +1144,7 @@ def run_tool_calls(
                             config=config,
                             session_id=session_id,
                             process_for_cache=process_for_cache,
-                            run_id=run_id,
+                            turn_id=turn_id,
                             **_grant_for(tid),
                         )
                     )
@@ -1105,7 +1160,7 @@ def run_tool_calls(
                         config=config,
                         session_id=session_id,
                         process_for_cache=process_for_cache,
-                        run_id=run_id,
+                        turn_id=turn_id,
                         **_grant_for(tid),
                     )
                     pending_single = {future}
@@ -1125,21 +1180,8 @@ def run_tool_calls(
                                     )
                                 )
                         else:
-                            future.cancel()
                             code = _stop_reason() or "batch_timeout"
-                            messages.append(
-                                _terminal_tool_message(
-                                    n,
-                                    tid,
-                                    status="cancelled" if code == "cancelled" else "failed",
-                                    reason_code=code,
-                                    message=(
-                                        "工具调用已取消。"
-                                        if code == "cancelled"
-                                        else "工具批次超时，调用未完成。"
-                                    ),
-                                )
-                            )
+                            messages.append(_unresolved(future, n, tid, code))
                     finally:
                         pool.shutdown(wait=not pending_single, cancel_futures=True)
             else:
@@ -1155,7 +1197,8 @@ def run_tool_calls(
                         config=config,
                         session_id=session_id,
                         process_for_cache=process_for_cache,
-                        run_id=run_id,
+                        turn_id=turn_id,
+                        **_grant_for(tid),
                     ): (n, tid)
                     for n, a, tid in batch
                 }
@@ -1187,19 +1230,8 @@ def run_tool_calls(
                         stop_reason = stop_reason or "batch_timeout"
                     for future in pending:
                         n, tid = futures[future]
-                        future.cancel()
                         code = stop_reason or "batch_timeout"
-                        results[tid] = _terminal_tool_message(
-                            n,
-                            tid,
-                            status="cancelled" if code == "cancelled" else "failed",
-                            reason_code=code,
-                            message=(
-                                "工具调用已取消。"
-                                if code == "cancelled"
-                                else "工具批次超时，调用未完成。"
-                            ),
-                        )
+                        results[tid] = _unresolved(future, n, tid, code)
                     for _n, _a, tid in batch:
                         messages.append(results[tid])
                 finally:
@@ -1220,7 +1252,7 @@ def run_tool_calls(
                 config=config,
                 session_id=session_id,
                 process_for_cache=process_for_cache,
-                run_id=run_id,
+                turn_id=turn_id,
                 **_grant_for(tid),
             )
         )

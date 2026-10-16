@@ -23,7 +23,7 @@ def build_long_history_messages(count: int = 2_000):
 
 def build_dense_stream_events(count: int = 1_000) -> list[AgentEvent]:
     return [
-        AgentEvent("chunk", {"content": str(i % 10)}, run_id="fixture-run")
+        AgentEvent("chunk", {"content": str(i % 10)}, turn_id="fixture-run")
         for i in range(count)
     ]
 

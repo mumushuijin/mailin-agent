@@ -14,6 +14,7 @@ from app.core.latency import LATENCY_STAGE_TOOL_BATCH, LATENCY_STAGE_USAGE_SNAPS
 from app.resilience import GRAPH_REQUEST_TIMEOUT_SECONDS
 from app.tools.runtime import drain_tool_progress
 from app.tools.tool_search import resolve_tool_display, should_show_tool_in_ui
+from app.storage.message_codec import encode_message
 
 
 def extract_final_content(messages: list) -> str:
@@ -42,21 +43,20 @@ def _chunk_text(chunk) -> str:
     return ""
 
 
-def _evt(event_type: str, data: dict, run_id: str | None = None) -> AgentEvent:
-    return AgentEvent(type=event_type, data=data, run_id=run_id)
+def _evt(event_type: str, data: dict, turn_id: str | None = None) -> AgentEvent:
+    return AgentEvent(type=event_type, data=data, turn_id=turn_id)
 
 
-async def _state_snapshot(graph, config, *, status: str | None = None, run_status: str | None = None) -> dict | None:
+async def _state_snapshot(graph, config, *, status: str | None = None, turn_status: str | None = None) -> dict | None:
     snapshot = await graph.aget_state(config)
     values = dict(snapshot.values) if snapshot and snapshot.values else {}
     if not values or "context" not in values:
         return None
-    values["state_revision"] = int(values.get("state_revision", 0)) + 1
-    values["checkpoint_id"] = values.get("checkpoint_uid") or f"cp_stream_{values['state_revision']}"
+    values["checkpoint_id"] = values.get("checkpoint_uid") or f"cp_{uuid.uuid4().hex}"
     if status:
         values["current_step"] = {**values.get("current_step", {}), "step_status": status}
-    if run_status:
-        values["run_status"] = run_status
+    if turn_status:
+        values["turn_status"] = turn_status
     return public_state_projection(values)
 
 
@@ -67,15 +67,26 @@ async def _persist_terminal(graph, config, *, status: str, reason: str) -> dict 
         return None
     step_status = {"failed": "failed", "cancelled": "cancelled", "handoff": "skipped"}.get(status, status)
     if hasattr(graph, "aupdate_state"):
+        from app.agent.audit import RuntimeLedgerAudit
+        from app.core.settings import get_settings
+        from app.storage.conversation_files import SessionConversationFiles
+        files = SessionConversationFiles(get_settings().workspace_path)
+        scope = values.get("scope") or {}
+        from app.agent.recovery import recover_ledger_tail
+        values = recover_ledger_tail(values, files)
+        if values.get("terminal_reason") == "execution_outcome_unknown":
+            status, reason, step_status = "failed", "execution_outcome_unknown", "failed"
+        seq = RuntimeLedgerAudit(files, scope).turn_terminal(status, reason)
         await graph.aupdate_state(
             config,
             {
-                **terminal_patch(values, status, reason),
+                **to_graph_state(values), **terminal_patch(values, status, reason),
                 "current_step": {**values.get("current_step", {}), "step_status": step_status},
                 "pending_interaction": None,
+                "ledger_pointer": {"applied_seq": seq, "applied_offset": files.offset_after(scope["session_id"], seq)},
             },
         )
-        return await _state_snapshot(graph, config, status=step_status, run_status=status)
+        return await _state_snapshot(graph, config, status=step_status, turn_status=status)
     return public_state_projection(values)
 
 
@@ -83,11 +94,8 @@ def _lifecycle_snapshot(snapshot: dict | None, *, node: str, status: str, index:
     if snapshot is None:
         return None
     value = dict(snapshot)
-    scope = dict(value.get("scope") or {})
-    scope["step_id"] = (value.get("current_step") or {}).get("step_id") or scope.get("step_id")
-    value["scope"] = scope
     current = dict(value.get("current_step") or {})
-    current.update({"step_id": scope["step_id"], "step_name": node, "step_status": status, "index": index})
+    current.update({"step_name": node, "step_status": status, "index": index})
     value["current_step"] = current
     return value
 
@@ -98,7 +106,7 @@ async def stream_graph_events(
     config: dict,
     max_steps: int,
     *,
-    run_id: str | None = None,
+    turn_id: str | None = None,
     input_override=None,
 ) -> AsyncIterator[AgentEvent]:
     """消费 LangGraph 事件流，产出统一 AgentEvent。
@@ -118,14 +126,14 @@ async def stream_graph_events(
                 name = event.get("name", "")
                 data = event.get("data", {})
 
-                if kind == "on_chain_start" and name == "agent":
+                if kind == "on_custom_event" and name == "runtime_node_start" and data.get("node") == "agent":
                     current_step += 1
                     emitted_step_start = True
                     state_frame = _lifecycle_snapshot(
-                        await _state_snapshot(graph, config, status="running", run_status="running"),
+                        public_state_projection(data["state"]),
                         node="agent", status="running", index=current_step,
                     )
-                    yield AgentEvent("step_start", {"step": current_step, "max_steps": max_steps}, run_id, state_frame)
+                    yield AgentEvent("step_start", {"step": current_step, "max_steps": max_steps}, turn_id, state_frame)
 
                 elif kind == "on_chat_model_stream":
                     text = _chunk_text(data.get("chunk"))
@@ -133,10 +141,10 @@ async def stream_graph_events(
                         text = strip_dsml_markup(text)
                         if text:
                             full_content += text
-                            yield _evt("chunk", {"content": text}, run_id)
+                            yield _evt("chunk", {"content": text}, turn_id)
 
-                elif kind == "on_chain_start" and name == "tools":
-                    chain_input = data.get("input") or {}
+                elif kind == "on_custom_event" and name == "runtime_node_start" and data.get("node") == "tools":
+                    chain_input = data.get("state") or {}
                     projected_input = to_runtime_view(chain_input) if "context" in chain_input else chain_input
                     messages = projected_input.get("messages") or []
                     if messages:
@@ -149,7 +157,7 @@ async def stream_graph_events(
                                     "status": "started",
                                     "tool_call_count": len(last.tool_calls),
                                 },
-                                run_id,
+                                turn_id,
                             )
                             for tc in last.tool_calls:
                                 raw_name = tc.get("name", "")
@@ -164,7 +172,7 @@ async def stream_graph_events(
                                 display_name, display_args = resolve_tool_display(raw_name, raw_args)
                                 if should_show_tool_in_ui(display_name):
                                     state_frame = _lifecycle_snapshot(
-                                        await _state_snapshot(graph, config, status="running"),
+                                        public_state_projection(chain_input),
                                         node="tools", status="running", index=current_step,
                                     )
                                     yield AgentEvent(
@@ -174,7 +182,7 @@ async def stream_graph_events(
                                             "args": display_args,
                                             "tool_call_id": tc.get("id"),
                                         },
-                                        run_id,
+                                        turn_id,
                                         state_frame,
                                     )
                             active_tool_call_ids.update(
@@ -187,12 +195,12 @@ async def stream_graph_events(
                         payload = dict(progress)
                         if payload.get("chunk") and not payload.get("message"):
                             payload["message"] = payload["chunk"]
-                        yield _evt("tool_progress", payload, run_id)
+                        yield _evt("tool_progress", payload, turn_id)
                     output = data.get("output") or {}
                     projected_output = to_runtime_view(output) if "context" in output else output
                     todos = projected_output.get("todos")
                     if todos is not None:
-                        yield _evt("todo", {"todos": todos}, run_id)
+                        yield _evt("todo", {"todos": todos}, turn_id)
                     for msg in projected_output.get("messages") or []:
                         if isinstance(msg, ToolMessage):
                             if active_tool_call_ids and str(msg.tool_call_id or "") not in active_tool_call_ids:
@@ -202,17 +210,16 @@ async def stream_graph_events(
                                 reason_code = (msg.additional_kwargs or {}).get("reason_code")
                                 tool_result = str(msg.content) if msg.content is not None else ""
                                 tool_kwargs = msg.additional_kwargs or {}
-                                result_ref = tool_kwargs.get("tool_cache_path")
+                                execution = encode_message(msg).get("execution") or {}
+                                outcome = execution.get("status")
+                                result_ref = (tool_kwargs.get("ledger_reference") or {}).get("path") or tool_kwargs.get("tool_cache_path")
                                 result_summary = tool_kwargs.get("tool_cache_summary") or summarize_tool_result(
                                     tool_result
                                 )
                                 state_frame = _lifecycle_snapshot(
-                                    await _state_snapshot(
-                                        graph, config,
-                                        status="failed" if (msg.additional_kwargs or {}).get("reason_code") else "completed",
-                                    ),
+                                    public_state_projection(output) if "context" in output else await _state_snapshot(graph, config),
                                     node="tools",
-                                    status="failed" if (msg.additional_kwargs or {}).get("reason_code") else "completed",
+                                    status=(output.get("current_step") or {}).get("step_status") or ("failed" if outcome in {"failed", "unknown"} else "completed"),
                                     index=current_step,
                                 )
                                 yield AgentEvent(
@@ -223,11 +230,14 @@ async def stream_graph_events(
                                         "result_ref": str(result_ref) if result_ref else None,
                                         "result_truncated": result_summary != tool_result,
                                         "tool_call_id": msg.tool_call_id,
+                                        "status": outcome,
+                                        "execution": execution,
+                                        "result_seq": tool_kwargs.get("ledger_seq"),
                                         "reason_code": (
                                             str(reason_code) if reason_code is not None else None
                                         ),
                                     },
-                                    run_id,
+                                    turn_id,
                                     state_frame,
                                 )
                     active_tool_call_ids.clear()
@@ -237,7 +247,7 @@ async def stream_graph_events(
                             "stage": LATENCY_STAGE_TOOL_BATCH,
                             "status": "done",
                         },
-                        run_id,
+                        turn_id,
                     )
 
                 elif kind == "on_chain_end" and name == "agent" and emitted_step_start:
@@ -249,7 +259,7 @@ async def stream_graph_events(
                             "stage": LATENCY_STAGE_USAGE_SNAPSHOT,
                             "status": "started",
                         },
-                        run_id,
+                        turn_id,
                     )
                     snapshot = await graph.aget_state(config)
                     values = dict(snapshot.values) if snapshot and snapshot.values else {}
@@ -269,28 +279,28 @@ async def stream_graph_events(
                                     "layer": context_usage.get("compression_layer"),
                                     "message": "上下文整理完成",
                                 },
-                                run_id,
+                                turn_id,
                             )
-                        yield _evt("context_usage", context_usage, run_id)
+                        yield _evt("context_usage", context_usage, turn_id)
                     api_usage = projected_output.get("api_usage")
                     if api_usage:
-                        yield _evt("api_usage", api_usage, run_id)
+                        yield _evt("api_usage", api_usage, turn_id)
                     session_token_stats = projected_output.get("session_token_stats")
                     if session_token_stats:
-                        yield _evt("session_token_stats", session_token_stats, run_id)
+                        yield _evt("session_token_stats", session_token_stats, turn_id)
                     yield _evt(
                         "stage",
                         {
                             "stage": LATENCY_STAGE_USAGE_SNAPSHOT,
                             "status": "done",
                         },
-                        run_id,
+                        turn_id,
                     )
                     state_frame = _lifecycle_snapshot(
-                        await _state_snapshot(graph, config, status="completed"),
+                        public_state_projection(output) if "context" in output else await _state_snapshot(graph, config),
                         node="agent", status="completed", index=current_step,
                     )
-                    yield AgentEvent("step_finish", {"step": current_step}, run_id, state_frame)
+                    yield AgentEvent("step_finish", {"step": current_step}, turn_id, state_frame)
                     emitted_step_start = False
 
         session_id = config.get("configurable", {}).get("thread_id")
@@ -306,20 +316,11 @@ async def stream_graph_events(
             snapshot = await graph.aget_state(config)
             values = dict(snapshot.values or {}) if snapshot else {}
             if "context" in values:
-                state_frame = dict(values)
-                state_frame["state_revision"] = int(values.get("state_revision", 0)) + 1
-                state_frame["checkpoint_id"] = values.get("checkpoint_uid") or f"cp_stream_{state_frame['state_revision']}"
-                state_frame["run_status"] = "waiting_user"
-                state_frame["current_step"] = {**values.get("current_step", {}), "step_status": "waiting_user"}
-                state_frame["pending_interaction"] = {
-                    "kind": value.get("kind"), "interrupt_id": value.get("interrupt_id"),
-                    "tool_call_id": value.get("tool_call_id"), "run_id": (values.get("scope") or {}).get("run_id"),
-                    "step_id": (values.get("scope") or {}).get("step_id"),
-                }
-                state_frame = public_state_projection(state_frame)
+                state_frame = public_state_projection(values)
             else:
                 state_frame = None
-            yield AgentEvent("interrupt", {**value, "session_id": config.get("configurable", {}).get("thread_id")}, run_id, state_frame)
+            from app.storage.message_codec import safe_business_value
+            yield AgentEvent("interrupt", safe_business_value({**value, "session_id": config.get("configurable", {}).get("thread_id")}), turn_id, state_frame)
             return
 
         final_state = await graph.aget_state(config)
@@ -327,16 +328,16 @@ async def stream_graph_events(
         projected = to_runtime_view(values) if "context" in values else values
         messages = projected.get("messages", [])
         if values:
-            yield _evt("context_usage", resolve_context_usage(projected, session_id), run_id)
+            yield _evt("context_usage", resolve_context_usage(projected, session_id), turn_id)
         todos = projected.get("todos")
         if todos:
-            yield _evt("todo", {"todos": todos}, run_id)
+            yield _evt("todo", {"todos": todos}, turn_id)
         api_usage = projected.get("api_usage")
         if api_usage:
-            yield _evt("api_usage", api_usage, run_id)
+            yield _evt("api_usage", api_usage, turn_id)
         session_token_stats = projected.get("session_token_stats")
         if session_token_stats:
-            yield _evt("session_token_stats", session_token_stats, run_id)
+            yield _evt("session_token_stats", session_token_stats, turn_id)
         content = extract_final_content(messages) or full_content
         terminal_reason = projected.get("terminal_reason")
         done_data: dict = {"content": content, "session_id": session_id}
@@ -346,21 +347,22 @@ async def stream_graph_events(
             if terminal_reason == "handoff":
                 done_data["handoff"] = True
         if "context" in values and hasattr(graph, "aupdate_state"):
-            terminal_status = values.get("run_status")
+            terminal_status = values.get("turn_status")
             if terminal_status not in {"completed", "failed", "cancelled", "handoff"}:
                 terminal_status = (
                     "handoff" if terminal_reason == "handoff"
                     else "failed" if terminal_reason == "step_budget_exhausted"
                     else "completed"
                 )
-            await graph.aupdate_state(config, terminal_patch(values, terminal_status, terminal_reason or "completed"))
+            if values.get("turn_status") not in {"completed", "failed", "cancelled", "handoff"}:
+                await _persist_terminal(graph, config, status=terminal_status, reason=terminal_reason or "completed")
         state_frame = await _state_snapshot(
             graph, config,
-            run_status=values.get("run_status") if values.get("run_status") in {"completed", "failed", "cancelled", "handoff"} else ("failed" if terminal_reason == "step_budget_exhausted" else "completed"),
+            turn_status=values.get("turn_status") if values.get("turn_status") in {"completed", "failed", "cancelled", "handoff"} else ("failed" if terminal_reason == "step_budget_exhausted" else "completed"),
         )
         if state_frame:
             state_frame["terminal_reason"] = terminal_reason or "completed"
-        yield AgentEvent("done", done_data, run_id, state_frame)
+        yield AgentEvent("done", done_data, turn_id, state_frame)
 
     except GraphInterrupt:
         # 兼容旧路径；1.x astream_events 通常不抛，见上方 pending-interrupt 检查
@@ -369,19 +371,19 @@ async def stream_graph_events(
         session_id = config.get("configurable", {}).get("thread_id")
         terminal_state = await _persist_terminal(graph, config, status="failed", reason="timeout")
         yield AgentEvent(
-            "error", {"error": f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s）"}, run_id, terminal_state
+            "error", {"error": f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s）"}, turn_id, terminal_state
         )
         if full_content:
             yield _evt(
                 "done",
                 {"content": full_content, "session_id": session_id, "partial": True},
-                run_id,
+                turn_id,
             )
     except asyncio.CancelledError:
         session_id = config.get("configurable", {}).get("thread_id")
         terminal_state = await _persist_terminal(graph, config, status="cancelled", reason="cancelled")
-        yield AgentEvent("error", {"error": "已取消", "cancelled": True}, run_id, terminal_state)
-        yield _evt(
+        yield AgentEvent("error", {"error": "已取消", "cancelled": True}, turn_id, terminal_state)
+        yield AgentEvent(
             "done",
             {
                 "content": full_content,
@@ -389,10 +391,9 @@ async def stream_graph_events(
                 "partial": True,
                 "cancelled": True,
             },
-            run_id,
-            terminal_state,
+            turn_id, terminal_state,
         )
         raise
     except Exception as e:
         terminal_state = await _persist_terminal(graph, config, status="failed", reason="error")
-        yield AgentEvent("error", {"error": str(e)}, run_id, terminal_state)
+        yield AgentEvent("error", {"error": str(e)}, turn_id, terminal_state)

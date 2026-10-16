@@ -25,13 +25,13 @@ function makeCtx(withAgentState = false): ChatStreamState {
     activeStage: ref<string | null>('waiting_user'),
     agentState: withAgentState ? ref(createAgentStateStream(1, 'r1', 100)) : undefined,
     pendingApproval: ref<PendingApproval | null>({
-      runId: 'r1',
+      turnId: 'r1',
       tool: 'write_file',
       args: {},
       reason: 'need',
     }),
     pendingAskUser: ref<PendingAskUser | null>({
-      runId: 'r1',
+      turnId: 'r1',
       prompt: 'q',
       options: [],
       allowMultiple: false,
@@ -48,13 +48,13 @@ function makeCtx(withAgentState = false): ChatStreamState {
 }
 
 describe('useChatStream terminal cleanup', () => {
-  const canonicalState = (runId: string, revision: number, todos: unknown[] = []) => ({
-    checkpoint_id: `cp-${revision}`, state_revision: revision,
-    scope: { workspace_id: 'w1', session_id: 's1', run_id: runId, task_id: 't1', request_id: 'q1', step_id: 'step1' },
-    context: { working_message: [] }, max_step_every_run: 4, tasks: ['t1'], current_task: 't1',
-    current_step: { step_id: 'step1', step_name: 'agent', step_status: 'running', tool_calls: [], token_info: {} },
-    memory: { recorded_count: 0, last_synced_run: null, source_files: [] },
-    task_details: { todos },
+  const canonicalState = (turnId: string, revision: number, todos: unknown[] = []) => ({
+    schema_version: 2, checkpoint_id: `cp_${'a'.repeat(32)}`, state_revision: revision, turn_status: 'running', ledger_pointer: { applied_seq: 99 },
+    scope: { workspace_id: 'w1', session_id: 's1', turn_id: turnId },
+    context: { working_message: [] }, max_step_every_turn: 4, tasks: ['t1'], current_task: 't1',
+    current_step: { step_id: 'step1', step_name: 'agent', step_status: 'running', tool_calls: [], model: { request_id: 'q1' } },
+    memory: { recorded_count: 0, last_synced_turn: null, source_files: [] },
+    task_details: { _runtime: { todos } },
   })
 
   it('clears pending prompts on handoff done', () => {
@@ -100,7 +100,7 @@ describe('useChatStream terminal cleanup', () => {
       currentTextSegmentId: -1,
     }
     applyChatStreamEvent(
-      { type: 'done', content: '', run_id: 'r1' } as StreamEvent,
+      { type: 'done', content: '', turn_id: 'r1' } as StreamEvent,
       ctx,
       session,
     )
@@ -124,7 +124,7 @@ describe('useChatStream terminal cleanup', () => {
         mode: 'handoff_and_stop',
         prompt: '请查看结果',
         interrupt_id: 'iid',
-        run_id: 'r2',
+        turn_id: 'r2',
         terminal_on_ack: true,
       } as StreamEvent,
       ctx,
@@ -151,7 +151,7 @@ describe('useChatStream terminal cleanup', () => {
         mode: 'handoff_and_stop',
         prompt: '请查看结果',
         interrupt_id: 'iid',
-        run_id: 'r1',
+        turn_id: 'r1',
         terminal_on_ack: true,
       } as StreamEvent,
       ctx,
@@ -165,7 +165,7 @@ describe('useChatStream terminal cleanup', () => {
         handoff: true,
         terminal_reason: 'handoff',
         content: '',
-        run_id: 'r1',
+        turn_id: 'r1',
       } as StreamEvent,
       ctx,
       session,
@@ -186,17 +186,17 @@ describe('useChatStream terminal cleanup', () => {
     }
 
     applyChatStreamEvent(
-      { type: 'done', content: '', run_id: 'r1' } as StreamEvent,
+      { type: 'done', content: '', turn_id: 'r1' } as StreamEvent,
       ctx,
       session,
     )
     applyChatStreamEvent(
-      { type: 'tool_start', tool: 'write_file', args: {}, run_id: 'r1' } as StreamEvent,
+      { type: 'tool_start', tool: 'write_file', args: {}, turn_id: 'r1' } as StreamEvent,
       ctx,
       session,
     )
     applyChatStreamEvent(
-      { type: 'stage', stage: 'thinking', run_id: 'r1' } as StreamEvent,
+      { type: 'stage', stage: 'thinking', turn_id: 'r1' } as StreamEvent,
       ctx,
       session,
     )
@@ -216,7 +216,7 @@ describe('useChatStream terminal cleanup', () => {
     const first = {
       type: 'step_start',
       step: 1,
-      run_id: 'r3',
+      turn_id: 'r3',
       seq: 1,
       event_id: 'r3-1',
       state: canonicalState('r3', 1),
@@ -227,7 +227,7 @@ describe('useChatStream terminal cleanup', () => {
       {
         type: 'chunk',
         content: 'late',
-        run_id: 'r3',
+        turn_id: 'r3',
         seq: 0,
         event_id: 'r3-0',
       } as StreamEvent,
@@ -249,7 +249,7 @@ describe('useChatStream terminal cleanup', () => {
       {
         type: 'stage',
         stage: 'thinking',
-        run_id: 'r4',
+        turn_id: 'r4',
         seq: 1,
         event_id: 'r4-1',
         state: canonicalState('r4', 1, [{ id: '1', content: 'x', status: 'completed' }]),
@@ -261,7 +261,7 @@ describe('useChatStream terminal cleanup', () => {
       {
         type: 'stage',
         stage: 'thinking',
-        run_id: 'r4',
+        turn_id: 'r4',
         seq: 3,
         event_id: 'r4-3',
       } as StreamEvent,
@@ -276,12 +276,12 @@ describe('useChatStream terminal cleanup', () => {
   it('rejects an older revision and a prior run after the next session starts', () => {
     const ctx = makeCtx()
     const session = { assistantMsgIndex: -1, currentSegments: [] as MessageSegment[], currentTextSegmentId: -1 }
-    applyChatStreamEvent({ type: 'session', run_id: 'r1', seq: 1, event_id: 'r1-1' } as StreamEvent, ctx, session)
-    applyChatStreamEvent({ type: 'state_sync', run_id: 'r1', seq: 2, event_id: 'r1-2', state: canonicalState('r1', 5) } as StreamEvent, ctx, session)
-    applyChatStreamEvent({ type: 'state_sync', run_id: 'r1', seq: 3, event_id: 'r1-3', state: canonicalState('r1', 4) } as StreamEvent, ctx, session)
-    expect(ctx.agentState?.value?.confirmedSeq).not.toBe(4)
-    applyChatStreamEvent({ type: 'session', run_id: 'r2', seq: 1, event_id: 'r2-1' } as StreamEvent, ctx, session)
-    applyChatStreamEvent({ type: 'step_start', run_id: 'r1', seq: 4, event_id: 'r1-4' } as StreamEvent, ctx, session)
+    applyChatStreamEvent({ type: 'session', turn_id: 'r1', seq: 1, event_id: 'r1-1' } as StreamEvent, ctx, session)
+    applyChatStreamEvent({ type: 'state_sync', turn_id: 'r1', seq: 2, event_id: 'r1-2', state: canonicalState('r1', 5) } as StreamEvent, ctx, session)
+    applyChatStreamEvent({ type: 'state_sync', turn_id: 'r1', seq: 3, event_id: 'r1-3', state: canonicalState('r1', 4) } as StreamEvent, ctx, session)
+    expect(ctx.agentState?.value?.confirmedRevision).not.toBe(4)
+    applyChatStreamEvent({ type: 'session', turn_id: 'r2', seq: 1, event_id: 'r2-1' } as StreamEvent, ctx, session)
+    applyChatStreamEvent({ type: 'step_start', turn_id: 'r1', seq: 4, event_id: 'r1-4' } as StreamEvent, ctx, session)
     expect(ctx.messages.value).toHaveLength(0)
   })
 })

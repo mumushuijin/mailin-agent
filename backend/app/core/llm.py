@@ -28,4 +28,7 @@ def get_chat_model() -> ChatOpenAI:
         temperature=agent_cfg.get("temperature", 0.7),
         streaming=True,
         stream_usage=True,
+        # Application retries each have a durable request identity. Disable the
+        # SDK's otherwise invisible retries underneath that boundary.
+        max_retries=0,
     )

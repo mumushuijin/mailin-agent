@@ -93,13 +93,10 @@ async def test_projection_rebuilds_from_checkpoint_when_missing_or_stale(history
 
     monkeypatch.setattr("app.services.chat_service.get_graph", lambda: DummyGraph())
 
-    page = await chat.get_history_page(sid, limit=1)
-    assert [m.content for m in page.messages] == ["new"]
-    assert page.has_more is True
-    assert page.next_cursor == "1"
-    rebuilt = chat.history_projection.read(sid)
-    assert rebuilt is not None
-    assert rebuilt["version"] == PROJECTION_VERSION
+    original = projection_path.read_bytes()
+    with pytest.raises(ValueError, match="投影格式"):
+        await chat.get_history_page(sid, limit=1)
+    assert projection_path.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -111,20 +108,44 @@ async def test_projection_rebuilds_from_jsonl_ledger(history_spaces):
     chat.history_projection = HistoryProjectionStore(home)
     chat.conversation_files = SessionConversationFiles(home)
     sid = chat.session_store.create(str(project))
-    scope = {"workspace_id": "workspace-1", "session_id": sid, "run_id": "run-1",
-             "task_id": "task-1", "request_id": None, "step_id": None}
+    scope = {"workspace_id": chat.conversation_files.workspace_id, "session_id": sid, "turn_id": "turn-1"}
     chat.conversation_files.append_messages(
-        sid, "run-1", [HumanMessage(content="question", id="m1"), AIMessage(content="answer", id="m2")], scope=scope,
+        sid, "turn-1", [HumanMessage(content="question", id="m1"), AIMessage(content="answer", id="m2")], scope=scope,
     )
     page = await chat.get_history_page(sid, limit=10)
     assert [message.content for message in page.messages] == ["question", "answer"]
-    assert [message.scope["run_id"] for message in page.messages] == ["run-1", "run-1"]
+    assert [message.turn_id for message in page.messages] == ["turn-1", "turn-1"]
     assert len({message.message_id for message in page.messages}) == 2
-    assert page.messages[1].vendor_message_id == "m2"
+    assert "vendor_message_id" not in page.messages[1].model_dump()
     assert chat.history_projection.read(sid) is not None
-    chat.conversation_files.append_messages(sid, "run-2", [HumanMessage(content="follow up", id="m3")], scope={**scope, "run_id": "run-2", "task_id": "task-2"})
+    chat.conversation_files.append_messages(sid, "turn-2", [HumanMessage(content="follow up", id="m3")], scope={**scope, "turn_id": "turn-2"})
     refreshed = await chat.get_history_page(sid, limit=10)
     assert [message.content for message in refreshed.messages] == ["question", "answer", "follow up"]
+
+
+@pytest.mark.asyncio
+async def test_full_tool_result_is_bound_to_ledger_seq_when_call_id_repeats(history_spaces):
+    settings, home, project = history_spaces
+    chat = ChatService()
+    chat.settings = settings
+    chat.session_store = SessionStore(home)
+    chat.conversation_files = SessionConversationFiles(home)
+    sid = chat.session_store.create(str(project))
+    sequences = []
+    for index in (1, 2):
+        turn_id = f"turn-{index}"
+        scope = {"workspace_id": chat.conversation_files.workspace_id, "session_id": sid, "turn_id": turn_id}
+        sequences.append(chat.conversation_files.append_messages(
+            sid, turn_id, [ToolMessage(content=f"result-{index}-" + "x" * 120_000, tool_call_id="reused-call")], scope=scope,
+        ))
+    assert chat.conversation_files.row_at(sid, sequences[0])["message"]["content"][0]["type"] == "reference"
+    for index, seq in enumerate(sequences, 1):
+        result = await chat.get_tool_result(sid, "reused-call", seq=seq)
+        assert result.available and result.content == f"result-{index}-" + "x" * 120_000
+    wrong = await chat.get_tool_result(sid, "other-call", seq=sequences[0])
+    assert not wrong.available and "不匹配" in wrong.error
+    missing = await chat.get_tool_result(sid, "reused-call", seq=sequences[-1] + 1)
+    assert not missing.available and "不可用" in missing.error
 
 
 @pytest.mark.asyncio
@@ -137,13 +158,11 @@ async def test_five_runs_eleven_model_replies_keep_scoped_history_without_prompt
     chat.conversation_files = SessionConversationFiles(home)
     sid = chat.session_store.create(str(project))
     for run_index in range(5):
-        run_id = f"run-{run_index}"
-        scope = {"workspace_id": "workspace-1", "session_id": sid, "run_id": run_id,
-                 "task_id": f"task-{run_index}", "request_id": None, "step_id": None}
+        run_id = f"turn-{run_index}"
+        scope = {"workspace_id": chat.conversation_files.workspace_id, "session_id": sid, "turn_id": run_id}
         chat.conversation_files.append_messages(sid, run_id, [HumanMessage(content=f"question {run_index}")], scope=scope)
         for request_index in range(2 + (run_index == 0)):
-            request_scope = {**scope, "request_id": f"request-{run_index}-{request_index}",
-                             "step_id": f"step-{run_index}-{request_index}"}
+            request_scope = scope
             messages = [
                 SystemMessage(content="rebuilt bootstrap", additional_kwargs={"context_bootstrap": True}),
                 AIMessage(content=f"answer {run_index}-{request_index}", id=f"run--vendor-{run_index}-{request_index}"),
@@ -156,14 +175,14 @@ async def test_five_runs_eleven_model_replies_keep_scoped_history_without_prompt
 
     rows = chat.conversation_files.read(sid)
     assert len(rows) == 18  # five users, eleven assistant replies, two tool results
-    assert all(row["origin"] != "system_maintenance" for row in rows)
+    assert all(row["message"]["role"] != "system" for row in rows)
     first = await chat.get_history_page(sid, limit=30)
     chat.history_projection.delete(sid)
     rebuilt = await chat.get_history_page(sid, limit=30)
-    assert [(m.message_id, m.scope, m.origin) for m in rebuilt.messages] == [
-        (m.message_id, m.scope, m.origin) for m in first.messages
+    assert [(m.message_id, m.turn_id, m.role) for m in rebuilt.messages] == [
+        (m.message_id, m.turn_id, m.role) for m in first.messages
     ]
-    assert [m.scope["run_id"] for m in rebuilt.messages if m.role == "user"] == [f"run-{i}" for i in range(5)]
+    assert [m.turn_id for m in rebuilt.messages if m.role == "user"] == [f"turn-{i}" for i in range(5)]
     assert len({m.message_id for m in rebuilt.messages}) == 18
 
 
@@ -195,26 +214,16 @@ def test_new_run_carries_transcript_but_only_appends_current_user_message(histor
     chat.conversation_files = SessionConversationFiles(home)
     session_id = "00000000-0000-4000-8000-000000000010"
     monkeypatch.setattr(chat, "_bootstrap_fingerprint", lambda _session_id: "fingerprint")
-    previous = {
-        "checkpoint_id": "cp_old",
-        "scope": {},
-        "context": {
-            "working_message": [
-                SystemMessage(content="system prompt"),
-                HumanMessage(content="reference", additional_kwargs={"context_reference": True}),
-                HumanMessage(content="prior user turn", id="prior-user"),
-            ]
-        },
-        "max_step_every_run": 48,
-        "tasks": [],
-        "current_task": None,
-        "current_step": {},
-        "memory": {},
-        "state_revision": 1,
-    }
+    from app.agent.state import new_agent_state
+    previous = new_agent_state(workspace_id=str(home), session_id=session_id, message=HumanMessage(content="prior user turn", id="prior-user"))
+    previous["context"]["working_message"] = [
+        SystemMessage(content="system prompt"),
+        HumanMessage(content="reference", additional_kwargs={"context_reference": True}),
+        HumanMessage(content="prior user turn", id="prior-user"),
+    ]
     assert REQUIRED_TOP_LEVEL.issubset(previous)
 
-    state = chat._new_run_state(session_id, "current user turn", 48, "run-new", previous)
+    state = chat._new_run_state(session_id, "current user turn", 48, "turn-new", previous)
 
     assert [message.content for message in state["context"]["working_message"]] == [
         "prior user turn",
@@ -252,10 +261,11 @@ async def test_tool_history_shows_execution_status_without_result_content(histor
     projected = chat.messages_to_openai(messages, session_id=sid, compact_tools=True)
     tool_msg = next(msg for msg in projected if msg.role == "tool")
     assert tool_msg.tool_call_id == "call-1"
-    assert tool_msg.tool_status == "completed"
+    assert tool_msg.tool_status == "succeeded"
     assert tool_msg.content is None
     assert tool_msg.tool_result_preview is None
 
+    chat.conversation_files.append_messages(sid, "t", messages)
     full = await chat.get_tool_result(sid, "call-1")
     assert full.available is True
     assert full.content == large

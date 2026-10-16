@@ -8,15 +8,15 @@ from typing import Any, Awaitable, Callable
 
 @dataclass(frozen=True)
 class DispatchEvent:
-    run_id: str
+    turn_id: str
     seq: int
     kind: str
     payload: dict[str, Any]
 
 
 class RunEventDispatcher:
-    def __init__(self, run_id: str, *, maxsize: int = 128):
-        self.run_id = run_id
+    def __init__(self, turn_id: str, *, maxsize: int = 128):
+        self.turn_id = turn_id
         self._queue: asyncio.Queue[DispatchEvent] = asyncio.Queue(maxsize=maxsize)
         self._seq = 0
         self._latest_state: Any = None
@@ -33,7 +33,7 @@ class RunEventDispatcher:
         self._seq += 1
         if state is not None:
             self._latest_state = state
-        event = DispatchEvent(self.run_id, self._seq, kind, dict(payload))
+        event = DispatchEvent(self.turn_id, self._seq, kind, dict(payload))
         try:
             self._queue.put_nowait(event)
             return True
@@ -53,7 +53,7 @@ class RunEventDispatcher:
         self._seq += 1
         if state is not None:
             self._latest_state = state
-        event = DispatchEvent(self.run_id, self._seq, kind, dict(payload))
+        event = DispatchEvent(self.turn_id, self._seq, kind, dict(payload))
         try:
             self._queue.put_nowait(event)
             return True
@@ -84,7 +84,7 @@ class RunEventDispatcher:
                 self._latest_state = None
                 self._needs_snapshot = False
                 self._seq += 1
-                await send(DispatchEvent(self.run_id, self._seq, "state_sync", {"agent_event": state}))
+                await send(DispatchEvent(self.turn_id, self._seq, "state_sync", {"agent_event": state}))
 
     def close(self) -> None:
         self._closed = True

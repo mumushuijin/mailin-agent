@@ -1,6 +1,7 @@
 import api, { getStreamApiBase } from './index'
 import { chatWs } from './ws'
-import { readCanonicalAgentState } from '@/utils/canonicalAgentState'
+import { readCanonicalAgentState, rejectLegacyTurnFields } from '@/utils/canonicalAgentState'
+import { normalizeInteractionRejection } from '@/utils/streamProtocol'
 
 const API_BASE = getStreamApiBase()
 
@@ -12,6 +13,7 @@ export interface ChatMessage {
 export interface ChatResponse {
   content: string
   session_id: string | null
+  turn_id?: string
 }
 
 export interface ContextUsageBreakdown {
@@ -60,18 +62,21 @@ export interface SessionTokenStats {
 }
 
 export interface AgentCheckpointState {
+  schema_version: 2
   checkpoint_id: string
   state_revision: number
-  scope: { workspace_id: string; session_id: string; run_id: string; task_id: string | null; request_id: string | null; step_id: string | null }
+  scope: { workspace_id: string; session_id: string; turn_id: string }
   context: Record<string, unknown> & { working_message: unknown[] }
-  max_step_every_run: number
+  max_step_every_turn: number
   tasks: string[]
   current_task: string | null
-  current_step: Record<string, unknown>
+  current_step: Record<string, unknown> & { step_id: string | null; tool_calls: Array<Record<string, unknown>>; model?: { request_id: string; usage?: Record<string, number> } | null }
   memory: Record<string, unknown>
   task_details?: Record<string, unknown>
-  run_status?: string
+  turn_status?: string
   terminal_reason?: string | null
+  ledger_pointer?: { applied_seq: number }
+  pending_interaction?: Record<string, unknown> | null
 }
 
 export interface StreamEvent {
@@ -100,6 +105,7 @@ export interface StreamEvent {
   args?: Record<string, unknown>
   result?: string
   result_ref?: string | null
+  result_seq?: number
   result_truncated?: boolean
   error?: string
   status?: string
@@ -111,7 +117,7 @@ export interface StreamEvent {
   session_id?: string | null
   step?: number
   max_steps?: number
-  run_id?: string
+  turn_id?: string
   partial?: boolean
   cancelled?: boolean
   handoff?: boolean
@@ -146,6 +152,8 @@ export interface StreamEvent {
   event_id?: string
   gap_detected?: boolean
   seq?: number
+  step_id?: string
+  execution?: { status: string; attempt?: number; started_at?: number; finished_at?: number; error?: { code: string; message?: string } }
 }
 
 export type StreamCallback = (event: StreamEvent) => void
@@ -157,7 +165,7 @@ export const chatApi = {
     sessionId?: string,
     signal?: AbortSignal
   ): Promise<ChatResponse> => {
-    return api.post('/chat/send', { message, session_id: sessionId }, {
+    return api.post('/chat/send', { message, session_id: sessionId, turn_id: crypto.randomUUID() }, {
       signal,
       timeout: 300000,
     })
@@ -168,14 +176,15 @@ export const chatApi = {
     message: string,
     sessionId: string | null | undefined,
     onChunk: StreamCallback,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    submittedTurnId?: string,
   ): Promise<ChatResponse> => {
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ message, session_id: sessionId }),
+      body: JSON.stringify({ message, session_id: sessionId, turn_id: submittedTurnId || crypto.randomUUID() }),
       signal,
     })
 
@@ -192,6 +201,7 @@ export const chatApi = {
     let buffer = ''
     let fullContent = ''
     let finalSessionId = sessionId
+    let finalTurnId = submittedTurnId
 
     try {
       while (true) {
@@ -218,18 +228,22 @@ export const chatApi = {
             if (data && currentEvent) {
               try {
                 const parsed = JSON.parse(data)
+                rejectLegacyTurnFields(parsed)
                 const state = readCanonicalAgentState(parsed.state)
-                const runId = (parsed.run_id || state?.scope.run_id) as string | undefined
+                const turnId = (parsed.turn_id || state?.scope.turn_id) as string | undefined
+                finalTurnId = turnId || finalTurnId
                 const eventMeta = {
-                  run_id: runId,
+                  turn_id: turnId,
                   state,
                   event_id: parsed.event_id,
                   seq: parsed.seq,
+                  session_id: parsed.session_id || state?.scope.session_id,
+                  step_id: parsed.step_id || state?.current_step.step_id,
                 }
 
                 if (currentEvent === 'session') {
                   finalSessionId = parsed.session_id
-                  onChunk({ type: 'session', session_id: parsed.session_id, ...eventMeta })
+                  onChunk({ type: 'session', ...eventMeta })
                 } else if (currentEvent === 'step_start') {
                   onChunk({ type: 'step_start', step: parsed.step, max_steps: parsed.max_steps, ...eventMeta })
                 } else if (currentEvent === 'chunk') {
@@ -243,8 +257,12 @@ export const chatApi = {
                     tool: parsed.tool,
                     result: parsed.result,
                     result_ref: parsed.result_ref,
+                    result_seq: parsed.result_seq,
                     result_truncated: Boolean(parsed.result_truncated),
                     tool_call_id: parsed.tool_call_id,
+                    status: parsed.status,
+                    execution: parsed.execution,
+                    reason_code: parsed.reason_code,
                     ...eventMeta,
                   })
                 } else if (currentEvent === 'tool_progress') {
@@ -305,7 +323,6 @@ export const chatApi = {
                   onChunk({
                     type: 'done',
                     content: parsed.content,
-                    session_id: parsed.session_id,
                     partial: Boolean(parsed.partial),
                     cancelled: Boolean(parsed.cancelled),
                     terminal_reason: parsed.terminal_reason,
@@ -313,10 +330,10 @@ export const chatApi = {
                     ...eventMeta,
                   })
                 } else if (currentEvent === 'error') {
-                  onChunk({ type: 'error', error: parsed.error, cancelled: Boolean(parsed.cancelled), ...eventMeta })
+                  onChunk(normalizeInteractionRejection({ type: 'error', error: parsed.error, reason_code: parsed.reason_code, cancelled: Boolean(parsed.cancelled), ...eventMeta }))
                 }
-              } catch {
-                // 忽略解析错误
+              } catch (error) {
+                throw new Error(error instanceof Error ? error.message : '不支持的传输协议')
               }
               currentEvent = ''
             }
@@ -327,7 +344,7 @@ export const chatApi = {
       reader.releaseLock()
     }
 
-    return { content: fullContent, session_id: finalSessionId ?? null }
+    return { content: fullContent, session_id: finalSessionId ?? null, turn_id: finalTurnId }
   },
 
   // WebSocket 发送（优先），失败时降级 SSE
@@ -345,12 +362,14 @@ export const chatApi = {
       chatWs.cancel()
     }
     signal?.addEventListener('abort', abortHandler)
+    const turnId = crypto.randomUUID()
 
     try {
-      return await chatWs.sendMessage(message, sessionId, onChunk)
+      return await chatWs.sendMessage(message, sessionId, onChunk, turnId)
     } catch (wsError) {
+      if ((wsError as { executionStarted?: boolean }).executionStarted) throw wsError
       console.warn('WebSocket 发送失败，降级到 SSE:', wsError)
-      return chatApi.sendMessageStream(message, sessionId, onChunk, signal)
+      return chatApi.sendMessageStream(message, sessionId, onChunk, signal, turnId)
     } finally {
       signal?.removeEventListener('abort', abortHandler)
     }
@@ -363,23 +382,23 @@ export const chatApi = {
 
   // 工具审批 / 问人
   approveTool: (
-    runId: string,
+    turnId: string,
     decision: 'allow' | 'deny',
-    opts?: { toolCallId?: string; sessionId?: string; stepId?: string },
+    opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string },
   ) => {
-    chatWs.approve(runId, decision, opts)
+    chatWs.approve(turnId, decision, opts)
   },
   answerAskUser: (
-    runId: string,
+    turnId: string,
     answer: string | string[],
     opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string; stepId?: string },
   ) => {
-    chatWs.answerAskUser(runId, answer, opts)
+    chatWs.answerAskUser(turnId, answer, opts)
   },
   ackHandoff: (
-    runId: string,
+    turnId: string,
     opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string },
   ) => {
-    chatWs.ackHandoff(runId, opts)
+    chatWs.ackHandoff(turnId, opts)
   },
 }

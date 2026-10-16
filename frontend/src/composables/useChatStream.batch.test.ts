@@ -33,7 +33,7 @@ let ctx: ChatStreamState
 
 const event = (payload: Partial<StreamEvent> & Pick<StreamEvent, 'type'>, seq: number): StreamEvent => ({
   ...payload,
-  run_id: 'run-batch',
+  turn_id: 'run-batch',
   seq,
   event_id: `run-batch-${seq}`,
 })
@@ -59,11 +59,11 @@ describe('createChatStreamEventBatcher', () => {
     batcher.handle(event({ type: 'tool_start', tool: 'run_shell', args: {}, tool_call_id: 'call-1' }, 1))
     batcher.handle(event({ type: 'tool_progress', tool: 'run_shell', tool_call_id: 'call-1', message: '第一段' }, 2))
     batcher.handle(event({ type: 'tool_progress', tool: 'run_shell', tool_call_id: 'call-1', message: '第二段' }, 3))
-    batcher.handle(event({ type: 'tool_finish', tool: 'run_shell', tool_call_id: 'call-1', result: '完成' }, 4))
+    batcher.handle(event({ type: 'tool_finish', tool: 'run_shell', tool_call_id: 'call-1', status: 'succeeded', result: '完成' }, 4))
     batcher.flush()
 
     const tool = ctx.messages.value[0]?.segments?.find((segment): segment is Extract<MessageSegment, { type: 'tool' }> => segment.type === 'tool')
-    expect(tool?.status).toBe('done')
+    expect(tool?.status).toBe('succeeded')
     expect(tool?.result).toBe('完成')
     expect(tool?.progressMessage).toBe('第二段')
   })

@@ -12,7 +12,8 @@ from langchain_core.runnables import RunnableConfig
 
 from app.agent.hooks import dispatch_pre_agent_step, dispatch_pre_llm_call
 from app.agent.iteration_budget import IterationBudget
-from app.agent.state import AgentState
+from app.agent.state import AgentState, utc_now
+from app.agent.audit import get_runtime_audit
 from app.context.api_usage import (
     build_step_api_usage,
     extract_api_usage,
@@ -177,24 +178,43 @@ def _invoke_llm(
     # 显式透传 config：execute_sync 会在独立线程执行，依赖 contextvars 的流式回调
     # 无法跨线程自动传播，必须把 config（含 astream_events 回调）显式传给 invoke。
     request_ids: list[str] = []
+    failed_requests: set[str] = set()
+    audit = get_runtime_audit()
 
     def invoke_once():
         request_id = f"req_{uuid.uuid4().hex}"
         request_ids.append(request_id)
         request_config = {**(config or {})}
         request_config["metadata"] = {**request_config.get("metadata", {}), "request_id": request_id}
-        return model.invoke(messages, config=request_config)
+        if audit:
+            audit.model_started(request_id, str(getattr(model, "model_name", "") or "") or None)
+        try:
+            return model.invoke(messages, config=request_config)
+        except BaseException as exc:
+            if audit:
+                audit.model_failed(request_id, str(exc), status="cancelled" if isinstance(exc, KeyboardInterrupt) else "failed")
+                failed_requests.add(request_id)
+            raise
+
+    def on_retry(_attempt, exc):
+        if audit and request_ids and request_ids[-1] not in failed_requests:
+            audit.model_failed(request_ids[-1], str(exc), status="unknown" if isinstance(exc, TimeoutError) else "failed")
+            failed_requests.add(request_ids[-1])
 
     outcome = execute_sync(
         policy.dependency_id,
         invoke_once,
         policy=policy,
         context=CallContext(session_id=session_id),
+        on_retry=on_retry,
     )
     if outcome.ok:
         if isinstance(outcome.value, AIMessage) and request_ids:
             outcome.value.additional_kwargs["request_id"] = request_ids[-1]
         return outcome.value, None
+    if audit and request_ids and request_ids[-1] not in failed_requests:
+        error = str(outcome.error or "LLM 调用失败")
+        audit.model_failed(request_ids[-1], error, status="unknown" if "timeout" in error.lower() or "超时" in error else "failed")
     return None, outcome.error or "LLM 调用失败"
 
 
@@ -237,7 +257,7 @@ def _run_grace_summary(
                 },
             )
     if "timestamp" not in grace_response.additional_kwargs:
-        grace_response.additional_kwargs["timestamp"] = int(time.time())
+        grace_response.additional_kwargs["timestamp"] = utc_now()
     return summary_human, grace_response
 
 
@@ -276,7 +296,7 @@ def _agent_error_payload(
     extra_messages: list | None = None,
 ) -> dict[str, Any]:
     token_updates = _build_token_usage_updates(state, assembled, None)
-    kwargs = {"timestamp": int(time.time())}
+    kwargs = {"timestamp": utc_now()}
     if extra_kwargs:
         kwargs.update(extra_kwargs)
     messages: list = list(cache_updates)
@@ -373,7 +393,7 @@ def _call_agent_core(
         rejected_messages.append(
             AIMessage(
                 content=assembled.reject_message or "上下文已满，请新建会话或清理历史。",
-                additional_kwargs={"timestamp": int(time.time()), "context_rejected": True},
+                additional_kwargs={"timestamp": utc_now(), "context_rejected": True},
             )
         )
         return {
@@ -478,7 +498,7 @@ def _call_agent_core(
         response = normalize_ai_message(response)
         response = _strip_duplicate_tool_calls(response, ledger)
         if "timestamp" not in response.additional_kwargs:
-            response.additional_kwargs["timestamp"] = int(time.time())
+            response.additional_kwargs["timestamp"] = utc_now()
         if ledger and is_system_maintenance(ledger[-1]):
             response.additional_kwargs["system_maintenance"] = True
 

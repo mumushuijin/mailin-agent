@@ -19,7 +19,12 @@ export interface ToolSegment {
   toolResultTruncated?: boolean
   reasonCode?: string | null
   fullResultLoading?: boolean
-  status: 'running' | 'done' | 'error' | 'cancelled' | 'policy_denied'
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'denied' | 'skipped' | 'unknown'
+  stepId?: string
+  definitionSeq?: number
+  resultSeq?: number
+  attempts?: ToolAttempt[]
+  contentError?: string
   snapshotId?: string | null
   undoStatus?: 'available' | 'conflict' | 'expired' | 'cross_session' | 'unavailable' | null
 }
@@ -88,11 +93,24 @@ export interface ToolExecution {
   startedAt: number
   endedAt?: number
   redacted?: boolean
+  stepId?: string
+  definitionSeq?: number
+  resultSeq?: number
+  attempt?: number
+  attempts?: ToolAttempt[]
+}
+
+export interface ToolAttempt {
+  attempt: number
+  status: string
+  started_at?: number
+  finished_at?: number
+  error?: { code: string; message?: string }
 }
 
 export interface AgentStateStream {
-  turnId: number
-  runId?: string | null
+  turnKey: number
+  turnId?: string | null
   status: AgentStatus
   currentStep: number
   maxSteps?: number
@@ -104,7 +122,12 @@ export interface AgentStateStream {
   todoTotal: number
   terminalLabel?: string
   requiresUserAction: boolean
-  confirmedSeq?: number | null
+  confirmedRevision?: number | null
+  transportSeq?: number | null
+  ledgerSeq?: number | null
+  currentTask?: string | null
+  currentStepId?: string | null
+  requestId?: string | null
   syncing?: boolean
   activeMessageId?: number | null
 }
@@ -115,6 +138,9 @@ export interface ChatUiMessage {
   content: string
   timestamp: Date
   segments?: MessageSegment[]
+  turnId?: string
+  messageId?: string
+  ledgerSeq?: number
 }
 
 export interface ApprovalPreview {
@@ -134,7 +160,8 @@ export interface ApprovalPreview {
 }
 
 export interface PendingApproval {
-  runId: string
+  turnId: string
+  interruptId?: string
   tool: string
   args: Record<string, unknown>
   reason: string
@@ -147,7 +174,7 @@ export interface PendingApproval {
 export type AskUserMode = 'answer_and_continue' | 'handoff_and_stop'
 
 export interface PendingAskUser {
-  runId: string
+  turnId: string
   prompt: string
   options: string[]
   allowMultiple: boolean

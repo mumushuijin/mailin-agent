@@ -9,7 +9,7 @@ from typing import Any
 from app.agent.state import validate_agent_state
 
 
-_RUN_SEQUENCES: dict[str, int] = defaultdict(int)
+_TURN_SEQUENCES: dict[str, int] = defaultdict(int)
 
 
 @dataclass
@@ -18,25 +18,25 @@ class AgentEvent:
 
     type: str
     data: dict
-    run_id: str | None = None
+    turn_id: str | None = None
     state: dict[str, Any] | None = None
     event_id: str | None = None
     seq: int | None = None
 
-    def with_run_id(self, run_id: str | None) -> AgentEvent:
-        if run_id is None or self.run_id == run_id:
+    def with_turn_id(self, turn_id: str | None) -> AgentEvent:
+        if turn_id is None or self.turn_id == turn_id:
             return self
         return AgentEvent(
-            type=self.type, data=self.data, run_id=run_id, state=self.state,
+            type=self.type, data=self.data, turn_id=turn_id, state=self.state,
             event_id=self.event_id, seq=self.seq,
         )
 
     def ensure_identity(self) -> None:
         if not self.event_id:
             self.event_id = f"evt_{uuid.uuid4().hex}"
-        if self.seq is None and self.run_id:
-            _RUN_SEQUENCES[self.run_id] += 1
-            self.seq = _RUN_SEQUENCES[self.run_id]
+        if self.seq is None and self.turn_id:
+            _TURN_SEQUENCES[self.turn_id] += 1
+            self.seq = _TURN_SEQUENCES[self.turn_id]
 
     def to_state(self) -> dict[str, Any] | None:
         if self.state is None:
@@ -48,8 +48,8 @@ class AgentEvent:
 def to_sse(event: AgentEvent) -> str:
     event.ensure_identity()
     data = dict(event.data)
-    if event.run_id:
-        data["run_id"] = event.run_id
+    if event.turn_id:
+        data["turn_id"] = event.turn_id
     if event.event_id:
         data["event_id"] = event.event_id
     if event.seq is not None:
@@ -63,8 +63,8 @@ def to_sse(event: AgentEvent) -> str:
 def to_ws(event: AgentEvent) -> dict:
     event.ensure_identity()
     payload: dict = {"type": event.type, "data": event.data}
-    if event.run_id:
-        payload["run_id"] = event.run_id
+    if event.turn_id:
+        payload["turn_id"] = event.turn_id
     if event.event_id:
         payload["event_id"] = event.event_id
     if event.seq is not None:

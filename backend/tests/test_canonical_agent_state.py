@@ -46,20 +46,20 @@ def test_reducer_merges_parallel_calls_and_rejects_scope_mismatch_and_terminal_r
     patch = {
         "state_revision": 1,
         "scope": state["scope"],
-        "current_step": {"tool_calls": [{"call_id": "call-b", "status": "success"}]},
+        "current_step": {"tool_calls": [{"call_id": "call-b", "status": "succeeded"}]},
     }
     merged = merge_agent_state(state, patch)
     calls = {call["call_id"]: call for call in merged["current_step"]["tool_calls"]}
     assert calls["call-a"]["status"] == "running"
-    assert calls["call-b"]["status"] == "success"
+    assert calls["call-b"]["status"] == "succeeded"
 
     wrong_scope = {**patch, "state_revision": 2, "scope": make_scope(workspace_id="other", session_id="session-1")}
     assert merge_agent_state(merged, wrong_scope) == merged
 
-    terminal = {**patch, "state_revision": 2, "run_status": "completed", "terminal_reason": "done"}
+    terminal = {**patch, "state_revision": 2, "turn_status": "completed", "terminal_reason": "done"}
     merged = merge_agent_state(merged, terminal)
-    stale = {**patch, "state_revision": 3, "run_status": "running"}
-    assert merge_agent_state(merged, stale)["run_status"] == "completed"
+    stale = {**patch, "state_revision": 3, "turn_status": "running"}
+    assert merge_agent_state(merged, stale)["turn_status"] == "completed"
 
 
 def test_memory_sync_metadata_survives_reducer_updates_and_deduplicates_sources():
@@ -69,7 +69,7 @@ def test_memory_sync_metadata_survives_reducer_updates_and_deduplicates_sources(
     merged = merge_agent_state(state, {
         "state_revision": 1,
         "scope": state["scope"],
-        "memory": {"recorded_count": 4, "last_synced_run": "run-1", "source_files": ["MEMORY.md", "USER.md"]},
+        "memory": {"recorded_count": 4, "last_synced_turn": "turn-1", "source_files": ["MEMORY.md", "USER.md"]},
     })
     merged = merge_agent_state(merged, {
         "state_revision": 2,
@@ -77,7 +77,7 @@ def test_memory_sync_metadata_survives_reducer_updates_and_deduplicates_sources(
         "memory": {"source_files": ["MEMORY.md", "MEMORY.md"]},
     })
     assert merged["memory"]["recorded_count"] == 4
-    assert merged["memory"]["last_synced_run"] == "run-1"
+    assert merged["memory"]["last_synced_turn"] == "turn-1"
     assert merged["memory"]["source_files"] == ["MEMORY.md"]
 
 
@@ -111,16 +111,19 @@ def test_scope_absence_is_null_and_request_can_be_cleared():
     state = new_agent_state(
         workspace_id="workspace-1", session_id="session-1", message=HumanMessage(content="hello")
     )
-    assert state["scope"]["request_id"] is None
-    assert state["scope"]["step_id"] is None
-    state["scope"]["request_id"] = "request-1"
-    state["scope"]["step_id"] = "step-1"
+    assert set(state["scope"]) == {"workspace_id", "session_id", "turn_id"}
+    assert state["current_step"]["step_id"] is None
+    state["current_step"]["model"] = {"request_id": "request-1"}
+    state["current_step"]["step_id"] = "step-1"
     updated = merge_agent_state(state, {
         "state_revision": 1,
-        "scope": {"request_id": None, "step_id": "step-2"},
+        "current_step": {
+            "model": None, "step_id": "step-2", "step_name": "agent",
+            "step_status": "pending", "tool_calls": [],
+        },
     })
-    assert updated["scope"]["request_id"] is None
-    assert updated["scope"]["step_id"] == "step-2"
+    assert updated["current_step"]["model"] is None
+    assert updated["current_step"]["step_id"] == "step-2"
     validate_agent_state(updated)
 
 
@@ -129,13 +132,16 @@ def test_terminal_transition_closes_only_active_tasks():
     old_task = "task-old"
     state["tasks"].insert(0, old_task)
     state["task_details"][old_task] = {"status": "completed"}
+    state["tasks"].append("task-active")
+    state["current_task"] = "task-active"
+    state["task_details"]["task-active"] = {"status": "running"}
     patch = terminal_patch(state, "cancelled", "cancelled")
     assert patch["task_details"][old_task]["status"] == "completed"
     assert patch["task_details"][state["current_task"]]["status"] == "cancelled"
-    assert patch["run_status"] == "cancelled"
+    assert patch["turn_status"] == "cancelled"
 
 
-def test_checkpoint_channel_reducers_reset_run_identity_but_keep_context_by_default():
+def test_checkpoint_channel_reducers_reset_turn_identity_but_keep_context_by_default():
     context = {"working_message": [HumanMessage(content="old", id="old")], "summary_pointer": "summaries/s1.json"}
     replaced = _merge_context(context, {"working_message": [HumanMessage(content="new", id="new")], "_replace_working_message": True})
     assert [message.content for message in replaced["working_message"]] == ["new"]
@@ -153,5 +159,5 @@ async def test_old_graph_checkpoint_is_explicitly_rejected():
         async def aget_state(self, _config):
             return SimpleNamespace(values={"meta": {}, "session": {}, "data": {}, "task": {}})
 
-    with pytest.raises(RuntimeError, match="不支持旧版 Agent checkpoint"):
+    with pytest.raises(RuntimeError, match="Agent checkpoint"):
         await ChatService()._reject_legacy_checkpoint(Graph(), {})

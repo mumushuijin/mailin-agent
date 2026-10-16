@@ -13,11 +13,12 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
     class FakeChatService:
         async def get_history(self, session_id: str):
             calls.append(("full", session_id, None))
-            return SessionHistory(session_id=session_id, messages=[ChatMessage(role="user", content="legacy")])
+            return SessionHistory(projection_version=3, session_id=session_id, messages=[ChatMessage(role="user", content="legacy")])
 
         async def get_history_page(self, session_id: str, *, limit: int, before: str | None = None):
             calls.append(("page", session_id, (limit, before)))
             return SessionHistoryPage(
+                projection_version=3,
                 session_id=session_id,
                 session=session,
                 messages=[ChatMessage(role="user", content="newest")],
@@ -28,7 +29,9 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
                 todos=[{"id": "t1", "content": "todo", "status": "pending"}],
             )
 
-        async def get_tool_result(self, session_id: str, tool_call_id: str):
+        async def get_tool_result(self, session_id: str, tool_call_id: str, *, seq: int | None = None):
+            if seq is not None:
+                calls.append(("tool", session_id, (tool_call_id, seq)))
             return ToolResultPayload(session_id=session_id, tool_call_id=tool_call_id, content="full")
 
     from app.api import session as session_api
@@ -39,12 +42,15 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
         paged = client.get("/api/session/sess-1/history?limit=1&before=10")
         full = client.get("/api/session/sess-1/history?limit=1&full=true")
         tool = client.get("/api/session/sess-1/tool-result/call-1")
+        exact_tool = client.get("/api/session/sess-1/tool-result/call-1?seq=7")
 
     assert legacy.status_code == 200
     assert legacy.json()["messages"][0]["content"] == "legacy"
     assert paged.status_code == 200
     payload = paged.json()
     assert payload["messages"][0]["content"] == "newest"
+    assert payload["projection_version"] == 3
+    assert "tool_calls" not in payload["messages"][0]
     assert payload["session"]["id"] == "sess-1"
     assert payload["limit"] == 1
     assert payload["before"] == "10"
@@ -52,8 +58,24 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
     assert payload["next_cursor"] == "9"
     assert full.json()["messages"][0]["content"] == "legacy"
     assert tool.json()["content"] == "full"
+    assert exact_tool.json()["content"] == "full"
     assert calls == [
         ("full", "sess-1", None),
         ("page", "sess-1", (1, "10")),
         ("full", "sess-1", None),
+        ("tool", "sess-1", ("call-1", 7)),
     ]
+
+
+def test_history_unsupported_format_is_an_actionable_response(monkeypatch):
+    class OldHistory:
+        async def get_history(self, _session_id):
+            raise ValueError("unsupported ledger metadata format; existing data preserved")
+
+    from app.api import session as session_api
+    monkeypatch.setattr(session_api, "chat_service", OldHistory())
+    with TestClient(app) as client:
+        response = client.get("/api/session/sess-1/history")
+    assert response.status_code == 409
+    assert response.json()["code"] == "unsupported_session_format"
+    assert "preserved" in response.json()["detail"]

@@ -18,7 +18,7 @@ LATENCY_STAGE_HISTORY_LOAD = "history_load"
 class RunLatency:
     """Small per-run timing helper for stream events, logs, and tests."""
 
-    run_id: str | None
+    turn_id: str | None
     session_id: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     _stage_starts: dict[str, float] = field(default_factory=dict)
@@ -46,7 +46,7 @@ class RunLatency:
 
     def summary(self, status: str = "success", **extra: Any) -> dict[str, Any]:
         payload = {
-            "run_id": self.run_id,
+            "turn_id": self.turn_id,
             "session_id": self.session_id,
             "status": status,
             "total_duration_ms": self.elapsed_ms(),
@@ -61,8 +61,8 @@ class RunLatency:
             "status": status,
             "elapsed_ms": self.elapsed_ms(),
         }
-        if self.run_id:
-            payload["run_id"] = self.run_id
+        if self.turn_id:
+            payload["turn_id"] = self.turn_id
         if self.session_id:
             payload["session_id"] = self.session_id
         payload.update({k: v for k, v in extra.items() if v is not None})

@@ -64,7 +64,7 @@ def test_decision_allow_needs_approval_deny(roots):
         {"file_path": "notes.txt"},
         tool_call_id="c1",
         session_id="s1",
-        run_id="r1",
+        turn_id="r1",
         approval_granted=True,
         workspace_root=project,
         agent_home=home,
@@ -256,14 +256,14 @@ def test_audit_payload_has_identity_without_secrets(roots):
         {"file_path": "notes.txt", "content": "SECRET_TOKEN_VALUE_XYZ", "command": "export KEY=secret"},
         tool_call_id="call-1",
         session_id="sess-1",
-        run_id="run-1",
+        turn_id="run-1",
         workspace_root=project,
         agent_home=home,
         template_root=defaults,
     )
     decision = evaluate_policy(ctx, emit_audit=False)
     payload = sanitize_audit_payload(ctx, decision)
-    assert payload["identity"]["run_id"] == "run-1"
+    assert payload["identity"]["turn_id"] == "run-1"
     assert payload["identity"]["session_id"] == "sess-1"
     assert payload["identity"]["tool_call_id"] == "call-1"
     blob = str(payload)

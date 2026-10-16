@@ -9,7 +9,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from app.context.tool_cache import save_tool_result
 from app.core.settings import get_settings
 from app.storage.workspace import assert_not_agent_space, _resolve_safe_path, normalize_workspace_path
 from app.tools.packages.filesystem.snapshots import is_snapshot_sidecar_path
@@ -23,7 +22,8 @@ from app.tools.packages.shell.process_registry import (
     register,
     unregister,
 )
-from app.tools.packages.shell.truncate import DEFAULT_MAX_BYTES, truncate_tail
+from app.tools.packages.shell.truncate import truncate_tail
+from app.tools.result import ToolResultText
 from app.tools.runtime import emit_tool_progress, tool_session_id
 
 logger = logging.getLogger(__name__)
@@ -200,27 +200,20 @@ def format_shell_result(
     if error:
         body = output.strip()
         prefix = f"命令执行失败: {error}"
-        return f"{prefix}\n\n{body}" if body else prefix
+        complete = f"{prefix}\n\n{body}" if body else prefix
+        return ToolResultText(truncate_tail(complete).content, full_content=complete)
 
     truncated = truncate_tail(output)
-    full_output = output
     display = truncated.content.strip()
-
-    if truncated.total_bytes > DEFAULT_MAX_BYTES and session_id:
-        try:
-            path = save_tool_result(session_id, "run_shell", full_output)
-            rel = path.relative_to(_workspace_root()).as_posix()
-            display += f"\n\n[完整输出已落盘: {rel}，可用 read_file 分页读取]"
-        except Exception:
-            logger.exception("落盘 shell 输出失败")
+    complete = output
 
     if exit_code != 0:
         trailer = f"\n\n命令以退出码 {exit_code} 结束"
-        return (display + trailer) if display else trailer.strip()
+        return ToolResultText((display + trailer) if display else trailer.strip(), full_content=complete + trailer)
 
     if not display:
-        return "命令执行成功（无输出）。"
-    return display
+        return ToolResultText("命令执行成功（无输出）。", full_content="命令执行成功（无输出）。")
+    return ToolResultText(display, full_content=complete)
 
 
 def run_with_progress(

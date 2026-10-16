@@ -59,12 +59,12 @@ def sanitize_audit_payload(ctx: ExecutionContext, decision: PolicyDecision) -> d
 def emit_policy_decision(ctx: ExecutionContext, decision: PolicyDecision) -> dict[str, Any]:
     payload = sanitize_audit_payload(ctx, decision)
     logger.info(
-        "[policy] outcome=%s reason_code=%s tool=%s session=%s run=%s call=%s",
+        "[policy] outcome=%s reason_code=%s tool=%s session=%s turn=%s call=%s",
         decision.outcome,
         decision.reason_code,
         ctx.tool_name,
         ctx.session_id,
-        ctx.run_id,
+        ctx.turn_id,
         ctx.tool_call_id,
     )
     logger.debug("[policy] audit=%s", payload)

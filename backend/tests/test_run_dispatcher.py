@@ -112,7 +112,7 @@ def test_node_lifecycle_pairs_interruption_and_preserves_status_and_duration():
     register_hook(AGENT_NODE_END, on_end)
     try:
         with pytest.raises(GraphInterrupt):
-            with _node_lifecycle(AGENT_NODE_START, AGENT_NODE_END, scope={"run_id": "r"}, node="agent", input_summary="safe input"):
+            with _node_lifecycle(AGENT_NODE_START, AGENT_NODE_END, scope={"turn_id": "r"}, node="agent", input_summary="safe input"):
                 raise GraphInterrupt([])
         assert started_event.wait(1)
         assert ended_event.wait(1)

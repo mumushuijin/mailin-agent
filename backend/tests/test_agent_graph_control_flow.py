@@ -39,7 +39,7 @@ async def test_canonical_graph_executes_tool_then_returns_final_answer(monkeypat
                     content="contents",
                     tool_call_id="call-1",
                     name="read_file",
-                    additional_kwargs={"tool_status": "completed"},
+                        additional_kwargs={"tool_status": "succeeded"},
                 )
             ]
         }
@@ -63,13 +63,15 @@ async def test_canonical_graph_executes_tool_then_returns_final_answer(monkeypat
 
     assert calls == ["agent", "tools", "agent"]
     first_agent = updates[0]["agent"]
-    assert first_agent["run_status"] == "running"
-    assert first_agent["task_details"][state["current_task"]]["status"] == "running"
-    assert updates[1]["tools"]["task_details"][state["current_task"]]["status"] == "running"
-    assert result["run_status"] == "completed"
-    assert result["task_details"][state["current_task"]]["status"] == "completed"
+    assert first_agent["turn_status"] == "running"
+    assert first_agent["tasks"] == []
+    assert updates[1]["tools"]["current_task"] is None
+    assert result["turn_status"] == "completed"
+    assert result["tasks"] == []
     tool_calls = updates[1]["tools"]["current_step"]["tool_calls"]
-    assert [(call["call_id"], call["status"]) for call in tool_calls] == [("call-1", "success")]
+    assert [(call["call_id"], call["status"]) for call in tool_calls] == [("call-1", "succeeded")]
+    assert tool_calls[0]["result_seq"] > tool_calls[0]["definition_seq"]
+    assert "input_summary" not in tool_calls[0]
     assert result["current_step"]["tool_calls"] == []
     assert result["context"]["working_message"][-1].content == "final answer"
     restored = await graph_module.build_graph().aget_state(graph_module.make_thread_config(SESSION_ID))

@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import threading
 import time
+import pytest
 
 from app.tools.card import make_card, resolve_concurrency
 from app.tools.tool_search import TOOL_CALL_NAME, ToolSearchConfig, run_tool_calls
+
+
+@pytest.fixture(autouse=True)
+def tool_unit_tests_do_not_initialize_session_storage(monkeypatch, request):
+    # These unit cases measure scheduling and cancellation with fake handlers.
+    # Real session binding is exercised by the graph integration tests.
+    if request.node.name != "test_safe_batch_preserves_project_workspace_context":
+        monkeypatch.setattr("app.storage.project.bind_session_runtime", lambda _sid: None)
 
 
 def _card(name: str, concurrency: str = "barrier"):
@@ -194,7 +203,8 @@ def test_safe_batch_returns_completed_and_timeout_results(monkeypatch):
 
     assert [msg.tool_call_id for msg in results] == ["fast-id", "slow-id"]
     assert results[0].content == "fast"
-    assert results[1].additional_kwargs["reason_code"] == "batch_timeout"
+    assert results[1].additional_kwargs["reason_code"] == "execution_outcome_unknown"
+    assert results[1].additional_kwargs["tool_status"] == "unknown"
 
 
 def test_safe_batch_preserves_project_workspace_context(monkeypatch, tmp_path):

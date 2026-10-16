@@ -1,6 +1,7 @@
 import { getWsApiBaseAsync } from './index'
 import type { AgentCheckpointState, ChatResponse, StreamCallback, StreamEvent } from './chat'
-import { readCanonicalAgentState } from '@/utils/canonicalAgentState'
+import { readCanonicalAgentState, rejectLegacyTurnFields } from '@/utils/canonicalAgentState'
+import { normalizeInteractionRejection, terminalOutcome } from '@/utils/streamProtocol'
 
 const HEARTBEAT_MS = 30_000
 const RECONNECT_BASE_MS = 1_000
@@ -18,26 +19,30 @@ type ConfigUpdatedHandler = (data: { name: string }) => void
 export type WsConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 type ConnectionHandler = (state: WsConnectionState) => void
 
-function mapWsToStreamEvent(msg: {
+export function mapWsToStreamEvent(msg: {
   type: string
   data?: Record<string, unknown>
-  run_id?: string
+  turn_id?: string
   state?: AgentCheckpointState
   seq?: number
   event_id?: string
 }): StreamEvent | null {
   const data = msg.data || {}
+  rejectLegacyTurnFields(msg as Record<string, unknown>)
+  rejectLegacyTurnFields(data)
   const state = readCanonicalAgentState(msg.state || data.state)
   const base = {
-    run_id: msg.run_id || state?.scope.run_id || undefined,
+    turn_id: msg.turn_id || state?.scope.turn_id || undefined,
     state,
     event_id: msg.event_id,
     seq: msg.seq,
+    session_id: (data.session_id || state?.scope.session_id) as string | undefined,
+    step_id: (data.step_id || state?.current_step.step_id) as string | undefined,
   }
 
   switch (msg.type) {
     case 'session':
-      return { type: 'session', session_id: data.session_id as string, ...base }
+      return { type: 'session', ...base }
     case 'step_start':
       return { type: 'step_start', step: data.step as number, max_steps: data.max_steps as number, ...base }
     case 'chunk':
@@ -56,7 +61,11 @@ function mapWsToStreamEvent(msg: {
         tool: data.tool as string,
         result: data.result as string,
         result_ref: data.result_ref as string | null | undefined,
+        result_seq: data.result_seq as number | undefined,
         result_truncated: Boolean(data.result_truncated),
+        status: data.status as string | undefined,
+        reason_code: data.reason_code as string | undefined,
+        execution: data.execution as StreamEvent['execution'],
         tool_call_id: data.tool_call_id as string,
         ...base,
       }
@@ -93,7 +102,6 @@ function mapWsToStreamEvent(msg: {
       return {
         type: 'done',
         content: data.content as string,
-        session_id: data.session_id as string,
         partial: Boolean(data.partial),
         cancelled: Boolean(data.cancelled),
         handoff: Boolean(data.handoff),
@@ -101,14 +109,14 @@ function mapWsToStreamEvent(msg: {
         ...base,
       }
     case 'error':
-      return {
+      return normalizeInteractionRejection({
         type: 'error',
         error: data.error as string,
         cancelled: Boolean(data.cancelled),
         fail_closed: Boolean(data.fail_closed),
         reason_code: data.reason_code as string | undefined,
         ...base,
-      }
+      })
     case 'interrupt':
       return {
         type: 'interrupt',
@@ -149,7 +157,7 @@ function mapWsToStreamEvent(msg: {
     case 'config_updated':
       return { type: 'config_updated', config_name: data.name as string, ...base }
     case 'state_sync':
-      return { type: 'state_sync', session_id: data.session_id as string, ...base }
+      return { type: 'state_sync', ...base }
     default:
       return null
   }
@@ -161,11 +169,13 @@ class ChatWebSocket {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private reconnectAttempt = 0
   private intentionalClose = false
-  private currentRunId: string | null = null
-  private runResolvers = new Map<string, { resolve: (v: ChatResponse) => void; reject: (e: Error) => void }>()
-  private runCallbacks = new Map<string, StreamCallback>()
+  private currentTurnId: string | null = null
+  private currentSessionId: string | null = null
+  private sessionStreamHandlers = new Set<StreamCallback>()
+  private turnResolvers = new Map<string, { resolve: (v: ChatResponse) => void; reject: (e: Error) => void }>()
+  private turnCallbacks = new Map<string, StreamCallback>()
   /** 已进入 interrupt 等待的 run：抑制抢先到达的 done，避免注销 callback */
-  private pendingInterruptRuns = new Set<string>()
+  private pendingInterruptTurns = new Set<string>()
   private deferredDoneTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private backgroundHandlers = new Set<BackgroundHandler>()
   private configHandlers = new Set<ConfigUpdatedHandler>()
@@ -190,6 +200,11 @@ class ChatWebSocket {
     this.connectionHandlers.add(handler)
     handler(this.state)
     return () => this.connectionHandlers.delete(handler)
+  }
+
+  onSessionStream(handler: StreamCallback): () => void {
+    this.sessionStreamHandlers.add(handler)
+    return () => this.sessionStreamHandlers.delete(handler)
   }
 
   private setState(state: WsConnectionState) {
@@ -221,6 +236,8 @@ class ChatWebSocket {
         this.startHeartbeat()
         this.connectPromise = null
         this.setState('connected')
+        if (this.currentSessionId) this.subscribeSession(this.currentSessionId)
+        if (this.currentSessionId && this.currentTurnId) this.requestStateSync(this.currentTurnId, this.currentSessionId)
         resolve()
       }
 
@@ -247,8 +264,9 @@ class ChatWebSocket {
           try {
             const msg = JSON.parse(ev.data as string)
             this.handleMessage(msg)
-          } catch {
-            // ignore
+          } catch (error) {
+            const event: StreamEvent = { type: 'error', error: error instanceof Error ? error.message : '不支持的传输协议', turn_id: this.currentTurnId || undefined }
+            if (this.currentTurnId) this.deliverAndSettle(this.currentTurnId, event)
           }
         }
       })
@@ -257,7 +275,7 @@ class ChatWebSocket {
     return this.connectPromise
   }
 
-  private handleMessage(msg: { type: string; data?: Record<string, unknown>; run_id?: string }) {
+  private handleMessage(msg: { type: string; data?: Record<string, unknown>; turn_id?: string }) {
     if (msg.type === 'pong') return
 
     const event = mapWsToStreamEvent(msg)
@@ -279,72 +297,93 @@ class ChatWebSocket {
       for (const h of this.configHandlers) h({ name: event.config_name })
     }
 
-    const runId = msg.run_id
-    if (!runId) return
+    const turnId = msg.turn_id
+    if (!turnId) return
+    if (event.type === 'session' && event.session_id && !this.currentSessionId && turnId === this.currentTurnId) this.currentSessionId = event.session_id
+    if (event.type === 'stage' && event.stage === 'interaction_timeout') this.releaseInterruptWait(turnId)
+    if (event.type === 'stage' && event.stage === 'interaction_rejected') {
+      this.pendingInterruptTurns.add(turnId)
+      if (this.currentSessionId) this.requestStateSync(turnId, this.currentSessionId)
+    }
+    if (event.session_id && event.session_id !== this.currentSessionId) return
+    if (!this.turnCallbacks.has(turnId)) {
+      if (event.type === 'state_sync' || event.type === 'interrupt') this.currentTurnId = turnId
+      for (const handler of this.sessionStreamHandlers) handler(event)
+    }
 
     if (event.type === 'interrupt') {
-      this.pendingInterruptRuns.add(runId)
-      this.clearDeferredDone(runId)
-      const cb = this.runCallbacks.get(runId)
+      this.pendingInterruptTurns.add(turnId)
+      this.clearDeferredDone(turnId)
+      const cb = this.turnCallbacks.get(turnId)
       if (cb) cb(event)
       return
     }
 
+    if (event.type === 'state_sync' && event.state?.turn_status !== 'waiting_user') {
+      this.releaseInterruptWait(turnId)
+      if (terminalOutcome(event)) {
+        this.clearDeferredDone(turnId)
+        this.deliverAndSettle(turnId, event)
+        return
+      }
+    }
+
     if (event.type === 'done') {
       // LangGraph 1.x 可能在 interrupt 前误发 done；短暂延迟，若随后收到 interrupt 则丢弃该 done
-      this.clearDeferredDone(runId)
+      this.clearDeferredDone(turnId)
       const timer = setTimeout(() => {
-        this.deferredDoneTimers.delete(runId)
-        if (this.pendingInterruptRuns.has(runId)) return
-        this.deliverAndSettle(runId, event)
+        this.deferredDoneTimers.delete(turnId)
+        if (this.pendingInterruptTurns.has(turnId) && !['completed', 'failed', 'cancelled', 'handoff'].includes(event.state?.turn_status || '')) return
+        this.deliverAndSettle(turnId, event)
       }, 50)
-      this.deferredDoneTimers.set(runId, timer)
+      this.deferredDoneTimers.set(turnId, timer)
       return
     }
 
-    const cb = this.runCallbacks.get(runId)
+    const cb = this.turnCallbacks.get(turnId)
     if (cb) cb(event)
 
     if (event.type === 'error') {
-      this.pendingInterruptRuns.delete(runId)
-      this.clearDeferredDone(runId)
-      this.settleRun(runId, event)
+      this.pendingInterruptTurns.delete(turnId)
+      this.clearDeferredDone(turnId)
+      this.settleTurn(turnId, event)
     }
   }
 
-  private clearDeferredDone(runId: string) {
-    const timer = this.deferredDoneTimers.get(runId)
+  private clearDeferredDone(turnId: string) {
+    const timer = this.deferredDoneTimers.get(turnId)
     if (timer) {
       clearTimeout(timer)
-      this.deferredDoneTimers.delete(runId)
+      this.deferredDoneTimers.delete(turnId)
     }
   }
 
-  private deliverAndSettle(runId: string, event: StreamEvent) {
-    const cb = this.runCallbacks.get(runId)
+  private deliverAndSettle(turnId: string, event: StreamEvent) {
+    const cb = this.turnCallbacks.get(turnId)
     if (cb) cb(event)
-    this.settleRun(runId, event)
+    this.settleTurn(turnId, event)
   }
 
-  private settleRun(runId: string, event: StreamEvent) {
-    const resolver = this.runResolvers.get(runId)
+  private settleTurn(turnId: string, event: StreamEvent) {
+    const resolver = this.turnResolvers.get(turnId)
     if (!resolver) return
-    if (event.type === 'error' && !event.error?.includes('已取消')) {
-      resolver.reject(new Error(event.error || '未知错误'))
+    if (terminalOutcome(event) === 'error' && !event.error?.includes('已取消')) {
+      resolver.reject(Object.assign(new Error(event.error || '未知错误'), { executionStarted: true }))
     } else {
       resolver.resolve({
         content: event.content || '',
         session_id: event.session_id ?? null,
+        turn_id: turnId,
       })
     }
-    this.runResolvers.delete(runId)
-    this.runCallbacks.delete(runId)
-    this.pendingInterruptRuns.delete(runId)
-    if (this.currentRunId === runId) this.currentRunId = null
+    this.turnResolvers.delete(turnId)
+    this.turnCallbacks.delete(turnId)
+    this.pendingInterruptTurns.delete(turnId)
+    if (this.currentTurnId === turnId) this.currentTurnId = null
   }
 
-  private releaseInterruptWait(runId: string) {
-    this.pendingInterruptRuns.delete(runId)
+  private releaseInterruptWait(turnId: string) {
+    this.pendingInterruptTurns.delete(turnId)
   }
 
   private startHeartbeat() {
@@ -372,11 +411,13 @@ class ChatWebSocket {
   }
 
   subscribeSession(sessionId: string | null) {
+    if (this.currentSessionId !== sessionId) this.currentTurnId = null
+    this.currentSessionId = sessionId
     this.send({ op: 'session.subscribe', session_id: sessionId })
   }
 
-  requestStateSync(runId: string, sessionId: string) {
-    this.send({ op: 'state.sync', run_id: runId, session_id: sessionId })
+  requestStateSync(turnId: string, sessionId: string) {
+    this.send({ op: 'state.sync', turn_id: turnId, session_id: sessionId })
   }
 
   private send(payload: Record<string, unknown>) {
@@ -389,18 +430,20 @@ class ChatWebSocket {
     message: string,
     sessionId: string | null | undefined,
     onChunk: StreamCallback,
+    submittedTurnId?: string,
   ): Promise<ChatResponse> {
     await this.connect()
 
-    const runId = crypto.randomUUID()
-    this.currentRunId = runId
+    const turnId = submittedTurnId || crypto.randomUUID()
+    this.currentTurnId = turnId
+    this.currentSessionId = sessionId || null
 
     return new Promise<ChatResponse>((resolve, reject) => {
-      this.runResolvers.set(runId, { resolve, reject })
-      this.runCallbacks.set(runId, onChunk)
+      this.turnResolvers.set(turnId, { resolve, reject })
+      this.turnCallbacks.set(turnId, onChunk)
       this.send({
         op: 'chat.send',
-        run_id: runId,
+        turn_id: turnId,
         message,
         session_id: sessionId,
       })
@@ -408,19 +451,20 @@ class ChatWebSocket {
   }
 
   cancel() {
-    if (this.currentRunId) {
-      this.releaseInterruptWait(this.currentRunId)
-      this.clearDeferredDone(this.currentRunId)
-      this.send({ op: 'chat.cancel', run_id: this.currentRunId })
+    if (this.currentTurnId) {
+      this.releaseInterruptWait(this.currentTurnId)
+      this.clearDeferredDone(this.currentTurnId)
+      this.send({ op: 'chat.cancel', turn_id: this.currentTurnId, session_id: this.currentSessionId })
     }
   }
 
-  approve(runId: string, decision: 'allow' | 'deny', opts?: { toolCallId?: string; sessionId?: string; stepId?: string }) {
-    this.releaseInterruptWait(runId)
+  approve(turnId: string, decision: 'allow' | 'deny', opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string }) {
+    this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
-      run_id: runId,
+      turn_id: turnId,
       decision,
+      interrupt_id: opts?.interruptId,
       tool_call_id: opts?.toolCallId,
       session_id: opts?.sessionId,
       step_id: opts?.stepId,
@@ -428,14 +472,14 @@ class ChatWebSocket {
   }
 
   answerAskUser(
-    runId: string,
+    turnId: string,
     answer: string | string[],
     opts?: { interruptId?: string; toolCallId?: string; mode?: string; sessionId?: string; stepId?: string },
   ) {
-    this.releaseInterruptWait(runId)
+    this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
-      run_id: runId,
+      turn_id: turnId,
       kind: 'ask_user',
       answer,
       interrupt_id: opts?.interruptId,
@@ -447,13 +491,13 @@ class ChatWebSocket {
   }
 
   ackHandoff(
-    runId: string,
+    turnId: string,
     opts?: { interruptId?: string; toolCallId?: string; sessionId?: string; stepId?: string },
   ) {
-    this.releaseInterruptWait(runId)
+    this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
-      run_id: runId,
+      turn_id: turnId,
       kind: 'ask_user',
       mode: 'handoff_and_stop',
       interrupt_id: opts?.interruptId,

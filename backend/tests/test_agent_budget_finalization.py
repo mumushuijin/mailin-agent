@@ -66,6 +66,6 @@ def test_budget_finalization_invokes_model_once_without_new_tools(monkeypatch, r
             message=HumanMessage(content="question"),
             max_steps=4,
         )
-        assert merge_runtime_updates(state, updates)["run_status"] == "failed"
+        assert merge_runtime_updates(state, updates)["turn_status"] == "failed"
     else:
         assert updates["messages"][-1].content == "final answer"

@@ -116,7 +116,7 @@ class ExecutionContext:
     tool_package: str
     tool_call_id: str
     session_id: str | None
-    run_id: str | None
+    turn_id: str | None
     sandbox_policy: str
     risk_level: str
     requires_confirmation: bool
@@ -133,7 +133,7 @@ class ExecutionContext:
 
     def identity(self) -> dict[str, str | None]:
         return {
-            "run_id": self.run_id,
+            "turn_id": self.turn_id,
             "session_id": self.session_id,
             "tool_call_id": self.tool_call_id,
             "tool_name": self.tool_name,

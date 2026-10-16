@@ -6,9 +6,9 @@ from app.agent.graph import _activate_todo_task
 
 def test_initial_graph_state_contains_canonical_checkpoint_shape():
     state = make_initial_state("hello", 48, session_id="00000000-0000-4000-8000-000000000001")
-    assert {"checkpoint_id", "scope", "context", "max_step_every_run", "tasks", "current_task", "current_step", "memory"}.issubset(state)
+    assert {"checkpoint_id", "scope", "context", "max_step_every_turn", "tasks", "current_task", "current_step", "memory"}.issubset(state)
     assert state["context"]["working_message"]
-    assert state["max_step_every_run"] == 48
+    assert state["max_step_every_turn"] == 48
     assert state["current_step"]["step_status"] == "pending"
 
 
@@ -23,10 +23,10 @@ def test_todo_transition_creates_stable_task_id_and_keeps_completed_tasks():
             ]},
         },
     }
-    scope = {"task_id": "task_existing"}
+    scope = {"workspace_id": "w", "session_id": "s", "turn_id": "t"}
     _activate_todo_task(state, scope)
 
-    assert scope["task_id"] == "task_todo-2"
+    assert "task_id" not in scope
     assert state["current_task"] == "task_todo-2"
     assert state["tasks"] == ["task_existing", "task_todo-1", "task_todo-2"]
     assert state["task_details"]["task_existing"]["status"] == "completed"

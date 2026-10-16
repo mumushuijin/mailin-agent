@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Query
+from fastapi.responses import Response
+from app.core.exceptions import AppError
 
 from app.schemas.session import (
     Session,
@@ -50,22 +52,47 @@ async def delete_session(session_id: str):
     return {"status": "ok"}
 
 
-@router.get("/{session_id}/history", response_model=SessionHistory | SessionHistoryPage)
+@router.get("/{session_id}/history", response_model=SessionHistory | SessionHistoryPage,
+            response_model_exclude_none=True, response_model_exclude_defaults=True)
 async def get_session_history(
     session_id: str,
     limit: int | None = Query(default=None, ge=1, le=200),
     before: str | None = Query(default=None),
     full: bool = Query(default=False),
 ):
-    if full or (limit is None and before is None):
-        return await chat_service.get_history(session_id)
-    return await chat_service.get_history_page(
-        session_id,
-        limit=limit or 30,
-        before=before,
-    )
+    try:
+        if full or (limit is None and before is None):
+            return await chat_service.get_history(session_id)
+        return await chat_service.get_history_page(
+            session_id, limit=limit or 30, before=before,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise AppError(str(exc), status_code=409, code="unsupported_session_format") from exc
 
 
 @router.get("/{session_id}/tool-result/{tool_call_id}", response_model=ToolResultPayload)
-async def get_tool_result(session_id: str, tool_call_id: str):
-    return await chat_service.get_tool_result(session_id, tool_call_id)
+async def get_tool_result(session_id: str, tool_call_id: str, seq: int | None = Query(default=None, ge=1)):
+    if seq is None:
+        return await chat_service.get_tool_result(session_id, tool_call_id)
+    return await chat_service.get_tool_result(session_id, tool_call_id, seq=seq)
+
+
+@router.get("/{session_id}/ledger-message/{seq}")
+async def get_ledger_message(session_id: str, seq: int):
+    try:
+        return await chat_service.get_ledger_message(session_id, seq)
+    except ValueError as exc:
+        raise AppError(str(exc), status_code=409, code="invalid_ledger_resource") from exc
+
+
+@router.get("/{session_id}/diagnostics")
+async def export_session_diagnostics(session_id: str):
+    try:
+        content = session_service.export_diagnostics(session_id)
+    except ValueError as exc:
+        raise AppError(str(exc), status_code=409, code="invalid_ledger_resource") from exc
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="session-diagnostics.zip"'},
+    )

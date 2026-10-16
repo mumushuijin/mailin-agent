@@ -19,7 +19,7 @@ class SessionService:
 
     def create(self, workspace_path: str) -> str:
         session_id = self.store.create(workspace_path)
-        self.conversation_files.session_dir(session_id).mkdir(parents=True, exist_ok=True)
+        self.conversation_files.ensure_metadata(session_id)
         dispatch_observe(ON_SESSION_START, session_id=session_id)
         return session_id
 
@@ -31,6 +31,19 @@ class SessionService:
 
     def rename(self, session_id: str, title: str) -> Session:
         return Session(**self.store.rename(session_id, title))
+
+    def export_diagnostics(self, session_id: str) -> bytes:
+        """Export one session's authoritative ledger and controlled resources."""
+        import io
+        import zipfile
+
+        self.store.get(session_id)
+        resources = self.conversation_files.export_files(session_id)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name, content in resources.items():
+                bundle.writestr(name, content)
+        return buffer.getvalue()
 
     async def delete(self, session_id: str) -> None:
         self.store.delete(session_id)

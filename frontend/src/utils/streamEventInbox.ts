@@ -1,4 +1,6 @@
 import type { StreamEvent } from '@/api/chat'
+import { isCanonicalAgentState, rejectLegacyTurnFields } from './canonicalAgentState'
+import { normalizeInteractionRejection, terminalOutcome } from './streamProtocol'
 
 export interface StreamInboxDrain {
   events: StreamEvent[]
@@ -15,8 +17,8 @@ interface QueuedEvent {
 
 const TERMINAL_TYPES = new Set<StreamEvent['type']>(['done', 'error'])
 
-const runIdOf = (event: StreamEvent): string | null => (
-  event.run_id || event.state?.scope.run_id || null
+const turnIdOf = (event: StreamEvent): string | null => (
+  event.turn_id || event.state?.scope.turn_id || null
 )
 
 const seqOf = (event: StreamEvent): number | undefined => (
@@ -27,12 +29,12 @@ const eventIdOf = (event: StreamEvent): string | null => (
   event.event_id || null
 )
 
-const isTerminal = (event: StreamEvent): boolean => TERMINAL_TYPES.has(event.type)
+const isTerminal = (event: StreamEvent): boolean => TERMINAL_TYPES.has(event.type) || (event.type === 'state_sync' && terminalOutcome(event) !== null)
 
 export class StreamEventInbox {
   private readonly gapWaitMs: number
-  private runId: string | null = null
-  private retiredRunIds = new Set<string>()
+  private turnId: string | null = null
+  private retiredTurnIds = new Set<string>()
   private lastAppliedSeq: number | null = null
   private pendingSequenced = new Map<number, QueuedEvent>()
   private pendingUnsequenced: QueuedEvent[] = []
@@ -41,18 +43,20 @@ export class StreamEventInbox {
   private syncing = false
   private terminal = false
   private order = 0
+  private lastRevision = -1
+  private sessionId: string | null = null
 
   constructor(gapWaitMs = 80) {
     this.gapWaitMs = gapWaitMs
   }
 
-  get currentRunId(): string | null {
-    return this.runId
+  get currentTurnId(): string | null {
+    return this.turnId
   }
 
   reset(): void {
-    this.runId = null
-    this.retiredRunIds.clear()
+    this.turnId = null
+    this.retiredTurnIds.clear()
     this.lastAppliedSeq = null
     this.pendingSequenced.clear()
     this.pendingUnsequenced = []
@@ -61,22 +65,34 @@ export class StreamEventInbox {
     this.syncing = false
     this.terminal = false
     this.order = 0
+    this.lastRevision = -1
+    this.sessionId = null
   }
 
   push(event: StreamEvent, now = Date.now()): StreamInboxDrain {
-    const incomingRunId = runIdOf(event)
+    event = normalizeInteractionRejection(event)
+    rejectLegacyTurnFields(event as unknown as Record<string, unknown>)
+    if (event.state && !isCanonicalAgentState(event.state)) throw new Error('不支持的 checkpoint 协议')
+    if (event.turn_id && event.state && event.turn_id !== event.state.scope.turn_id) throw new Error('传输 turn 与 checkpoint 归属不一致')
+    const sessionId = event.session_id || event.state?.scope.session_id || null
+    if (this.sessionId && sessionId && this.sessionId !== sessionId) return this.emptyDrain()
+    const incomingTurnId = turnIdOf(event)
     const isNewRunBoundary = event.type === 'session'
 
-    if (this.runId && incomingRunId && this.runId !== incomingRunId) {
-      if (!isNewRunBoundary || this.retiredRunIds.has(incomingRunId)) return this.emptyDrain()
-      const priorRunIds = new Set([...this.retiredRunIds, this.runId])
+    if (this.turnId && incomingTurnId && this.turnId !== incomingTurnId) {
+      if (!isNewRunBoundary || this.retiredTurnIds.has(incomingTurnId)) return this.emptyDrain()
+      const priorTurnIds = new Set([...this.retiredTurnIds, this.turnId])
       this.reset()
-      this.retiredRunIds = priorRunIds
+      this.retiredTurnIds = priorTurnIds
     }
 
-    if (this.terminal && !isTerminal(event)) return this.emptyDrain()
+    if (this.terminal) return this.emptyDrain()
 
-    if (incomingRunId) this.runId = incomingRunId
+    if (incomingTurnId) this.turnId = incomingTurnId
+    if (sessionId) this.sessionId = sessionId
+
+    const revision = event.state?.state_revision
+    if (typeof revision === 'number' && revision < this.lastRevision) return this.emptyDrain()
 
     if (event.type === 'state_sync' && typeof event.seq === 'number') {
       this.pendingSequenced.clear()
@@ -84,6 +100,7 @@ export class StreamEventInbox {
       this.lastAppliedSeq = event.seq - 1
       this.syncing = false
       this.gapStartedAt = null
+      this.seenEventIds.clear()
     }
 
     const eventId = eventIdOf(event)
@@ -135,7 +152,12 @@ export class StreamEventInbox {
       if (next) {
         this.pendingSequenced.delete(nextSeq)
         this.lastAppliedSeq = nextSeq
-        events.push(next.event)
+        const revision = next.event.state?.state_revision
+        if (typeof revision === 'number' && revision < this.lastRevision) continue
+        const revisionGap = typeof revision === 'number' && this.lastRevision >= 0 && revision > this.lastRevision + 1 && next.event.type !== 'state_sync'
+        if (revisionGap) { gapDetected = true; this.syncing = true }
+        if (typeof revision === 'number') this.lastRevision = revision
+        events.push(revisionGap ? { ...next.event, gap_detected: true } : next.event)
         if (this.syncing) this.syncing = false
         this.gapStartedAt = null
         if (isTerminal(next.event)) this.terminal = true
@@ -166,6 +188,13 @@ export class StreamEventInbox {
       const unsequenced = [...this.pendingUnsequenced].sort((left, right) => left.order - right.order)
       this.pendingUnsequenced = []
       for (const item of unsequenced) {
+        const revision = item.event.state?.state_revision
+        if (typeof revision === 'number' && revision < this.lastRevision) continue
+        if (typeof revision === 'number' && this.lastRevision >= 0 && revision > this.lastRevision + 1 && item.event.type !== 'state_sync') {
+          item.event = { ...item.event, gap_detected: true }; gapDetected = true; this.syncing = true
+        }
+        if (typeof revision === 'number') this.lastRevision = revision
+        if (this.terminal) continue
         events.push(item.event)
         if (isTerminal(item.event)) this.terminal = true
       }

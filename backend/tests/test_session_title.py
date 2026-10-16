@@ -230,6 +230,9 @@ async def test_chat_service_sets_title_on_first_accepted_message(spaces, monkeyp
         async def ainvoke(self, _state, _config):
             return {"messages": []}
 
+        async def aget_state(self, _config):
+            return None
+
     monkeypatch.setattr("app.services.chat_service.prepare_session_memory", noop_memory)
     monkeypatch.setattr("app.services.chat_service.get_graph", lambda: DummyGraph())
     monkeypatch.setattr("app.services.chat_service.dispatch_post_llm_call", lambda **_kwargs: None)
@@ -266,6 +269,9 @@ async def test_chat_service_refines_auto_title_after_done(spaces, monkeypatch):
         async def ainvoke(self, _state, _config):
             return {"messages": []}
 
+        async def aget_state(self, _config):
+            return None
+
     monkeypatch.setattr("app.services.chat_service.prepare_session_memory", noop_memory)
     monkeypatch.setattr("app.services.chat_service.get_graph", lambda: DummyGraph())
     monkeypatch.setattr("app.services.chat_service.dispatch_post_llm_call", lambda **_kwargs: None)
@@ -285,7 +291,7 @@ async def test_chat_service_refines_auto_title_after_done(spaces, monkeypatch):
     release = asyncio.Event()
     scheduled: list[asyncio.Task] = []
 
-    async def fake_title(_user, _assistant):
+    async def fake_title(_user, _assistant, **_scope):
         started.set()
         await release.wait()
         return "侧栏短标题"

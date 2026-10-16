@@ -1,14 +1,17 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     message: str
     session_id: str | None = None
+    turn_id: str | None = Field(default=None, min_length=1)
 
 
 class ChatResponse(BaseModel):
     content: str
     session_id: str | None = None
+    turn_id: str
 
 
 class StreamEventPayload(BaseModel):
@@ -22,7 +25,7 @@ class StreamEventPayload(BaseModel):
     session_id: str | None = None
     step: int | None = None
     max_steps: int | None = None
-    run_id: str | None = None
+    turn_id: str | None = None
     stage: str | None = None
     status: str | None = None
     elapsed_ms: float | None = None

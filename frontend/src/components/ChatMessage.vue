@@ -20,7 +20,7 @@ interface ToolSegment {
   tool: string
   args: Record<string, unknown>
   result?: string
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'denied' | 'skipped' | 'unknown'
 }
 
 type MessageSegment = TextSegment | ToolSegment
@@ -114,8 +114,12 @@ const hasVisibleContent = computed(() => {
               <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
                 <LoadingOutlined /> 执行中
               </Tag>
-              <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
-              <Tag v-else-if="segment.status === 'error'" color="error" class="tool-tag">失败</Tag>
+              <Tag v-else-if="segment.status === 'succeeded'" color="success" class="tool-tag">完成</Tag>
+              <Tag v-else-if="segment.status === 'failed'" color="error" class="tool-tag">失败</Tag>
+              <Tag v-else-if="segment.status === 'denied'" color="warning" class="tool-tag">拒绝</Tag>
+              <Tag v-else-if="segment.status === 'skipped'" class="tool-tag">跳过</Tag>
+              <Tag v-else-if="segment.status === 'unknown'" color="warning" class="tool-tag">结果未知</Tag>
+              <Tag v-else-if="segment.status === 'cancelled'" class="tool-tag">已取消</Tag>
               <span
                 v-if="segment.status !== 'running'"
                 class="collapse-indicator"

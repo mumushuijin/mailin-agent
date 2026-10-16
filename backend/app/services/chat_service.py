@@ -2,17 +2,19 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
+import uuid
+import threading
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, messages_from_dict
-from langgraph.graph.message import add_messages
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from app.agent.messages import is_ephemeral_prompt_frame, is_internal_prompt_message
 from app.agent.graph import get_graph, make_initial_state, make_thread_config
-from app.agent.state import REQUIRED_TOP_LEVEL, to_runtime_view, merge_runtime_updates, to_graph_state, terminal_patch
+from app.agent.state import REQUIRED_TOP_LEVEL, to_runtime_view, merge_runtime_updates, to_graph_state, terminal_patch, utc_now
 from app.agent.hooks import (
     ON_SESSION_END,
     ON_SESSION_START,
@@ -22,9 +24,7 @@ from app.agent.hooks import (
 from app.agent.streaming.events import AgentEvent, to_sse
 from app.agent.streaming.sse_mapper import extract_final_content, stream_graph_events
 from app.context.engine import resolve_context_usage
-from app.context.ledger import repair_orphan_tool_calls
 from app.context.memory.maintenance import prepare_session_memory
-from app.context.tool_cache import save_tool_result, summarize_tool_result
 from app.core.latency import (
     LATENCY_STAGE_ACCEPTED,
     LATENCY_STAGE_CONTEXT_PREPARE,
@@ -43,15 +43,13 @@ from app.schemas.session import (
     Session,
     SessionHistory,
     SessionHistoryPage,
-    ToolCall,
-    ToolCallFunction,
     ToolResultPayload,
 )
 from app.core.exceptions import AppError
-from app.storage.history_projection import HistoryProjectionStore
+from app.storage.history_projection import HistoryProjectionStore, project_ledger
 from app.storage.conversation_files import SessionConversationFiles
 from app.storage.project import require_bound_session, session_project_path
-from app.storage.workspace import SessionStore, project_tool_results_dir
+from app.storage.workspace import SessionStore
 from app.tools.registry import load_full_config
 from app.tools.tool_search import resolve_tool_display, should_show_tool_in_ui
 
@@ -60,6 +58,47 @@ log = logging.getLogger(__name__)
 DEFAULT_HISTORY_LIMIT = 30
 MAX_HISTORY_LIMIT = 200
 PREPARE_MEMORY_TIMEOUT_SECONDS = 8.0
+
+_session_execution_lock = threading.Lock()
+_session_executions: set[tuple[str, str]] = set()
+
+
+@contextmanager
+def _session_execution(workspace: Path, session_id: str):
+    key = (str(workspace.resolve()), session_id)
+    with _session_execution_lock:
+        if key in _session_executions:
+            raise AppError("该会话已有进行中的 turn，请等待或取消后重试", status_code=409)
+        _session_executions.add(key)
+    try:
+        yield
+    finally:
+        with _session_execution_lock:
+            _session_executions.discard(key)
+
+
+def _exclusive_turn(*, stream: bool = False):
+    def decorate(method):
+        if stream:
+            @wraps(method)
+            async def events(self, message, session_id, *, turn_id=None):
+                try:
+                    sid = self._require_bound_session(session_id)
+                    with _session_execution(self.settings.workspace_path, sid):
+                        async for event in method(self, message, sid, turn_id=turn_id):
+                            yield event
+                except AppError as exc:
+                    yield AgentEvent("error", {"error": exc.message, "reason_code": "session_busy" if exc.status_code == 409 else "invalid_session"}, turn_id)
+                except ValueError as exc:
+                    yield AgentEvent("error", {"error": str(exc), "reason_code": "unsupported_ledger"}, turn_id)
+            return events
+        @wraps(method)
+        async def invoke(self, message, session_id, *, turn_id=None):
+            sid = self._require_bound_session(session_id)
+            with _session_execution(self.settings.workspace_path, sid):
+                return await method(self, message, sid, turn_id=turn_id)
+        return invoke
+    return decorate
 
 
 class ChatService:
@@ -70,13 +109,18 @@ class ChatService:
         self.conversation_files = SessionConversationFiles(self.settings.workspace_path)
 
     def _new_run_state(
-        self, session_id: str, message: str, max_steps: int, run_id: str | None,
+        self, session_id: str, message: str, max_steps: int, turn_id: str | None,
         previous: dict[str, Any] | None = None,
     ):
+        if previous and previous.get("turn_status") in {"running", "waiting_user"}:
+            raise AppError("上一 turn 尚未结束，请先恢复或取消", status_code=409)
         state = make_initial_state(
             message, max_steps, session_id=session_id,
-            workspace_id=str(self.settings.workspace_path), run_id=run_id,
+            workspace_id=str(self.settings.workspace_path), turn_id=turn_id,
         )
+        self.conversation_files.ensure_metadata(session_id)
+        if self.conversation_files.message_by_id(session_id, f"msg_user_{state['scope']['turn_id']}"):
+            raise AppError("该 turn 已提交，不能重复执行；请加载会话历史查看结果", status_code=409)
         if previous and REQUIRED_TOP_LEVEL.issubset(set(previous) | {"checkpoint_id"}):
             previous_context = dict(previous.get("context") or {})
             previous_memory = dict(previous.get("memory") or {})
@@ -87,12 +131,15 @@ class ChatService:
             state["context"].update({key: value for key, value in previous_context.items() if key != "working_message"})
             state["context"]["working_message"] = [*prior_messages, *state["context"]["working_message"]]
             state["memory"].update(previous_memory)
-            state["tasks"] = list(dict.fromkeys([*(previous.get("tasks") or []), *state["tasks"]]))
-            state["task_details"] = {**(previous.get("task_details") or {}), **state["task_details"]}
+            previous_todos = (previous.get("task_details") or {}).get("_runtime", {}).get("todos")
+            if previous_todos:
+                state["task_details"]["_runtime"] = {"todos": list(previous_todos)}
         state["context"]["bootstrap_fingerprint"] = self._bootstrap_fingerprint(session_id)
+        user_message = state["context"]["working_message"][-1]
+        user_message.additional_kwargs["ledger_message_id"] = f"msg_user_{state['scope']['turn_id']}"
         seq = self.conversation_files.append_messages(
             session_id,
-            str(state["scope"]["run_id"]),
+            str(state["scope"]["turn_id"]),
             [state["context"]["working_message"][-1]],
             scope=state["scope"],
         )
@@ -107,50 +154,13 @@ class ChatService:
         text, _tokens = load_bootstrap(self.settings.workspace_path, Path(project) if project else None)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def _recover_ledger_tail(self, session_id: str, previous: dict[str, Any]) -> dict[str, Any]:
-        pointer = dict(previous.get("ledger_pointer") or {})
-        if self.conversation_files.has_sequence_anomalies(session_id):
-            rows = self.conversation_files.read(session_id)
-            recovered = dict(previous)
-            context = dict(previous.get("context") or {})
-            messages = messages_from_dict([row["message"] for row in rows])
-            context["working_message"] = [
-                msg for msg in messages if not is_ephemeral_prompt_frame(msg)
-            ]
-            recovered["context"] = context
-            latest_seq = self.conversation_files.latest_seq(session_id)
-            recovered["ledger_pointer"] = {
-                **pointer,
-                "applied_seq": latest_seq,
-                "applied_offset": self.conversation_files.offset_after(session_id, latest_seq),
-            }
-            return recovered
-        rows = self.conversation_files.read_tail(
-            session_id,
-            after_seq=int(pointer.get("applied_seq", 0)),
-            offset=pointer.get("applied_offset"),
-        )
-        if not rows:
-            return previous
-        recovered = dict(previous)
-        context = dict(previous.get("context") or {})
-        messages = messages_from_dict([row["message"] for row in rows])
-        existing = list(context.get("working_message") or [])
-        seen_ids = {
-            (message.additional_kwargs or {}).get("ledger_message_id")
-            for message in existing if (message.additional_kwargs or {}).get("ledger_message_id")
-        }
-        unseen = [message for message in messages if (message.additional_kwargs or {}).get("ledger_message_id") not in seen_ids]
-        context["working_message"] = add_messages(existing, unseen)
-        recovered["context"] = context
-        recovered["ledger_pointer"] = {
-            **pointer,
-            "applied_seq": int(rows[-1]["seq"]),
-            "applied_offset": int(rows[-1]["_end_offset"]),
-        }
-        return recovered
+    def _recover_ledger_tail(self, session_id: str, previous: dict[str, Any], *, stop_incomplete: bool = False) -> dict[str, Any]:
+        from app.agent.recovery import recover_ledger_tail
+        return recover_ledger_tail(previous, self.conversation_files, session_id=session_id, stop_incomplete=stop_incomplete)
 
     def _refresh_stale_context(self, session_id: str, previous: dict[str, Any]) -> dict[str, Any]:
+        if not previous:
+            return previous
         context = dict(previous.get("context") or {})
         fingerprint = self._bootstrap_fingerprint(session_id)
         if context.get("bootstrap_fingerprint") == fingerprint:
@@ -159,10 +169,11 @@ class ChatService:
         # from the durable ledger once, then let the existing compression pipeline
         # establish a fresh token-bounded working window before the next model call.
         rows = self.conversation_files.read(session_id)
+        from app.agent.recovery import decode_window_row, is_audit_row
         rebuilt = dict(previous)
         context["working_message"] = [
-            msg for msg in messages_from_dict([row["message"] for row in rows])
-            if not is_ephemeral_prompt_frame(msg)
+            decode_window_row(self.conversation_files, session_id, row)
+            for row in rows if not is_audit_row(row)
         ]
         context["bootstrap_fingerprint"] = fingerprint
         context["last_built_at"] = None
@@ -187,12 +198,11 @@ class ChatService:
         values = dict(snapshot.values or {}) if snapshot else {}
         if not values:
             return
-        required = REQUIRED_TOP_LEVEL - {"checkpoint_id"}
-        legacy_shape = {"meta", "session", "data", "task"}.issubset(values)
-        if legacy_shape and (
-            not required.issubset(values) or not ("checkpoint_id" in values or "checkpoint_uid" in values)
-        ):
-            raise RuntimeError("不支持旧版 Agent checkpoint；请新建 session 后继续对话")
+        from app.agent.state import validate_agent_state
+        try:
+            validate_agent_state(values)
+        except ValueError as exc:
+            raise RuntimeError(f"不支持旧版或无效 Agent checkpoint；请处理旧会话后新建：{exc}") from exc
 
     def _max_steps(self) -> int:
         from app.agent.iteration_budget import DEFAULT_MAX_STEPS, clamp_max_steps
@@ -256,19 +266,17 @@ class ChatService:
     ) -> SessionHistory:
         projected = to_runtime_view(values) if "context" in values else values
         ledger_rows = self.conversation_files.read(session_id)
-        ledger_messages = messages_from_dict([row["message"] for row in ledger_rows])
-        messages = repair_orphan_tool_calls(ledger_messages or projected.get("messages", []))
+        messages = self.conversation_files.messages(session_id, include_audit=False)
+        projection = project_ledger(ledger_rows)
         session_token_stats = projected.get("session_token_stats") or {}
-        api_usage = projected.get("api_usage") or {}
+        api_usage = projection.get("api_usage") or projected.get("api_usage") or {}
         context_usage = resolve_context_usage({**projected, "messages": messages}, session_id)
         return SessionHistory(
+            projection_version=3,
             session_id=session_id,
-            messages=self.messages_to_openai(
-                messages,
-                session_id=session_id,
-                compact_tools=compact_tools,
-                ledger_rows=ledger_rows,
-            ),
+            workspace_id=self.conversation_files.workspace_id,
+            messages=[ChatMessage(**row) for row in projection["messages"]],
+            timelines=projection["timelines"],
             context_usage=context_usage,
             api_usage=api_usage or None,
             session_token_stats=session_token_stats or None,
@@ -284,6 +292,7 @@ class ChatService:
         self.session_store.get(session_id)
         graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
+        await self._reject_legacy_checkpoint(graph, config)
         state = await graph.aget_state(config)
         values = dict(state.values) if state and state.values else {}
         return self._history_from_values(session_id, values, compact_tools=compact_tools)
@@ -300,6 +309,7 @@ class ChatService:
             config = config or make_thread_config(session_id)
             state = await graph.aget_state(config)
             values = dict(state.values) if state and state.values else {}
+            await self._reject_legacy_checkpoint(graph, config)
             history = self._history_from_values(session_id, values, compact_tools=True)
             self.history_projection.write(
                 session_id,
@@ -308,6 +318,7 @@ class ChatService:
                 api_usage=history.api_usage,
                 session_token_stats=history.session_token_stats,
                 todos=history.todos,
+                timelines=history.timelines,
                 ledger_seq=self.conversation_files.latest_seq(session_id),
             )
         except Exception:
@@ -320,7 +331,7 @@ class ChatService:
         limit: int = DEFAULT_HISTORY_LIMIT,
         before: str | None = None,
     ) -> SessionHistoryPage:
-        latency = RunLatency(run_id=None, session_id=session_id)
+        latency = RunLatency(turn_id=None, session_id=session_id)
         latency.start(LATENCY_STAGE_HISTORY_LOAD)
         meta = self.session_store.get(session_id)
         limit = max(1, min(MAX_HISTORY_LIMIT, int(limit or DEFAULT_HISTORY_LIMIT)))
@@ -328,16 +339,15 @@ class ChatService:
         payload = self.history_projection.read(session_id)
         if payload is None or int(payload.get("ledger_seq", -1)) < self.conversation_files.latest_seq(session_id):
             ledger_rows = self.conversation_files.read(session_id)
-            ledger_messages = messages_from_dict([row["message"] for row in ledger_rows])
-            if ledger_messages:
+            if ledger_rows:
+                projection = project_ledger(ledger_rows)
                 history = SessionHistory(
+                    projection_version=3,
                     session_id=session_id,
-                    messages=self.messages_to_openai(
-                        repair_orphan_tool_calls(ledger_messages),
-                        session_id=session_id,
-                        compact_tools=True,
-                        ledger_rows=ledger_rows,
-                    ),
+                    workspace_id=self.conversation_files.workspace_id,
+                    messages=[ChatMessage(**row) for row in projection["messages"]],
+                    timelines=projection["timelines"],
+                    api_usage=projection.get("api_usage"),
                 )
             else:
                 history = await self._history_from_checkpoint(session_id, compact_tools=True)
@@ -348,10 +358,12 @@ class ChatService:
                 api_usage=history.api_usage,
                 session_token_stats=history.session_token_stats,
                 todos=history.todos,
+                timelines=history.timelines,
                 ledger_seq=self.conversation_files.latest_seq(session_id),
             )
             payload = self.history_projection.read(session_id) or {
-                "messages": [m.model_dump(mode="json") for m in history.messages],
+                "messages": [m.model_dump(mode="json", exclude_none=True, exclude_defaults=True) for m in history.messages],
+                "timelines": history.timelines,
                 "context_usage": history.context_usage,
                 "api_usage": history.api_usage,
                 "session_token_stats": history.session_token_stats,
@@ -373,13 +385,16 @@ class ChatService:
             ),
         )
         return SessionHistoryPage(
+            projection_version=3,
             session_id=session_id,
+            workspace_id=self.conversation_files.workspace_id,
             session=Session(**meta),
             messages=page_messages,
             context_usage=payload.get("context_usage"),
             api_usage=payload.get("api_usage"),
             session_token_stats=payload.get("session_token_stats"),
             todos=payload.get("todos"),
+            timelines=payload.get("timelines", []),
             limit=limit,
             before=before,
             has_more=has_more,
@@ -387,31 +402,25 @@ class ChatService:
             projection_updated_at=payload.get("updated_at"),
         )
 
-    async def get_tool_result(self, session_id: str, tool_call_id: str) -> ToolResultPayload:
+    async def get_tool_result(self, session_id: str, tool_call_id: str, *, seq: int | None = None) -> ToolResultPayload:
         self.session_store.get(session_id)
-        project = session_project_path(session_id)
-        if project is None:
-            return ToolResultPayload(
-                session_id=session_id,
-                tool_call_id=tool_call_id,
-                available=False,
-                error="会话未绑定项目工作区",
-            )
-        safe_id = re.sub(r"[^\w\-]", "_", tool_call_id or "unknown")
-        path = project_tool_results_dir(Path(project), session_id) / f"{safe_id}.json"
-        if not path.exists():
-            return ToolResultPayload(
-                session_id=session_id,
-                tool_call_id=tool_call_id,
-                content=None,
-                available=False,
-                error="工具结果不可用或尚未落盘",
-            )
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            content = payload.get("content")
+            if seq is not None:
+                row = self.conversation_files.row_at(session_id, seq)
+                if row is not None and (row["message"].get("role") != "tool"
+                                        or row["message"].get("tool_call_id") != tool_call_id):
+                    raise ValueError("工具结果序号与调用身份不匹配")
+            else:
+                rows = self.conversation_files.read(session_id)
+                row = next((row for row in reversed(rows) if row["message"].get("role") == "tool"
+                            and row["message"].get("tool_call_id") == tool_call_id), None)
+            if row is None:
+                raise ValueError("工具结果不可用或尚未落盘")
+            message = self.conversation_files.decode_row(row, session_id=session_id, resolve_references=True)
+            from app.storage.message_codec import safe_business_value
+            content = safe_business_value(message.content)
             if not isinstance(content, str):
-                raise ValueError("工具结果格式无效")
+                content = json.dumps(content, ensure_ascii=False)
             return ToolResultPayload(session_id=session_id, tool_call_id=tool_call_id, content=content)
         except Exception as exc:
             return ToolResultPayload(
@@ -422,7 +431,20 @@ class ChatService:
                 error=str(exc),
             )
 
-    async def _llm_short_title(self, user_message: str, assistant_content: str) -> str | None:
+    async def get_ledger_message(self, session_id: str, seq: int) -> dict:
+        self.session_store.get(session_id)
+        row = self.conversation_files.row_at(session_id, seq)
+        if row is None:
+            raise AppError("账本消息不存在", status_code=404)
+        from app.storage.message_codec import safe_business_value
+        safe = safe_business_value({key: value for key, value in row.items() if not key.startswith("_")})
+        # Only the business message and public outcome are a UI resource.
+        safe.pop("extensions", None)
+        safe.pop("model", None)
+        safe["message"].pop("id", None)
+        return {"session_id": session_id, "workspace_id": self.conversation_files.workspace_id, "message": safe}
+
+    async def _llm_short_title(self, user_message: str, assistant_content: str, *, session_id: str, turn_id: str) -> str | None:
         if not self.settings.has_llm:
             return None
         prompt = (
@@ -433,10 +455,13 @@ class ChatService:
         )
         try:
             model = get_chat_model()
-            result = await asyncio.wait_for(
-                model.ainvoke([HumanMessage(content=prompt)]),
-                timeout=8,
-            )
+            from app.agent.audit import RuntimeLedgerAudit, bind_runtime_audit
+            from app.core.model_request import bind_model_request_scope, invoke_auxiliary_model_async
+            scope = {"workspace_id": self.conversation_files.workspace_id, "session_id": session_id, "turn_id": turn_id}
+            with bind_model_request_scope(scope), bind_runtime_audit(RuntimeLedgerAudit(self.conversation_files, scope)):
+                result = await asyncio.wait_for(
+                    invoke_auxiliary_model_async(model, [HumanMessage(content=prompt)]), timeout=8,
+                )
             raw = result.content if hasattr(result, "content") else str(result)
             if isinstance(raw, list):
                 raw = "".join(str(part) for part in raw)
@@ -450,6 +475,7 @@ class ChatService:
         session_id: str,
         user_message: str,
         assistant_content: str,
+        turn_id: str,
     ) -> None:
         try:
             meta = self.session_store.get(session_id)
@@ -457,22 +483,24 @@ class ChatService:
                 return
             if not (assistant_content or "").strip():
                 return
-            summary = await self._llm_short_title(user_message, assistant_content)
+            summary = await self._llm_short_title(user_message, assistant_content, session_id=session_id, turn_id=turn_id)
             if summary:
                 self.session_store.apply_auto_title(session_id, summary)
         except Exception:
             return
 
+    @_exclusive_turn()
     async def send_sync(
         self,
         message: str,
         session_id: str | None,
         *,
-        run_id: str | None = None,
+        turn_id: str | None = None,
     ) -> ChatResponse:
         from app.core.settings import get_settings
 
-        latency = RunLatency(run_id=run_id, session_id=session_id)
+        turn_id = turn_id or "turn_" + uuid.uuid4().hex
+        latency = RunLatency(turn_id=turn_id, session_id=session_id)
         sid = self._require_bound_session(session_id)
         latency.bind_session(sid)
 
@@ -485,11 +513,11 @@ class ChatService:
         config = make_thread_config(sid)
         await self._reject_legacy_checkpoint(graph, config)
         previous = self._refresh_stale_context(
-            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config))
+            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config), stop_incomplete=True)
         )
         max_steps = self._max_steps()
-        state = self._new_run_state(sid, message, max_steps, run_id, previous)
-        run_id = str(state["scope"]["run_id"])
+        state = self._new_run_state(sid, message, max_steps, turn_id, previous)
+        turn_id = str(state["scope"]["turn_id"])
         latency.finish(LATENCY_STAGE_CONTEXT_PREPARE)
 
         try:
@@ -501,16 +529,25 @@ class ChatService:
             latency.finish(LATENCY_STAGE_MODEL_STREAM)
         except TimeoutError as exc:
             latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed")
+            await self.repair_cancelled_checkpoint(sid)
+            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "request_timeout")
             raise RuntimeError(
                 f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s），请稍后重试"
             ) from exc
+        except Exception:
+            await self.repair_cancelled_checkpoint(sid)
+            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "runtime_error")
+            raise
         projected_result = to_runtime_view(result)
+        from app.agent.streaming.interrupts import has_pending_interrupt
+        if await has_pending_interrupt(graph, config):
+            raise RuntimeError("此操作需要通过 WebSocket 确认或回答，请重连当前会话")
         content = extract_final_content(projected_result.get("messages", []))
         self.session_store.touch(sid)
         await self._refresh_history_projection(sid, graph=graph, config=config)
         self._schedule_background(
             "auto-title refinement",
-            lambda: self._refine_auto_title_after_turn(sid, message, content),
+            lambda: self._refine_auto_title_after_turn(sid, message, content, turn_id),
         )
         dispatch_post_llm_call(
             session_id=sid,
@@ -524,32 +561,34 @@ class ChatService:
                 lambda: get_maintenance_runner().run_memory_nudge_for_session(sid),
             )
         log.info("chat.run.completed", extra=latency.summary(status="success"))
-        return ChatResponse(content=content, session_id=sid)
+        return ChatResponse(content=content, session_id=sid, turn_id=turn_id)
 
+    @_exclusive_turn(stream=True)
     async def iter_chat_events(
         self,
         message: str,
         session_id: str | None,
         *,
-        run_id: str | None = None,
+        turn_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """聊天主流程：产出统一 AgentEvent 流（SSE / WS 共用）。"""
-        latency = RunLatency(run_id=run_id, session_id=session_id)
+        turn_id = turn_id or "turn_" + uuid.uuid4().hex
+        latency = RunLatency(turn_id=turn_id, session_id=session_id)
         try:
             sid = self._require_bound_session(session_id)
         except AppError as exc:
-            yield AgentEvent("error", {"error": exc.message}, run_id)
+            yield AgentEvent("error", {"error": exc.message}, turn_id)
             return
         latency.bind_session(sid)
 
         if not self.settings.has_llm:
-            yield AgentEvent("error", {"error": "未配置 LLM API Key，请在 backend/.env 设置 OPENAI_API_KEY"}, run_id)
+            yield AgentEvent("error", {"error": "未配置 LLM API Key，请在 backend/.env 设置 OPENAI_API_KEY"}, turn_id)
             return
-        yield AgentEvent("session", {"session_id": sid}, run_id)
-        yield AgentEvent("stage", latency.instant(LATENCY_STAGE_ACCEPTED), run_id)
+        yield AgentEvent("session", {"session_id": sid}, turn_id)
+        yield AgentEvent("stage", latency.instant(LATENCY_STAGE_ACCEPTED), turn_id)
         self.session_store.maybe_set_title_from_message(sid, message)
 
-        yield AgentEvent("stage", latency.start(LATENCY_STAGE_CONTEXT_PREPARE), run_id)
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_CONTEXT_PREPARE), turn_id)
         memory_status = await self._prepare_memory_bounded(message, latency)
         try:
             graph = await self._get_graph_bounded()
@@ -557,34 +596,34 @@ class ChatService:
             yield AgentEvent(
                 "stage",
                 latency.finish(LATENCY_STAGE_CONTEXT_PREPARE, "failed", error=str(exc)),
-                run_id,
+                turn_id,
             )
-            yield AgentEvent("error", {"error": str(exc)}, run_id)
+            yield AgentEvent("error", {"error": str(exc)}, turn_id)
             log.info("chat.run.completed", extra=latency.summary(status="failed", failed_stage=LATENCY_STAGE_CONTEXT_PREPARE))
             return
         config = make_thread_config(sid)
         try:
             await self._reject_legacy_checkpoint(graph, config)
         except RuntimeError as exc:
-            yield AgentEvent("error", {"error": str(exc), "reason_code": "unsupported_checkpoint"}, run_id)
+            yield AgentEvent("error", {"error": str(exc), "reason_code": "unsupported_checkpoint"}, turn_id)
             return
         previous = self._refresh_stale_context(
-            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config))
+            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config), stop_incomplete=True)
         )
         max_steps = self._max_steps()
-        state = self._new_run_state(sid, message, max_steps, run_id, previous)
-        run_id = str(state["scope"]["run_id"])
+        state = self._new_run_state(sid, message, max_steps, turn_id, previous)
+        turn_id = str(state["scope"]["turn_id"])
         yield AgentEvent(
             "stage",
             latency.finish(LATENCY_STAGE_CONTEXT_PREPARE, memory_status),
-            run_id,
+            turn_id,
         )
-        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), run_id)
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), turn_id)
 
         nudge_pending = False
         final_content = ""
         completed = False
-        async for event in stream_graph_events(graph, state, config, max_steps, run_id=run_id):
+        async for event in stream_graph_events(graph, state, config, max_steps, turn_id=turn_id):
             if event.type == "done":
                 self.session_store.touch(sid)
                 final_content = event.data.get("content", "") or ""
@@ -596,20 +635,20 @@ class ChatService:
                 yield AgentEvent(
                     "stage",
                     latency.finish(LATENCY_STAGE_MODEL_STREAM, "done" if completed else "partial"),
-                    run_id,
+                    turn_id,
                 )
             elif event.type == "error":
                 yield AgentEvent(
                     "stage",
                     latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"),
-                    run_id,
+                    turn_id,
                 )
             yield event
 
         if completed:
             self._schedule_background(
                 "auto-title refinement",
-                lambda: self._refine_auto_title_after_turn(sid, message, final_content),
+                lambda: self._refine_auto_title_after_turn(sid, message, final_content, turn_id),
             )
             self._schedule_background(
                 "history projection refresh",
@@ -631,7 +670,7 @@ class ChatService:
             yield AgentEvent(
                 "stage",
                 latency.instant(LATENCY_STAGE_POSTPROCESS, status="background"),
-                run_id,
+                turn_id,
             )
             self._schedule_background(
                 "memory nudge",
@@ -644,12 +683,12 @@ class ChatService:
         message: str,
         session_id: str | None,
         *,
-        run_id: str | None = None,
+        turn_id: str | None = None,
     ) -> AsyncIterator[str]:
         from app.agent.streaming.interrupts import has_pending_interrupt
 
         sid: str | None = session_id
-        async for event in self.iter_chat_events(message, session_id, run_id=run_id):
+        async for event in self.iter_chat_events(message, session_id, turn_id=turn_id):
             if event.type == "session" and event.data.get("session_id"):
                 sid = event.data["session_id"]
             yield to_sse(event)
@@ -666,7 +705,7 @@ class ChatService:
                         "fail_closed": True,
                         "reason_code": "sse_no_answer_channel",
                     },
-                    run_id,
+                    turn_id,
                 )
             )
 
@@ -675,7 +714,7 @@ class ChatService:
         session_id: str,
         decision: Any,
         *,
-        run_id: str | None = None,
+        turn_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """恢复 interrupt 后继续产出事件流。"""
         from langgraph.types import Command
@@ -683,242 +722,166 @@ class ChatService:
         graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
         await self._reject_legacy_checkpoint(graph, config)
-        values = await self._checkpoint_values(graph, config)
-        checkpoint_run_id = (values.get("scope") or {}).get("run_id")
-        if run_id and checkpoint_run_id and run_id != checkpoint_run_id:
-            raise RuntimeError("恢复请求与 checkpoint 中的 run 不匹配")
-        run_id = str(checkpoint_run_id or run_id or "")
+        values = self._recover_ledger_tail(session_id, await self._checkpoint_values(graph, config))
+        if values.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}:
+            raise RuntimeError("该 turn 已结束，不能恢复过期交互")
+        checkpoint_turn_id = (values.get("scope") or {}).get("turn_id")
+        if turn_id and checkpoint_turn_id and turn_id != checkpoint_turn_id:
+            raise RuntimeError("恢复请求与 checkpoint 中的 turn 不匹配")
+        turn_id = str(checkpoint_turn_id or turn_id or "")
         pending = values.get("pending_interaction") if values else None
+        if not isinstance(pending, dict) or not pending.get("id"):
+            raise RuntimeError("没有可恢复的有效交互")
         if isinstance(pending, dict):
+            if isinstance(decision, dict):
+                decision_kind = "approval" if decision.get("kind") == "tool_approval" else decision.get("kind")
+                if decision_kind and decision_kind != pending["kind"]:
+                    raise RuntimeError("响应与 checkpoint 中的交互类型不匹配")
+                if decision.get("step_id") != values.get("current_step", {}).get("step_id"):
+                    raise RuntimeError("响应与 checkpoint 中的 step 不匹配")
+                if decision.get("mode") and decision["mode"] != pending.get("mode"):
+                    raise RuntimeError("响应与 checkpoint 中的交互模式不匹配")
+                if decision.get("tool_call_id") != pending.get("call_id"):
+                    raise RuntimeError("响应与 checkpoint 中的调用不匹配")
             response_id = decision.get("interrupt_id") if isinstance(decision, dict) else None
-            if response_id and pending.get("interrupt_id") and response_id != pending.get("interrupt_id"):
+            if isinstance(decision, dict) and response_id != pending.get("id"):
                 raise RuntimeError("响应与 checkpoint 中的 interrupt 不匹配")
-            if hasattr(graph, "aupdate_state"):
-                await graph.aupdate_state(
-                    config,
-                    {
-                        "state_revision": int(values.get("state_revision", 0)) + 1,
-                        "checkpoint_uid": f"cp_{uuid.uuid4().hex}",
-                        "run_status": "running",
-                        "current_step": {**values.get("current_step", {}), "step_status": "running"},
-                        "pending_interaction": None,
-                    },
+            if pending.get("decision") is not None:
+                decision = pending["decision"]
+            else:
+                interaction = {"id": pending["id"], "kind": pending["kind"], "decision": decision}
+                message_payload = {"role": "user", "content": (
+                    str(decision.get("answer") or "已确认交还") if isinstance(decision, dict) else str(decision)
+                )}
+                if isinstance(decision, dict) and decision.get("kind") == "tool_approval":
+                    message_payload["content"] = decision["decision"]
+                if isinstance(decision, dict) and decision.get("source") in {"timeout", "cancelled"}:
+                    message_payload = {"role": "system", "content": [{"type": "lifecycle", "subject": "interaction"}]}
+                if pending.get("call_id"):
+                    message_payload["tool_call_id"] = pending["call_id"]
+                source = decision.get("source") if isinstance(decision, dict) else None
+                answer = decision.get("decision") if isinstance(decision, dict) else decision
+                interaction_status = "expired" if source == "timeout" else "cancelled" if source == "cancelled" else "denied" if answer == "deny" else "completed"
+                seq, _ = self.conversation_files.append(
+                    session_id, f"msg_decision_{pending['id']}", message_payload,
+                    turn_id=turn_id, interaction=interaction,
+                    execution={"status": interaction_status, "finished_at": utc_now()},
                 )
+                values["ledger_pointer"] = {
+                    "applied_seq": seq,
+                    "applied_offset": self.conversation_files.offset_after(session_id, seq),
+                }
+            # Commit the durable decision together with the native resume. A
+            # separate update here would clear LangGraph's pending interrupt.
+            values["state_revision"] = int(values.get("state_revision", 0)) + 1
+            values["checkpoint_uid"] = f"cp_{uuid.uuid4().hex}"
+            values.pop("checkpoint_id", None)
+            values["pending_interaction"] = {**pending, "decision": decision}
         max_steps = self._max_steps()
-        latency = RunLatency(run_id=run_id, session_id=session_id)
-        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), run_id)
+        if isinstance(decision, dict) and decision.get("kind") == "tool_approval":
+            decision = decision["decision"]
+        latency = RunLatency(turn_id=turn_id, session_id=session_id)
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), turn_id)
 
         async for event in stream_graph_events(
             graph,
             {},
             config,
             max_steps,
-            run_id=run_id,
-            input_override=Command(resume=decision),
+            turn_id=turn_id,
+            input_override=Command(resume=decision, update=to_graph_state(values)),
         ):
             if event.type == "done":
                 self.session_store.touch(session_id)
-                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM), run_id)
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM), turn_id)
                 self._schedule_background(
                     "history projection refresh",
                     lambda: self._refresh_history_projection(session_id, graph=graph, config=config),
                 )
             elif event.type == "error":
-                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"), run_id)
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"), turn_id)
             yield event
 
     async def repair_cancelled_checkpoint(self, session_id: str) -> None:
         """取消时修复未完成的 tool_calls。"""
-        from app.context.ledger import cancel_tool_calls_message, has_pending_tool_calls
-
         graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
         snapshot = await graph.aget_state(config)
         if not snapshot or not snapshot.values:
             return
-        projected = to_runtime_view(dict(snapshot.values or {})) if "context" in snapshot.values else dict(snapshot.values or {})
-        messages = list(projected.get("messages") or [])
-        if not has_pending_tool_calls(messages):
-            return
-        last = messages[-1]
-        if isinstance(last, AIMessage) and last.tool_calls:
-            cancelled = cancel_tool_calls_message(last)
-            values = dict(snapshot.values or {})
-            scope = values.get("scope") or {}
-            run_id = str(scope.get("run_id") or "")
-            step_id = str((values.get("current_step") or {}).get("step_id") or "")
-            seq = self.conversation_files.append_messages(
-                session_id, run_id, cancelled,
-                scope={**scope, "request_id": None, "step_id": step_id or None},
-            )
-            patch = merge_runtime_updates(values, {"messages": cancelled})
-            patch["ledger_pointer"] = {
-                **(values.get("ledger_pointer") or {}),
-                "applied_seq": seq,
-                "applied_offset": self.conversation_files.offset_after(session_id, seq),
-            }
-            await graph.aupdate_state(config, patch)
+        values = dict(snapshot.values or {})
+        recovered = self._recover_ledger_tail(session_id, values)
+        rows = self.conversation_files.read(session_id)
+        settled = {row["message"].get("tool_call_id") for row in rows
+                   if row.get("turn_id") == values["scope"]["turn_id"] and row["message"].get("role") == "tool"}
+        pending_messages = []
+        for msg in reversed(recovered.get("context", {}).get("working_message", [])):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for call in msg.tool_calls:
+                    if call["id"] not in settled:
+                        pending_messages.append(ToolMessage(
+                            content="工具调用在执行前取消。", tool_call_id=call["id"],
+                            additional_kwargs={"tool_status": "cancelled", "reason_code": "cancelled",
+                                               "ledger_message_id": f"msg_cancelled_{values['scope']['turn_id']}_{call['id']}"},
+                        ))
+                break
+        if pending_messages:
+            from app.agent.audit import RuntimeLedgerAudit
+            audit = RuntimeLedgerAudit(self.conversation_files, values["scope"])
+            pending_messages = [audit.settle_tool(message) for message in pending_messages]
+            seq = self.conversation_files.latest_seq(session_id)
+            recovered = merge_runtime_updates(recovered, {"messages": pending_messages})
+            recovered["ledger_pointer"] = {"applied_seq": seq, "applied_offset": self.conversation_files.offset_after(session_id, seq)}
+        await graph.aupdate_state(config, to_graph_state(recovered))
 
-    async def mark_terminal_checkpoint(self, session_id: str, run_id: str, status: str, reason: str) -> None:
+    async def mark_terminal_checkpoint(self, session_id: str, turn_id: str, status: str, reason: str) -> None:
         graph = await self._get_graph_bounded()
         config = make_thread_config(session_id)
         if not hasattr(graph, "aget_state") or not hasattr(graph, "aupdate_state"):
             return
         snapshot = await graph.aget_state(config)
         values = dict(snapshot.values or {}) if snapshot else {}
-        if "context" not in values or (values.get("scope") or {}).get("run_id") not in {None, run_id}:
+        if "context" not in values or (values.get("scope") or {}).get("turn_id") not in {None, turn_id}:
             return
+        values = self._recover_ledger_tail(session_id, values)
+        if values.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}:
+            await graph.aupdate_state(config, to_graph_state(values))
+            return
+        from app.agent.audit import RuntimeLedgerAudit
+        seq = RuntimeLedgerAudit(self.conversation_files, values["scope"]).turn_terminal(status, reason)
         await graph.aupdate_state(
             config,
             {
                 **terminal_patch(values, status, reason),
+                "ledger_pointer": {"applied_seq": seq, "applied_offset": self.conversation_files.offset_after(session_id, seq)},
                 "current_step": {
                     **values.get("current_step", {}),
-                    "step_status": status,
-                    "tool_calls": [
-                        {**call, "status": "cancelled"}
-                        if call.get("status") in {"pending", "running"} else call
-                        for call in (values.get("current_step", {}).get("tool_calls") or [])
-                    ],
+                    "step_status": "skipped" if status == "handoff" else status,
+                    "tool_calls": values.get("current_step", {}).get("tool_calls", []),
                 },
                 "pending_interaction": None,
             },
         )
 
-    def _message_timestamp(self, msg: BaseMessage) -> int | None:
-        ts = msg.additional_kwargs.get("timestamp")
-        if isinstance(ts, (int, float)):
-            return int(ts)
-        return None
-
-    def _compact_tool_content(
-        self,
-        msg: ToolMessage,
-        *,
-        session_id: str | None = None,
-    ) -> tuple[str, str | None, str | None, bool]:
-        content = str(msg.content) if msg.content is not None else ""
-        kwargs = getattr(msg, "additional_kwargs", None) or {}
-        cache_path = kwargs.get("tool_cache_path")
-        cache_summary = kwargs.get("tool_cache_summary")
-        if cache_path and cache_summary:
-            return str(cache_summary), msg.tool_call_id, str(cache_summary), True
-        preview = summarize_tool_result(content, max_chars=800)
-        truncated = len(preview) < len(content)
-        if truncated and session_id and msg.tool_call_id:
-            project = session_project_path(session_id)
-            if project is not None:
-                try:
-                    save_tool_result(session_id, msg.tool_call_id, content, Path(project))
-                    return preview, msg.tool_call_id, preview, True
-                except Exception:
-                    log.warning(
-                        "tool result projection cache failed",
-                        extra={"session_id": session_id, "tool_call_id": msg.tool_call_id},
-                        exc_info=True,
-                    )
-        return (preview if truncated else content), None, (preview if truncated else None), truncated
-
-    def messages_to_openai(
-        self,
-        messages: list,
-        *,
-        session_id: str | None = None,
-        compact_tools: bool = False,
-        ledger_rows: list[dict] | None = None,
-    ) -> list[ChatMessage]:
-        rows_by_id = {row["message_id"]: row for row in (ledger_rows or [])}
-
-        def identity(msg: BaseMessage) -> dict:
-            ledger_id = (msg.additional_kwargs or {}).get("ledger_message_id")
-            row = rows_by_id.get(ledger_id)
-            return {
-                "message_id": ledger_id,
-                "vendor_message_id": msg.id,
-                "scope": row["scope"] if row else None,
-                "origin": row["origin"] if row else None,
-            }
-        tool_display_names: dict[str, str] = {}
-        for msg in messages:
-            if isinstance(msg, ToolMessage) and msg.tool_call_id and msg.name:
-                tool_display_names[msg.tool_call_id] = msg.name
-
-        result: list[ChatMessage] = []
-        for msg in messages:
-            if is_internal_prompt_message(msg):
-                continue
-            if isinstance(msg, HumanMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                result.append(
-                    ChatMessage(role="user", content=content, timestamp=self._message_timestamp(msg), **identity(msg))
-                )
-            elif isinstance(msg, AIMessage):
-                content = msg.content
-                if isinstance(content, list):
-                    content = "".join(
-                        p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
-                    )
-                tool_calls = None
-                if msg.tool_calls:
-                    tool_calls = []
-                    for tc in msg.tool_calls:
-                        tc_id = tc.get("id", "")
-                        raw_name = tc.get("name", "")
-                        raw_args = tc.get("args") or {}
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except json.JSONDecodeError:
-                                raw_args = {}
-                        display_name, display_args = resolve_tool_display(raw_name, raw_args)
-                        if tc_id and tc_id in tool_display_names:
-                            display_name = tool_display_names[tc_id]
-                        if not should_show_tool_in_ui(display_name):
-                            continue
-                        tool_calls.append(
-                            ToolCall(
-                                id=tc_id,
-                                function=ToolCallFunction(
-                                    name=display_name,
-                                    arguments=json.dumps(display_args, ensure_ascii=False),
-                                ),
-                            )
-                        )
-                    if not tool_calls:
-                        tool_calls = None
-                if not content and not tool_calls:
+    def messages_to_openai(self, messages: list, *, session_id: str | None = None,
+                           compact_tools: bool = False, ledger_rows: list[dict] | None = None) -> list[ChatMessage]:
+        """Project business messages; runtime objects never define the storage protocol."""
+        from app.agent.state import utc_now
+        from app.storage.message_codec import encode_message
+        rows = ledger_rows
+        if rows is None:
+            rows = []
+            for message in messages:
+                if is_internal_prompt_message(message):
                     continue
-                result.append(
-                    ChatMessage(
-                        role="assistant",
-                        content=content or None,
-                        tool_calls=tool_calls,
-                        timestamp=self._message_timestamp(msg),
-                        **identity(msg),
-                    )
-                )
-            elif isinstance(msg, ToolMessage):
-                display_name = msg.name or "tool"
-                if not should_show_tool_in_ui(display_name):
-                    continue
-                kwargs = msg.additional_kwargs or {}
-                tool_status = str(kwargs.get("tool_status") or (
-                    "failed" if kwargs.get("reason_code") else "completed"
-                ))
-                result.append(
-                    ChatMessage(
-                        role="tool",
-                        # History shows the execution result only. Full tool
-                        # output remains in the append-only ledger/cache.
-                        content=None,
-                        tool_call_id=msg.tool_call_id,
-                        timestamp=self._message_timestamp(msg),
-                        tool_status=tool_status,
-                        tool_reason_code=str(kwargs["reason_code"]) if kwargs.get("reason_code") else None,
-                        **identity(msg),
-                    )
-                )
-        return result
+                kwargs = message.additional_kwargs or {}
+                row = {"seq": len(rows) + 1,
+                       "message_id": kwargs.get("ledger_message_id") or f"msg_{uuid.uuid4().hex}",
+                       "turn_id": kwargs.get("ledger_turn_id") or "turn_preview",
+                       "timestamp": kwargs.get("ledger_timestamp") or utc_now(),
+                       **encode_message(message)}
+                rows.append(row)
+        return [ChatMessage(**row) for row in project_ledger(rows)["messages"]]
 
     async def get_history(self, session_id: str) -> SessionHistory:
         return await self._history_from_checkpoint(session_id, compact_tools=False)

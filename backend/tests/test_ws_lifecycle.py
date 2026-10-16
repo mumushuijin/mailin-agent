@@ -189,6 +189,7 @@ async def test_cancel_run_cancels_approval_future_instead_of_deny():
     manager = MagicMock()
     chat_service = MagicMock()
     chat_service.repair_cancelled_checkpoint = AsyncMock()
+    chat_service.mark_terminal_checkpoint = AsyncMock()
     svc = WsChatService(manager, chat_service)
 
     loop = asyncio.get_running_loop()
@@ -216,16 +217,17 @@ async def test_stale_approval_is_rejected_without_consuming_pending_future():
     future: asyncio.Future[str] = loop.create_future()
     svc._approval_futures["run-1"] = future
     svc._run_sessions["run-1"] = "sess-1"
-    svc._pending_interrupt_meta["run-1"] = {"tool_call_id": "tool-1", "session_id": "sess-1"}
+    svc._pending_interrupt_meta["run-1"] = {"tool_call_id": "tool-1", "session_id": "sess-1", "kind": "approval", "interrupt_id": "i1"}
 
     await svc.handle_message(
         1,
         {
             "op": "approve",
-            "run_id": "run-1",
+            "turn_id": "run-1",
             "decision": "allow",
             "tool_call_id": "tool-old",
             "session_id": "sess-1",
+            "interrupt_id": "i1",
         },
     )
 
@@ -246,23 +248,21 @@ async def test_state_sync_returns_snapshot_only_for_active_run_session():
     dispatcher = MagicMock()
     dispatcher.publish = AsyncMock(return_value=True)
     svc._dispatchers["run-1"] = dispatcher
-    state = {
-        "checkpoint_id": "cp-1", "state_revision": 1,
-        "scope": {"workspace_id": "ws-1", "session_id": "sess-1", "run_id": "run-1", "task_id": "task-1", "request_id": "req-1", "step_id": "step-1"},
-        "context": {"working_message": []}, "max_step_every_run": 8,
-        "tasks": ["task-1"], "current_task": "task-1",
-        "current_step": {"step_id": "step-1", "tool_calls": []}, "memory": {},
-    }
+    from app.agent.state import new_agent_state
+    from langchain_core.messages import HumanMessage
+    state = new_agent_state(workspace_id="ws-1", session_id="sess-1", message=HumanMessage(content="hello"), turn_id="run-1")
+    state["checkpoint_id"] = "cp_1234567890abcdef1234567890abcdef"
     graph = MagicMock()
     graph.aget_state = AsyncMock(return_value=MagicMock(values=state))
+    chat_service._recover_ledger_tail = MagicMock(side_effect=lambda _sid, values: values)
     with patch("app.services.ws_chat_service.asyncio.to_thread", new=AsyncMock(return_value=graph)):
-        await svc.handle_message(7, {"op": "state.sync", "run_id": "run-1", "session_id": "sess-old"})
+        await svc.handle_message(7, {"op": "state.sync", "turn_id": "run-1", "session_id": "sess-old"})
         dispatcher.publish.assert_not_awaited()
-        await svc.handle_message(7, {"op": "state.sync", "run_id": "run-1", "session_id": "sess-1"})
+        await svc.handle_message(7, {"op": "state.sync", "turn_id": "run-1", "session_id": "sess-1"})
 
     event = dispatcher.publish.await_args.args[1]["agent_event"]
     assert event.type == "state_sync"
-    assert event.state["checkpoint_id"] == "cp-1"
+    assert event.state["checkpoint_id"] == state["checkpoint_id"]
 
 
 def test_push_maintenance_background_payload():
@@ -304,4 +304,4 @@ def test_ws_background_event_has_no_run_id():
     )
     assert payload["type"] == "background"
     assert payload["data"]["task_id"] == "abc"
-    assert "run_id" not in payload
+    assert "turn_id" not in payload

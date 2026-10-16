@@ -38,16 +38,16 @@ def test_ws_invalid_json(client):
 def test_agent_event_to_ws():
     from app.agent.streaming.events import AgentEvent, to_sse, to_ws
 
-    event = AgentEvent("chunk", {"content": "hello"}, run_id="r1")
+    event = AgentEvent("chunk", {"content": "hello"}, turn_id="r1")
     ws_payload = to_ws(event)
     assert ws_payload["type"] == "chunk"
     assert ws_payload["data"]["content"] == "hello"
-    assert ws_payload["run_id"] == "r1"
+    assert ws_payload["turn_id"] == "r1"
 
     sse = to_sse(event)
     assert "event: chunk" in sse
     assert "hello" in sse
-    assert '"run_id": "r1"' in sse
+    assert '"turn_id": "r1"' in sse
 
 
 def test_stream_event_payload_accepts_lifecycle_and_terminal_fields():
@@ -55,7 +55,7 @@ def test_stream_event_payload_accepts_lifecycle_and_terminal_fields():
 
     payload = StreamEventPayload(
         type="stage",
-        run_id="run-1",
+        turn_id="run-1",
         session_id="sess-1",
         stage="context_prepare",
         status="started",
@@ -66,6 +66,6 @@ def test_stream_event_payload_accepts_lifecycle_and_terminal_fields():
         cancelled=True,
     )
 
-    assert payload.run_id == "run-1"
+    assert payload.turn_id == "run-1"
     assert payload.stage == "context_prepare"
     assert payload.todos and payload.todos[0]["id"] == "t1"

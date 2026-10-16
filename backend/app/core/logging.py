@@ -1,4 +1,4 @@
-"""structlog 结构化日志：trace_id / run_id / task_id 上下文传播。"""
+"""structlog 结构化日志：trace_id / turn_id / task_id 上下文传播。"""
 
 from __future__ import annotations
 

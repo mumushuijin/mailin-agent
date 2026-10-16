@@ -43,7 +43,7 @@ def make_system_message(content: str, kind: str) -> SystemMessage:
         additional_kwargs={
             SYSTEM_MAINTENANCE_KEY: True,
             MAINTENANCE_KIND_KEY: kind,
-            "timestamp": int(time.time()),
+            "timestamp": time.time_ns() // 1_000_000,
         },
     )
 

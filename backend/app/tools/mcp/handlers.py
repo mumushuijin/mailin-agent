@@ -47,6 +47,16 @@ def _format_tool_result(result) -> str:
         payload["result"] = "\n".join(text_parts)
     if structured is not None:
         payload["structuredContent"] = structured
+    other_blocks = []
+    for block in getattr(result, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            continue
+        if hasattr(block, "model_dump"):
+            other_blocks.append(block.model_dump(mode="json", exclude_none=True))
+        elif isinstance(block, dict):
+            other_blocks.append(block)
+    if other_blocks:
+        payload["content"] = other_blocks
     if not payload:
         payload["result"] = ""
     return json.dumps(payload, ensure_ascii=False)

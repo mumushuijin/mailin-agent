@@ -24,9 +24,9 @@ def mcp_status_handler(**_kwargs) -> str:
     try:
         payload = build_mcp_status_payload()
         logger.debug(
-            "MCP status snapshot requested session=%s run=%s tool_call_id=%s stale=%s source=%s",
+            "MCP status snapshot requested session=%s turn=%s tool_call_id=%s stale=%s source=%s",
             _kwargs.get("session_id"),
-            _kwargs.get("run_id"),
+            _kwargs.get("turn_id"),
             _kwargs.get("tool_call_id"),
             payload.get("snapshot_stale"),
             payload.get("snapshot_source"),
