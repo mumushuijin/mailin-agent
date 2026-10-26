@@ -10,7 +10,7 @@ from app.storage.ledger_contract import is_audit_row, lifecycle_subject
 from app.storage.message_codec import safe_business_value
 from app.storage.conversation_files import _atomic_write, utc_milliseconds
 
-PROJECTION_VERSION = 3
+PROJECTION_VERSION = 4
 
 
 def _safe_session_id(session_id: str) -> str:
@@ -204,7 +204,7 @@ class HistoryProjectionStore:
         except (OSError, json.JSONDecodeError):
             return None
         if payload.get("version") != PROJECTION_VERSION:
-            raise ValueError("不支持的历史投影格式: expected projection version 3; existing data is preserved")
+            raise ValueError(f"不支持的历史投影格式: expected projection version {PROJECTION_VERSION}; existing data is preserved")
         messages = payload.get("messages")
         if not isinstance(messages, list):
             return None
@@ -225,6 +225,7 @@ class HistoryProjectionStore:
         payload = {
             "version": PROJECTION_VERSION,
             "session_id": session_id,
+            "branch_id": "main",
             "updated_at": utc_milliseconds(),
             "messages": [safe_business_value(m.model_dump(mode="json", exclude_none=True, exclude_defaults=True)) for m in messages],
         }

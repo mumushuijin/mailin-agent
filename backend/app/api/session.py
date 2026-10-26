@@ -13,10 +13,12 @@ from app.schemas.session import (
 )
 from app.services.chat_service import ChatService
 from app.services.session_service import SessionService
+from app.services.timeline_service import TimelineService
 
 router = APIRouter()
 session_service = SessionService()
 chat_service = ChatService()
+timeline_service = TimelineService(session_service.conversation_files)
 
 
 @router.get("/list")
@@ -68,6 +70,45 @@ async def get_session_history(
         )
     except (ValueError, RuntimeError) as exc:
         raise AppError(str(exc), status_code=409, code="unsupported_session_format") from exc
+
+
+@router.get("/{session_id}/timeline")
+async def get_session_timeline(
+    session_id: str,
+    branch_id: str = Query(default="main", min_length=1, max_length=256),
+    limit: int = Query(default=100, ge=1, le=200),
+    after_cursor: str | None = Query(default=None, max_length=2048),
+):
+    try:
+        session_service.get(session_id)
+        return timeline_service.read_page(
+            session_id,
+            branch_id=branch_id,
+            limit=limit,
+            after_cursor=after_cursor,
+        )
+    except ValueError as exc:
+        raise AppError(str(exc), status_code=409, code="invalid_timeline_cursor") from exc
+
+
+@router.get("/{session_id}/events")
+async def get_session_events(
+    session_id: str,
+    branch_id: str = Query(default="main", min_length=1, max_length=256),
+    after_cursor: str | None = Query(default=None, max_length=2048),
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    try:
+        session_service.get(session_id)
+        return timeline_service.read_page(
+            session_id,
+            branch_id=branch_id,
+            limit=limit,
+            after_cursor=after_cursor,
+            include_projection=False,
+        )
+    except ValueError as exc:
+        raise AppError(str(exc), status_code=409, code="invalid_timeline_cursor") from exc
 
 
 @router.get("/{session_id}/tool-result/{tool_call_id}", response_model=ToolResultPayload)

@@ -9,12 +9,12 @@ import { mapWsToStreamEvent } from '@/api/ws'
 vi.mock('@/api/config', () => ({ configApi: { getAgentInfo: vi.fn().mockResolvedValue({ name: '麦林' }) } }))
 vi.mock('ant-design-vue', () => ({ message: { warning: vi.fn(), error: vi.fn() } }))
 const state = (revision: number, status = 'running'): AgentCheckpointState => ({
-  schema_version: 2, checkpoint_id: `cp_${'b'.repeat(32)}`, state_revision: revision,
+  schema_version: 3, checkpoint_id: `cp_${'b'.repeat(32)}`, state_revision: revision,
   scope: { workspace_id: 'w1', session_id: 's1', turn_id: 'turn_1' },
   context: { working_message: [] }, max_step_every_turn: 48, tasks: [], current_task: null,
   current_step: { step_id: 'step1', step_status: 'running', tool_calls: [], model: null },
   memory: { recorded_count: 0, last_synced_turn: null, source_files: [] }, turn_status: status,
-  ledger_pointer: { applied_seq: 900 },
+  ledger_pointer: { applied_seq: 900, event_cursor: { branch_id: 'main', event_seq: 900, event_id: 'event-900' } },
 })
 function context(): ChatStreamState {
   return { messages: ref([]), currentSessionId: ref('s1'), contextUsage: ref(null), apiUsage: ref(null),
@@ -76,8 +76,8 @@ describe('checkpoint and turn stream semantics', () => {
   })
 
   it('normalizes WS business statuses and rejects legacy envelope fields explicitly', () => {
-    const normalized = mapWsToStreamEvent({ type: 'tool_finish', turn_id: 'turn_1', data: { status: 'denied', result_seq: 8, tool_call_id: 'c1' } })
+    const normalized = mapWsToStreamEvent({ stream_schema_version: 3, type: 'tool_finish', turn_id: 'turn_1', data: { status: 'denied', result_seq: 8, tool_call_id: 'c1' } })
     expect(normalized?.status).toBe('denied'); expect(normalized?.result_seq).toBe(8)
-    expect(() => mapWsToStreamEvent({ type: 'session', run_id: 'old' } as never)).toThrow('旧 run')
+    expect(() => mapWsToStreamEvent({ stream_schema_version: 3, type: 'session', run_id: 'old' } as never)).toThrow('旧 run')
   })
 })

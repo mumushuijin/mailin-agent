@@ -41,7 +41,9 @@ def _settle_response(response, request_id, audit):
             from app.agent.state import utc_now
             response.additional_kwargs["timestamp"] = utc_now()
             response.additional_kwargs["ledger_extensions"] = {"runtime": {"auxiliary": True}}
-            audit.files.append_messages(audit.session_id, audit.turn_id, [response], scope=audit.scope)
+            audit.files.append_messages(
+                audit.session_id, audit.turn_id, [response], scope=audit.scope, branch_id=audit.branch_id,
+            )
     return response
 
 

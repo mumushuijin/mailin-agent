@@ -1,6 +1,7 @@
 import api from './index'
 import type { ApiUsage, ContextUsage, SessionTokenStats } from './chat'
 import type { ToolAttempt } from '@/types/chat-ui'
+import type { PersistentTimelineState, TimelineEventEnvelope } from '@/utils/eventTimelineReducer'
 
 export interface Session {
   id: string
@@ -51,7 +52,9 @@ export interface ChatMessage {
 export interface SessionHistory {
   session_id: string
   workspace_id?: string
-  projection_version: 3
+  projection_version: 4
+  branch_id?: string
+  as_of_event_seq?: number
   timelines?: TurnTimeline[]
   messages: ChatMessage[]
   context_usage?: ContextUsage | null
@@ -75,6 +78,23 @@ export interface ToolResultPayload {
   content?: string | null
   available: boolean
   error?: string | null
+}
+
+export interface SessionTimelinePage {
+  session_id: string
+  branch_id: string
+  as_of_event_seq: number
+  projection?: PersistentTimelineState
+  events: TimelineEventEnvelope[]
+  snapshot_cursor: string
+  next_cursor: string
+  has_more: boolean
+}
+
+export interface SessionTimelineParams {
+  branch_id?: string
+  limit?: number
+  after_cursor?: string | null
 }
 
 export const sessionApi = {
@@ -121,14 +141,20 @@ export const sessionApi = {
       execution?: { status: string; attempt?: number; error?: { code: string; message?: string } }
     }
   }>(`/session/${id}/ledger-message/${seq}`),
+  getTimeline: async (id: string, params?: SessionTimelineParams) => api.get<SessionTimelinePage>(`/session/${id}/timeline`, {
+    params: { branch_id: params?.branch_id ?? 'main', limit: params?.limit ?? 100, after_cursor: params?.after_cursor ?? undefined },
+  }),
+  getTimelineEvents: async (id: string, params?: SessionTimelineParams) => api.get<SessionTimelinePage>(`/session/${id}/events`, {
+    params: { branch_id: params?.branch_id ?? 'main', limit: params?.limit ?? 100, after_cursor: params?.after_cursor ?? undefined },
+  }),
 }
 
 export function validateHistory<T extends SessionHistory>(value: T): T {
-  if (value.projection_version !== 3 || !Array.isArray(value.messages) || value.messages.some(message =>
+  if (value.projection_version !== 4 || !Array.isArray(value.messages) || value.messages.some(message =>
     ['scope', 'origin', 'vendor_message_id', 'run_id'].some(key => key in message) ||
     !['user', 'assistant', 'tool', 'system'].includes(message.role) ||
     (message.tool_calls || []).some(call => typeof call.id !== 'string' || typeof call.name !== 'string' || !call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)))) {
-    throw new Error('不支持的历史协议：需要 history_projection version=3；旧会话请手动清理后新建。')
+    throw new Error('不支持的历史协议：需要 history_projection version=4；旧会话请手动清理后新建。')
   }
   return value
 }

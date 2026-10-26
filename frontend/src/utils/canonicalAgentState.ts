@@ -13,7 +13,7 @@ const toolState = (call: unknown): boolean => object(call) && identity(call.call
   ['started_at', 'ended_at', 'finished_at'].every(key => !(key in call) || millis(call[key]))
 
 export function isCanonicalAgentState(value: unknown): value is AgentCheckpointState {
-  if (!object(value) || value.schema_version !== 2 || legacyKeys.some(key => key in value)) return false
+  if (!object(value) || value.schema_version !== 3 || legacyKeys.some(key => key in value)) return false
   const state = value as Record<string, unknown>
   const scope = state.scope as Record<string, unknown> | null
   const context = state.context as Record<string, unknown> | null
@@ -29,6 +29,9 @@ export function isCanonicalAgentState(value: unknown): value is AgentCheckpointS
     (state.current_task === null || (identity(state.current_task) && state.tasks.includes(state.current_task))) &&
     ['created', 'running', 'waiting_user', 'completed', 'failed', 'cancelled', 'handoff'].includes(String(state.turn_status)) &&
     object(state.ledger_pointer) && !('file' in state.ledger_pointer) && nonnegative(state.ledger_pointer.applied_seq) &&
+    object(state.ledger_pointer.event_cursor) && identity(state.ledger_pointer.event_cursor.branch_id) &&
+    state.ledger_pointer.event_cursor.event_seq === state.ledger_pointer.applied_seq &&
+    identity(state.ledger_pointer.event_cursor.event_id) &&
     step && (step.step_id === null || identity(step.step_id)) && Array.isArray(step.tool_calls) && step.tool_calls.every(toolState) && !('token_info' in step) &&
     ['pending', 'running', 'waiting_user', 'completed', 'failed', 'cancelled', 'skipped'].includes(String(step.step_status)) &&
     ['started_at', 'ended_at'].every(key => !(key in step) || millis(step[key])) &&
@@ -40,7 +43,7 @@ export function isCanonicalAgentState(value: unknown): value is AgentCheckpointS
 
 export function readCanonicalAgentState(value: unknown): AgentCheckpointState | undefined {
   if (value === undefined || value === null) return undefined
-  if (!isCanonicalAgentState(value)) throw new Error('不支持的状态协议：需要 checkpoint schema_version=2 和 turn 字段；旧数据请手动清理后新建会话。')
+  if (!isCanonicalAgentState(value)) throw new Error('不支持的状态协议：需要 checkpoint schema_version=3 和 branch event cursor；旧数据请手动清理后新建会话。')
   return value
 }
 

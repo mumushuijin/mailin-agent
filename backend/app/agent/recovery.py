@@ -54,18 +54,36 @@ def decode_window_row(files, session_id: str, row: dict):
     return bounded_model_message(message, row)
 
 
-def recover_ledger_tail(state: dict, files, *, session_id: str | None = None, stop_incomplete: bool = False) -> dict:
+def recover_ledger_tail(state: dict, files, *, session_id: str | None = None, stop_incomplete: bool = False,
+                        branch_id: str | None = None) -> dict:
     if not state:
         if session_id and files.session_dir(session_id).exists() and any(files.session_dir(session_id).iterdir()):
-            files.read_tail(session_id, after_seq=0)
-        return {}
+            events = files.visible_events(session_id, branch_id=branch_id or "main")
+            accepted = next((event for event in reversed(events) if event["event_type"] == "message.accepted"), None)
+            if not accepted:
+                return {}
+            from langchain_core.messages import HumanMessage
+            from app.agent.state import new_agent_state
+            state = new_agent_state(workspace_id=str(files.root.parent), session_id=session_id,
+                                    turn_id=accepted["turn_id"], message=HumanMessage(content=""))
+            state["context"]["working_message"] = []
+            state["ledger_pointer"] = files.ledger_pointer(session_id, 0, branch_id=branch_id or "main")
+            # Native graph scheduling is unavailable. Replay facts and stop at a
+            # safe domain boundary rather than executing an inferred continuation.
+            stop_incomplete = True
+        else:
+            return {}
     validate_agent_state(state)
     result = copy.deepcopy(state)
     scope = result["scope"]
     session_id = session_id or scope["session_id"]
     turn_id = scope["turn_id"]
+    branch_id = branch_id or result.get("ledger_pointer", {}).get("event_cursor", {}).get("branch_id", "main")
     cursor = int(result.get("ledger_pointer", {}).get("applied_seq", 0))
-    rows = files.read_tail(session_id, after_seq=cursor, offset=result.get("ledger_pointer", {}).get("applied_offset"))
+    expected_pointer = files.ledger_pointer(session_id, cursor, branch_id=branch_id)
+    if expected_pointer["event_cursor"] != result["ledger_pointer"]["event_cursor"]:
+        raise ValueError("checkpoint event cursor identity does not match the durable ledger")
+    rows = files.read_tail(session_id, after_seq=cursor, offset=result.get("ledger_pointer", {}).get("applied_offset"), branch_id=branch_id)
     calls = {call["call_id"]: dict(call) for call in result["current_step"].get("tool_calls") or []}
     model_requests = {}
     current_step = result["current_step"]
@@ -162,11 +180,61 @@ def recover_ledger_tail(state: dict, files, *, session_id: str | None = None, st
                 files.read_summary(session_id, context["summary_ref"])
                 result["context"]["summary_pointer"] = context["summary_ref"]
                 result["context"]["compression_count"] = context.get("compression_count", result["context"].get("compression_count", 0))
+            if context.get("window_ref"):
+                from app.storage.model_window import ModelWindowStore
+                window = ModelWindowStore(files).load(
+                    session_id,
+                    context["window_ref"],
+                    expected_source_event_cursor=context.get("source_event_cursor"),
+                    expected_window_schema_version=context.get("window_schema_version"),
+                    expected_compression_version=context.get("compression_version"),
+                    expected_bootstrap_fingerprint=context.get("bootstrap_fingerprint"),
+                    expected_reference_fingerprint=context.get("reference_fingerprint"),
+                )
+                if window.content_sha256 != context.get("content_sha256"):
+                    raise ValueError("context window content hash does not match its ledger event")
+                result["context"]["window_pointer"] = window.reference
+    visible_events = files.visible_events(session_id, branch_id=branch_id)
+    for event in visible_events:
+        if event["event_type"] == "memory.sync.recorded":
+            result["memory"] = copy.deepcopy(event["payload"])
+        elif (event["event_type"] == "context.window.materialized"
+              and event["event_seq"] > int(result["ledger_pointer"].get("applied_seq", 0))):
+            # visible_events has verified native materializations even without a message projection.
+            result["context"]["window_pointer"] = copy.deepcopy(event["payload"]["window_ref"])
+    if visible_events and visible_events[-1]["event_seq"] > cursor:
+        cursor = visible_events[-1]["event_seq"]
+        changed = True
+    window_ref = result["context"].get("window_pointer")
+    if window_ref:
+        import hashlib
+        import json
+        from app.storage.message_codec import encode_message
+        from app.storage.model_window import ModelWindowStore
+        references = [block for message in result["context"].get("working_message") or []
+                      for block in (encode_message(message).get("message", {}).get("content") or [])
+                      if isinstance(block, dict) and block.get("type") == "reference"]
+        reference_bytes = json.dumps(references, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        latest_context_event = next((event for event in reversed(visible_events) if event["event_type"] in {
+            "message.accepted", "model.response.completed", "tool.attempt.settled",
+        }), None)
+        source_cursor = {"branch_id": branch_id, "event_seq": latest_context_event["event_seq"] if latest_context_event else 0,
+                         "event_id": latest_context_event["event_id"] if latest_context_event else "origin"}
+        window = ModelWindowStore(files).load_if_current(
+            session_id, window_ref, expected_source_event_cursor=source_cursor,
+            expected_window_schema_version="working-window-v1", expected_compression_version="four-layer-v1",
+            expected_bootstrap_fingerprint=result["context"].get("bootstrap_fingerprint") or hashlib.sha256(b"").hexdigest(),
+            expected_reference_fingerprint=hashlib.sha256(reference_bytes).hexdigest(),
+        )
+        if window is None:
+            result["context"]["window_pointer"] = None
+            result["context"]["last_built_at"] = None
+            changed = True
     unknown = []
     if result.get("turn_status") not in TERMINAL_TURN_STATUSES:
         from langchain_core.messages import ToolMessage
         from app.agent.audit import RuntimeLedgerAudit
-        audit = RuntimeLedgerAudit(files, scope)
+        audit = RuntimeLedgerAudit(files, scope, branch_id=branch_id)
         uncertain = [call for call in calls.values() if call.get("status") == "running" and not call.get("result_seq")]
         changed = changed or bool(uncertain)
         for call in uncertain:
@@ -175,15 +243,15 @@ def recover_ledger_tail(state: dict, files, *, session_id: str | None = None, st
             call.update({"status": settled.additional_kwargs["tool_status"], "result_seq": settled.additional_kwargs["ledger_seq"]})
             if call["status"] == "unknown":
                 unknown.append(call)
-            row = files.read_tail(session_id, after_seq=call["result_seq"] - 1)[0]
+            row = files.read_tail(session_id, after_seq=call["result_seq"] - 1, branch_id=branch_id)[0]
             result["context"]["working_message"] = append_window_messages(result["context"]["working_message"], [bounded_model_message(settled, row)])
-            cursor = files.latest_seq(session_id)
+            cursor = max(cursor, int(settled.additional_kwargs["ledger_seq"]))
         if unknown:
             result["turn_status"] = "failed"
             result["terminal_reason"] = "execution_outcome_unknown"
             result["pending_interaction"] = None
             result["current_step"]["step_status"] = "failed"
-            cursor = RuntimeLedgerAudit(files, scope).turn_terminal("failed", "execution_outcome_unknown")
+            cursor = RuntimeLedgerAudit(files, scope, branch_id=branch_id).turn_terminal("failed", "execution_outcome_unknown")
             changed = True
         unresolved_models = [request_id for request_id, status in model_requests.items() if status == "running"]
         if unresolved_models and result.get("turn_status") not in TERMINAL_TURN_STATUSES:
@@ -221,7 +289,7 @@ def recover_ledger_tail(state: dict, files, *, session_id: str | None = None, st
                 detail["status"] = result["turn_status"]
                 result["task_details"][task_id] = detail
     if changed:
-        result["ledger_pointer"] = {"applied_seq": cursor, "applied_offset": files.offset_after(session_id, cursor)}
+        result["ledger_pointer"] = files.ledger_pointer(session_id, cursor, branch_id=branch_id)
         result["state_revision"] = int(result.get("state_revision", 0)) + 1
         result["checkpoint_uid"] = f"cp_{uuid.uuid4().hex}"
         result.pop("checkpoint_id", None)

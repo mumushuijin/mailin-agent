@@ -5,7 +5,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.storage.conversation_files import INLINE_CONTENT_BYTES, SessionConversationFiles
-from app.storage.ledger_contract import validate_row
+from app.storage.ledger_contract import validate_event, validate_row
 
 SID = "00000000-0000-4000-8000-000000000001"
 OTHER = "00000000-0000-4000-8000-000000000002"
@@ -68,11 +68,13 @@ def test_metadata_versions_containers_and_old_data_fail_closed(tmp_path):
     with pytest.raises(ValueError, match="metadata"):
         files.read(SID)
     files.ensure_metadata(SID)
-    assert files.read_metadata(SID) == {"schema_version": 2, "workspace_id": files.workspace_id, "session_id": SID}
+    assert files.read_metadata(SID) == {"schema_version": 3, "workspace_id": files.workspace_id,
+                                        "session_id": SID, "resource_layout": "session-v1"}
     with pytest.raises(ValueError, match="identity"):
         SessionConversationFiles(tmp_path, "different").read(SID)
     meta = files.metadata_path(SID)
-    meta.write_text(json.dumps({"schema_version": 99, "workspace_id": files.workspace_id, "session_id": SID}))
+    meta.write_text(json.dumps({"schema_version": 99, "workspace_id": files.workspace_id, "session_id": SID,
+                                "resource_layout": "session-v1"}))
     with pytest.raises(ValueError, match="version"):
         files.append(SID, "one", message("hello"), turn_id="t")
     assert json.loads(meta.read_text())["schema_version"] == 99
@@ -91,8 +93,8 @@ def test_metadata_versions_containers_and_old_data_fail_closed(tmp_path):
 def test_complete_line_damage_is_not_rewritten(tmp_path, damage):
     files = SessionConversationFiles(tmp_path)
     files.append(SID, "one", message("hello"), turn_id="t")
-    row = files.read(SID)[0]
-    damaged = {**row, "seq": 4 if damage == "wrong-seq" else 2}
+    event = files.read_events(SID)[0]
+    damaged = {**event, "event_seq": 4 if damage == "wrong-seq" else 2}
     if damage == "old-scope":
         damaged["scope"] = {"run_id": "old"}
     with files.ledger_path(SID).open("a") as stream:
@@ -206,12 +208,12 @@ def test_index_refresh_reads_only_new_lines_and_offset_cannot_skip_tail(tmp_path
     assert second.latest_seq(SID) == 1
     first.append(SID, "two", message("world"), turn_id="t")
     import app.storage.conversation_files as module
-    original = module.validate_row
+    original = module.validate_event
     validated = []
-    def counted(row):
-        validated.append(row["seq"])
-        return original(row)
-    monkeypatch.setattr(module, "validate_row", counted)
+    def counted(row, **kwargs):
+        validated.append(row["event_seq"])
+        return original(row, **kwargs)
+    monkeypatch.setattr(module, "validate_event", counted)
     assert second.latest_seq(SID) == 2
     assert validated == [2]
     assert second.read_tail(SID, after_seq=1, offset=second.offset_after(SID, 2))[0]["seq"] == 2

@@ -97,11 +97,13 @@ async def test_iter_chat_events_acknowledges_before_expensive_graph_work(latency
             assert not memory_called.is_set()
             assert not graph_called.is_set()
 
-    assert [e.type for e in events[:4]] == ["session", "stage", "stage", "stage"]
-    assert events[1].data["stage"] == LATENCY_STAGE_ACCEPTED
-    assert events[2].data["stage"] == LATENCY_STAGE_CONTEXT_PREPARE
-    assert events[2].data["status"] == "started"
-    assert events[3].data["stage"] == LATENCY_STAGE_CONTEXT_PREPARE
+    live_events = [event for event in events if event.type != "timeline_event"]
+    assert [e.type for e in live_events[:4]] == ["session", "stage", "stage", "stage"]
+    assert live_events[1].data["stage"] == LATENCY_STAGE_ACCEPTED
+    assert live_events[2].data["stage"] == LATENCY_STAGE_CONTEXT_PREPARE
+    assert live_events[2].data["status"] == "started"
+    assert live_events[3].data["stage"] == LATENCY_STAGE_CONTEXT_PREPARE
+    assert any(event.type == "timeline_event" and event.data["event"]["event_type"] == "message.accepted" for event in events)
     assert any(e.type == "stage" and e.data["stage"] == LATENCY_STAGE_MODEL_STREAM for e in events)
     assert any(e.type == "done" and e.data["session_id"] == sid for e in events)
     records = [r for r in caplog.records if r.message == "chat.run.completed"]

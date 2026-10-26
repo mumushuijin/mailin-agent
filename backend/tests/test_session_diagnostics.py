@@ -24,4 +24,5 @@ def test_diagnostics_bundle_has_one_container_and_complete_resources(tmp_path):
         assert {"ledger.jsonl", reference["path"], summary}.issubset(names)
         assert bundle.read(reference["path"]) == b"full result"
         row = json.loads(bundle.read("ledger.jsonl").splitlines()[0])
-        assert "workspace_id" not in row and "session_id" not in row
+        assert "workspace_id" not in row and row["session_id"] == session
+        assert row["schema_version"] == 3 and row["event_type"] == "tool.attempt.settled"

@@ -55,6 +55,8 @@ class SessionHistory(BaseModel):
     session_id: str
     workspace_id: str | None = None
     projection_version: int
+    branch_id: str = "main"
+    as_of_event_seq: int | None = None
     messages: list[ChatMessage]
     timelines: list[dict] = Field(default_factory=list)
     context_usage: dict | None = None

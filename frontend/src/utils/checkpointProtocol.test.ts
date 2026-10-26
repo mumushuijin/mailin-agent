@@ -5,12 +5,12 @@ import { buildHistoryMessages, buildHistoryTimelines } from './historyProjection
 import { validateHistory } from '@/api/session'
 
 export const checkpoint = (revision = 0, turn = 'turn_1') => ({
-  schema_version: 2 as const, checkpoint_id: `cp_${'a'.repeat(32)}`, state_revision: revision,
+  schema_version: 3 as const, checkpoint_id: `cp_${'a'.repeat(32)}`, state_revision: revision,
   scope: { workspace_id: 'ws_1', session_id: 's1', turn_id: turn },
   context: { working_message: [] }, max_step_every_turn: 48, tasks: [], current_task: null,
   current_step: { step_id: null, step_name: 'agent', step_status: 'pending', tool_calls: [] },
   memory: { recorded_count: 0, last_synced_turn: null, source_files: [] },
-  turn_status: 'created', ledger_pointer: { applied_seq: 500 },
+  turn_status: 'created', ledger_pointer: { applied_seq: 500, event_cursor: { branch_id: 'main', event_seq: 500, event_id: 'event-500' } },
 })
 
 describe('new checkpoint and history protocol', () => {
@@ -19,11 +19,15 @@ describe('new checkpoint and history protocol', () => {
     expect(isCanonicalAgentState({ ...checkpoint(), current_step: { ...checkpoint().current_step, model: null } })).toBe(true)
     for (const invalid of [
       { ...checkpoint(), schema_version: 1 },
+      { ...checkpoint(), schema_version: 2 },
+      { ...checkpoint(), schema_version: 99 },
       { ...checkpoint(), run_id: 'old' },
       { ...checkpoint(), scope: { ...checkpoint().scope, step_id: null } },
       { ...checkpoint(), current_task: 'missing' },
       { ...checkpoint(), turn_status: 'succeeded' },
       { ...checkpoint(), ledger_pointer: { file: 'ledger.jsonl', applied_seq: 1 } },
+      { ...checkpoint(), ledger_pointer: { applied_seq: 500 } },
+      { ...checkpoint(), ledger_pointer: { applied_seq: 500, event_cursor: { branch_id: 'main', event_seq: 499, event_id: 'wrong' } } },
       { ...checkpoint(), current_step: { ...checkpoint().current_step, tool_calls: [{ call_id: 'c1', status: 'done', input: {} }] } },
     ]) expect(() => readCanonicalAgentState(invalid)).toThrow('不支持')
   })

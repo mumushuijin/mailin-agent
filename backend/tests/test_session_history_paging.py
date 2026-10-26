@@ -13,12 +13,12 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
     class FakeChatService:
         async def get_history(self, session_id: str):
             calls.append(("full", session_id, None))
-            return SessionHistory(projection_version=3, session_id=session_id, messages=[ChatMessage(role="user", content="legacy")])
+            return SessionHistory(projection_version=4, session_id=session_id, messages=[ChatMessage(role="user", content="legacy")])
 
         async def get_history_page(self, session_id: str, *, limit: int, before: str | None = None):
             calls.append(("page", session_id, (limit, before)))
             return SessionHistoryPage(
-                projection_version=3,
+                projection_version=4,
                 session_id=session_id,
                 session=session,
                 messages=[ChatMessage(role="user", content="newest")],
@@ -49,7 +49,7 @@ def test_history_endpoint_uses_paged_contract_when_limit_is_present(monkeypatch)
     assert paged.status_code == 200
     payload = paged.json()
     assert payload["messages"][0]["content"] == "newest"
-    assert payload["projection_version"] == 3
+    assert payload["projection_version"] == 4
     assert "tool_calls" not in payload["messages"][0]
     assert payload["session"]["id"] == "sess-1"
     assert payload["limit"] == 1

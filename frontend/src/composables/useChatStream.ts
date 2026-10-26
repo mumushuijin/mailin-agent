@@ -62,6 +62,11 @@ interface StreamGuard {
 }
 
 const streamGuards = new WeakMap<object, StreamGuard>()
+let lastStreamMessageId = 0
+const nextStreamMessageId = (): number => {
+  lastStreamMessageId = Math.max(Date.now(), lastStreamMessageId + 1)
+  return lastStreamMessageId
+}
 
 function acceptAgentEvent(ctx: ChatStreamState, event: StreamEvent): boolean {
   const sessionId = event.session_id || event.state?.scope.session_id
@@ -298,6 +303,7 @@ export function applyChatStreamEvent(
     assistantMsgIndex: number
     currentSegments: MessageSegment[]
     currentTextSegmentId: number
+    assistantMessageId?: number
   },
   options: { skipEnvelopeGuard?: boolean } = {},
 ): { assistantMsgIndex: number; currentTextSegmentId: number } {
@@ -329,16 +335,30 @@ export function applyChatStreamEvent(
   }
   const gapDetected = Boolean(event.gap_detected)
   let { assistantMsgIndex, currentSegments, currentTextSegmentId } = session
+  if (session.assistantMessageId !== undefined) {
+    assistantMsgIndex = ctx.messages.value.findIndex((message) => message.id === session.assistantMessageId)
+  }
+  const previousAssistant = ctx.messages.value[assistantMsgIndex]
+  if (event.type === 'chunk' && previousAssistant?.messageId) return { assistantMsgIndex, currentTextSegmentId }
+  if (event.type === 'step_start' && previousAssistant && (previousAssistant.messageId || currentSegments.some(
+    (segment) => segment.type === 'tool' || Boolean(segment.content),
+  ))) {
+    assistantMsgIndex = -1
+    currentSegments = []
+    session.currentSegments = currentSegments
+    session.assistantMessageId = undefined
+  }
 
   const ensureAssistant = () => {
     if (assistantMsgIndex === -1) {
       assistantMsgIndex = ctx.messages.value.length
       ctx.messages.value.push({
-        id: Date.now(),
+        id: nextStreamMessageId(),
         role: 'assistant',
         content: '',
         timestamp: new Date(),
         turnId: event.turn_id || event.state?.scope.turn_id,
+        requestId: event.state?.current_step.model?.request_id || ctx.agentState?.value?.requestId || undefined,
         segments: currentSegments,
       })
     } else {
@@ -346,6 +366,7 @@ export function applyChatStreamEvent(
     }
     const state = ctx.agentState?.value
     const messageId = ctx.messages.value[assistantMsgIndex]?.id
+    session.assistantMessageId = messageId
     if (state && typeof messageId === 'number') attachAgentStateMessage(state, messageId)
   }
 
@@ -668,6 +689,7 @@ export function createChatStreamEventBatcher(
     assistantMsgIndex: initial?.assistantMsgIndex ?? -1,
     currentSegments: initial?.currentSegments || [] as MessageSegment[],
     currentTextSegmentId: initial?.currentTextSegmentId ?? -1,
+    assistantMessageId: initial && initial.assistantMsgIndex >= 0 ? ctx.messages.value[initial.assistantMsgIndex]?.id : undefined,
   }
   let scheduled = false
   let gapTimer: ReturnType<typeof setTimeout> | null = null

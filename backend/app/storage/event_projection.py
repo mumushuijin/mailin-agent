@@ -185,6 +185,8 @@ def _projection_state(session_id: str, branch_id: str, lineage: list[tuple[str, 
         "step_order": [],
         "model_requests": {},
         "model_request_order": [],
+        "memory": {},
+        "context_window": None,
         "items": [],
     }
 
@@ -543,6 +545,10 @@ def _apply_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     turn_id = event.get("turn_id")
     turn = _ensure_turn(state, turn_id, event)
     event_type = event["event_type"]
+    if event_type == "memory.sync.recorded":
+        state["memory"] = copy.deepcopy(event["payload"])
+    elif event_type == "context.window.materialized":
+        state["context_window"] = copy.deepcopy(event["payload"])
     turn_scoped = {
         "message.accepted", "model.response.completed", "activity.started", "activity.settled",
         "tool.attempt.started", "tool.attempt.settled", "interaction.opened", "interaction.resolved",

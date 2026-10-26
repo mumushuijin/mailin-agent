@@ -76,14 +76,15 @@ async def _persist_terminal(graph, config, *, status: str, reason: str) -> dict 
         values = recover_ledger_tail(values, files)
         if values.get("terminal_reason") == "execution_outcome_unknown":
             status, reason, step_status = "failed", "execution_outcome_unknown", "failed"
-        seq = RuntimeLedgerAudit(files, scope).turn_terminal(status, reason)
+        branch_id = values.get("ledger_pointer", {}).get("event_cursor", {}).get("branch_id", "main")
+        seq = RuntimeLedgerAudit(files, scope, branch_id=branch_id).turn_terminal(status, reason)
         await graph.aupdate_state(
             config,
             {
                 **to_graph_state(values), **terminal_patch(values, status, reason),
                 "current_step": {**values.get("current_step", {}), "step_status": step_status},
                 "pending_interaction": None,
-                "ledger_pointer": {"applied_seq": seq, "applied_offset": files.offset_after(scope["session_id"], seq)},
+                "ledger_pointer": files.ledger_pointer(scope["session_id"], seq, branch_id=branch_id),
             },
         )
         return await _state_snapshot(graph, config, status=step_status, turn_status=status)

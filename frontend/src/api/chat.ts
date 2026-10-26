@@ -1,7 +1,7 @@
 import api, { getStreamApiBase } from './index'
 import { chatWs } from './ws'
 import { readCanonicalAgentState, rejectLegacyTurnFields } from '@/utils/canonicalAgentState'
-import { normalizeInteractionRejection } from '@/utils/streamProtocol'
+import { normalizeInteractionRejection, requireStreamSchemaVersion } from '@/utils/streamProtocol'
 
 const API_BASE = getStreamApiBase()
 
@@ -14,6 +14,11 @@ export interface ChatResponse {
   content: string
   session_id: string | null
   turn_id?: string
+}
+
+export interface ChatSubmissionOptions {
+  branch_id?: string
+  fork_cursor?: { branch_id: string; event_seq: number; event_id: string }
 }
 
 export interface ContextUsageBreakdown {
@@ -62,7 +67,7 @@ export interface SessionTokenStats {
 }
 
 export interface AgentCheckpointState {
-  schema_version: 2
+  schema_version: 3
   checkpoint_id: string
   state_revision: number
   scope: { workspace_id: string; session_id: string; turn_id: string }
@@ -75,7 +80,7 @@ export interface AgentCheckpointState {
   task_details?: Record<string, unknown>
   turn_status?: string
   terminal_reason?: string | null
-  ledger_pointer?: { applied_seq: number }
+  ledger_pointer?: { applied_seq: number; event_cursor: { branch_id: string; event_seq: number; event_id: string } }
   pending_interaction?: Record<string, unknown> | null
 }
 
@@ -100,6 +105,7 @@ export interface StreamEvent {
     | 'background'
     | 'config_updated'
     | 'state_sync'
+    | 'timeline_event'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -150,6 +156,12 @@ export interface StreamEvent {
   compression?: { status: string; layer?: number; message?: string }
   state?: AgentCheckpointState
   event_id?: string
+  event_seq?: number
+  branch_id?: string
+  transport_id?: string
+  transport_seq?: number
+  state_revision?: number
+  timeline_event?: Record<string, unknown>
   gap_detected?: boolean
   seq?: number
   step_id?: string
@@ -163,9 +175,17 @@ export const chatApi = {
   sendMessage: async (
     message: string,
     sessionId?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: ChatSubmissionOptions,
   ): Promise<ChatResponse> => {
-    return api.post('/chat/send', { message, session_id: sessionId, turn_id: crypto.randomUUID() }, {
+    return api.post('/chat/send', {
+      message,
+      session_id: sessionId,
+      turn_id: crypto.randomUUID(),
+      submission_id: crypto.randomUUID(),
+      branch_id: options?.branch_id ?? 'main',
+      fork_cursor: options?.fork_cursor,
+    }, {
       signal,
       timeout: 300000,
     })
@@ -178,13 +198,22 @@ export const chatApi = {
     onChunk: StreamCallback,
     signal?: AbortSignal,
     submittedTurnId?: string,
+    submittedSubmissionId?: string,
+    options?: ChatSubmissionOptions,
   ): Promise<ChatResponse> => {
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ message, session_id: sessionId, turn_id: submittedTurnId || crypto.randomUUID() }),
+      body: JSON.stringify({
+        message,
+        session_id: sessionId,
+        turn_id: submittedTurnId || crypto.randomUUID(),
+        submission_id: submittedSubmissionId || crypto.randomUUID(),
+        branch_id: options?.branch_id ?? 'main',
+        fork_cursor: options?.fork_cursor,
+      }),
       signal,
     })
 
@@ -203,6 +232,7 @@ export const chatApi = {
     let finalSessionId = sessionId
     let finalTurnId = submittedTurnId
 
+    let currentEvent = ''
     try {
       while (true) {
         const { done, value } = await reader.read()
@@ -214,7 +244,6 @@ export const chatApi = {
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
 
-        let currentEvent = ''
         for (const line of lines) {
           // 跳过 ping 事件和空行
           if (line.startsWith('ping') || line.trim() === '') {
@@ -228,6 +257,7 @@ export const chatApi = {
             if (data && currentEvent) {
               try {
                 const parsed = JSON.parse(data)
+                requireStreamSchemaVersion(parsed)
                 rejectLegacyTurnFields(parsed)
                 const state = readCanonicalAgentState(parsed.state)
                 const turnId = (parsed.turn_id || state?.scope.turn_id) as string | undefined
@@ -236,6 +266,11 @@ export const chatApi = {
                   turn_id: turnId,
                   state,
                   event_id: parsed.event_id,
+                  event_seq: parsed.event_seq,
+                  branch_id: parsed.branch_id,
+                  transport_id: parsed.transport_id,
+                  transport_seq: parsed.transport_seq,
+                  state_revision: parsed.state_revision,
                   seq: parsed.seq,
                   session_id: parsed.session_id || state?.scope.session_id,
                   step_id: parsed.step_id || state?.current_step.step_id,
@@ -329,6 +364,10 @@ export const chatApi = {
                     handoff: Boolean(parsed.handoff),
                     ...eventMeta,
                   })
+                } else if (currentEvent === 'timeline_event') {
+                  onChunk({ type: 'timeline_event', timeline_event: parsed.event as Record<string, unknown>, ...eventMeta })
+                } else if (currentEvent === 'state_sync') {
+                  onChunk({ type: 'state_sync', ...eventMeta })
                 } else if (currentEvent === 'error') {
                   onChunk(normalizeInteractionRejection({ type: 'error', error: parsed.error, reason_code: parsed.reason_code, cancelled: Boolean(parsed.cancelled), ...eventMeta }))
                 }
@@ -353,6 +392,7 @@ export const chatApi = {
     sessionId: string | null | undefined,
     onChunk: StreamCallback,
     signal?: AbortSignal,
+    options?: ChatSubmissionOptions,
   ): Promise<ChatResponse> => {
     if (signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError')
@@ -363,13 +403,15 @@ export const chatApi = {
     }
     signal?.addEventListener('abort', abortHandler)
     const turnId = crypto.randomUUID()
+    const submissionId = crypto.randomUUID()
 
     try {
-      return await chatWs.sendMessage(message, sessionId, onChunk, turnId)
+      return await chatWs.sendMessage(message, sessionId, onChunk, turnId, submissionId, options)
     } catch (wsError) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
       if ((wsError as { executionStarted?: boolean }).executionStarted) throw wsError
       console.warn('WebSocket 发送失败，降级到 SSE:', wsError)
-      return chatApi.sendMessageStream(message, sessionId, onChunk, signal, turnId)
+      return chatApi.sendMessageStream(message, sessionId, onChunk, signal, turnId, submissionId, options)
     } finally {
       signal?.removeEventListener('abort', abortHandler)
     }

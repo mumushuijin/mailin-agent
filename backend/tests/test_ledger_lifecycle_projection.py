@@ -45,7 +45,7 @@ def test_projection_rebuilds_attempts_steps_interactions_and_terminal_without_au
     projection = HistoryProjectionStore(tmp_path)
     projection.write(SID, [ChatMessage(**m) for m in projected["messages"]], timelines=projected["timelines"], ledger_seq=files.latest_seq(SID))
     payload = projection.read(SID)
-    assert payload["version"] == 3 and payload["updated_at"] > 1_000_000_000_000
+    assert payload["version"] == 4 and payload["updated_at"] > 1_000_000_000_000
     assert all("scope" not in m and "origin" not in m and all(v is not None for v in m.values()) for m in payload["messages"])
     projection.delete(SID)
     assert project_ledger(files.read(SID)) == projected

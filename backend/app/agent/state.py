@@ -10,7 +10,7 @@ from typing import Annotated, Any, TypedDict
 from langchain_core.messages import BaseMessage
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled", "handoff"}
 REQUIRED_TOP_LEVEL = {
     "schema_version", "checkpoint_id", "scope", "context", "max_step_every_turn", "tasks",
@@ -137,7 +137,7 @@ def new_agent_state(
         "memory": {"recorded_count": 0, "last_synced_turn": None, "source_files": []},
         "turn_status": "created", "terminal_reason": None,
         "task_details": {},
-        "ledger_pointer": {"applied_seq": 0},
+        "ledger_pointer": {"applied_seq": 0, "event_cursor": {"branch_id": "main", "event_seq": 0, "event_id": "origin"}},
         "pending_interaction": None,
     }
 
@@ -210,9 +210,19 @@ def validate_agent_state(state: dict[str, Any]) -> None:
         raise ValueError("invalid memory checkpoint metadata")
     if "file" in (state.get("ledger_pointer") or {}):
         raise ValueError("ledger_pointer.file is unsupported")
-    cursor = (state.get("ledger_pointer") or {}).get("applied_seq")
+    pointer = state.get("ledger_pointer") or {}
+    cursor = pointer.get("applied_seq")
     if type(cursor) is not int or cursor < 0:
         raise ValueError("ledger_pointer.applied_seq must be a non-negative integer")
+    event_cursor = pointer.get("event_cursor")
+    if not isinstance(event_cursor, dict) or set(event_cursor) != {"branch_id", "event_seq", "event_id"}:
+        raise ValueError("ledger_pointer.event_cursor must identify a branch event")
+    if not isinstance(event_cursor.get("branch_id"), str) or not event_cursor["branch_id"]:
+        raise ValueError("ledger_pointer.event_cursor.branch_id must be non-empty")
+    if type(event_cursor.get("event_seq")) is not int or event_cursor["event_seq"] != cursor:
+        raise ValueError("ledger_pointer event cursor sequence must match applied_seq")
+    if not isinstance(event_cursor.get("event_id"), str) or not event_cursor["event_id"]:
+        raise ValueError("ledger_pointer.event_cursor.event_id must be non-empty")
     pending = state.get("pending_interaction")
     if pending and ({"scope", "run_id", "turn_id", "step_id", "session_id", "workspace_id"} & set(pending)):
         raise ValueError("pending interaction must not duplicate checkpoint identities")

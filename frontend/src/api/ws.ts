@@ -1,7 +1,7 @@
 import { getWsApiBaseAsync } from './index'
-import type { AgentCheckpointState, ChatResponse, StreamCallback, StreamEvent } from './chat'
+import type { AgentCheckpointState, ChatResponse, ChatSubmissionOptions, StreamCallback, StreamEvent } from './chat'
 import { readCanonicalAgentState, rejectLegacyTurnFields } from '@/utils/canonicalAgentState'
-import { normalizeInteractionRejection, terminalOutcome } from '@/utils/streamProtocol'
+import { normalizeInteractionRejection, requireStreamSchemaVersion, terminalOutcome } from '@/utils/streamProtocol'
 
 const HEARTBEAT_MS = 30_000
 const RECONNECT_BASE_MS = 1_000
@@ -26,8 +26,15 @@ export function mapWsToStreamEvent(msg: {
   state?: AgentCheckpointState
   seq?: number
   event_id?: string
+  event_seq?: number
+  branch_id?: string
+  transport_id?: string
+  transport_seq?: number
+  state_revision?: number
+  stream_schema_version?: number
 }): StreamEvent | null {
   const data = msg.data || {}
+  requireStreamSchemaVersion(msg)
   rejectLegacyTurnFields(msg as Record<string, unknown>)
   rejectLegacyTurnFields(data)
   const state = readCanonicalAgentState(msg.state || data.state)
@@ -35,6 +42,11 @@ export function mapWsToStreamEvent(msg: {
     turn_id: msg.turn_id || state?.scope.turn_id || undefined,
     state,
     event_id: msg.event_id,
+    event_seq: (msg.event_seq ?? data.event_seq) as number | undefined,
+    branch_id: (msg.branch_id ?? data.branch_id) as string | undefined,
+    transport_id: (msg.transport_id ?? data.transport_id) as string | undefined,
+    transport_seq: (msg.transport_seq ?? data.transport_seq) as number | undefined,
+    state_revision: (msg.state_revision ?? data.state_revision) as number | undefined,
     seq: msg.seq,
     session_id: (data.session_id || state?.scope.session_id) as string | undefined,
     step_id: (data.step_id || state?.current_step.step_id) as string | undefined,
@@ -158,6 +170,8 @@ export function mapWsToStreamEvent(msg: {
       return { type: 'config_updated', config_name: data.name as string, ...base }
     case 'state_sync':
       return { type: 'state_sync', ...base }
+    case 'timeline_event':
+      return { type: 'timeline_event', timeline_event: data.event as Record<string, unknown>, ...base }
     default:
       return null
   }
@@ -171,6 +185,7 @@ class ChatWebSocket {
   private intentionalClose = false
   private currentTurnId: string | null = null
   private currentSessionId: string | null = null
+  private currentBranchId = 'main'
   private sessionStreamHandlers = new Set<StreamCallback>()
   private turnResolvers = new Map<string, { resolve: (v: ChatResponse) => void; reject: (e: Error) => void }>()
   private turnCallbacks = new Map<string, StreamCallback>()
@@ -236,7 +251,7 @@ class ChatWebSocket {
         this.startHeartbeat()
         this.connectPromise = null
         this.setState('connected')
-        if (this.currentSessionId) this.subscribeSession(this.currentSessionId)
+        if (this.currentSessionId) this.subscribeSession(this.currentSessionId, this.currentBranchId)
         if (this.currentSessionId && this.currentTurnId) this.requestStateSync(this.currentTurnId, this.currentSessionId)
         resolve()
       }
@@ -298,7 +313,12 @@ class ChatWebSocket {
     }
 
     const turnId = msg.turn_id
-    if (!turnId) return
+    if (!turnId) {
+      if (event.type === 'timeline_event' && (!event.session_id || event.session_id === this.currentSessionId)) {
+        for (const handler of this.sessionStreamHandlers) handler(event)
+      }
+      return
+    }
     if (event.type === 'session' && event.session_id && !this.currentSessionId && turnId === this.currentTurnId) this.currentSessionId = event.session_id
     if (event.type === 'stage' && event.stage === 'interaction_timeout') this.releaseInterruptWait(turnId)
     if (event.type === 'stage' && event.stage === 'interaction_rejected') {
@@ -306,6 +326,7 @@ class ChatWebSocket {
       if (this.currentSessionId) this.requestStateSync(turnId, this.currentSessionId)
     }
     if (event.session_id && event.session_id !== this.currentSessionId) return
+    if (event.branch_id && event.branch_id !== this.currentBranchId && event.type !== 'timeline_event') return
     if (!this.turnCallbacks.has(turnId)) {
       if (event.type === 'state_sync' || event.type === 'interrupt') this.currentTurnId = turnId
       for (const handler of this.sessionStreamHandlers) handler(event)
@@ -410,14 +431,15 @@ class ChatWebSocket {
     }, delay)
   }
 
-  subscribeSession(sessionId: string | null) {
-    if (this.currentSessionId !== sessionId) this.currentTurnId = null
+  subscribeSession(sessionId: string | null, branchId = 'main') {
+    if (this.currentSessionId !== sessionId || this.currentBranchId !== branchId) this.currentTurnId = null
     this.currentSessionId = sessionId
-    this.send({ op: 'session.subscribe', session_id: sessionId })
+    this.currentBranchId = branchId
+    this.send({ op: 'session.subscribe', session_id: sessionId, branch_id: branchId })
   }
 
   requestStateSync(turnId: string, sessionId: string) {
-    this.send({ op: 'state.sync', turn_id: turnId, session_id: sessionId })
+    this.send({ op: 'state.sync', turn_id: turnId, session_id: sessionId, branch_id: this.currentBranchId })
   }
 
   private send(payload: Record<string, unknown>) {
@@ -431,12 +453,15 @@ class ChatWebSocket {
     sessionId: string | null | undefined,
     onChunk: StreamCallback,
     submittedTurnId?: string,
+    submittedSubmissionId?: string,
+    options?: ChatSubmissionOptions,
   ): Promise<ChatResponse> {
     await this.connect()
 
     const turnId = submittedTurnId || crypto.randomUUID()
     this.currentTurnId = turnId
     this.currentSessionId = sessionId || null
+    this.currentBranchId = options?.branch_id ?? 'main'
 
     return new Promise<ChatResponse>((resolve, reject) => {
       this.turnResolvers.set(turnId, { resolve, reject })
@@ -444,6 +469,9 @@ class ChatWebSocket {
       this.send({
         op: 'chat.send',
         turn_id: turnId,
+        submission_id: submittedSubmissionId || crypto.randomUUID(),
+        branch_id: this.currentBranchId,
+        fork_cursor: options?.fork_cursor,
         message,
         session_id: sessionId,
       })
@@ -454,7 +482,7 @@ class ChatWebSocket {
     if (this.currentTurnId) {
       this.releaseInterruptWait(this.currentTurnId)
       this.clearDeferredDone(this.currentTurnId)
-      this.send({ op: 'chat.cancel', turn_id: this.currentTurnId, session_id: this.currentSessionId })
+      this.send({ op: 'chat.cancel', turn_id: this.currentTurnId, session_id: this.currentSessionId, branch_id: this.currentBranchId })
     }
   }
 
@@ -462,6 +490,7 @@ class ChatWebSocket {
     this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
+      branch_id: this.currentBranchId,
       turn_id: turnId,
       decision,
       interrupt_id: opts?.interruptId,
@@ -479,6 +508,7 @@ class ChatWebSocket {
     this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
+      branch_id: this.currentBranchId,
       turn_id: turnId,
       kind: 'ask_user',
       answer,
@@ -497,6 +527,7 @@ class ChatWebSocket {
     this.releaseInterruptWait(turnId)
     this.send({
       op: 'approve',
+      branch_id: this.currentBranchId,
       turn_id: turnId,
       kind: 'ask_user',
       mode: 'handoff_and_stop',

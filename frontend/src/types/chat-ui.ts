@@ -141,6 +141,8 @@ export interface ChatUiMessage {
   turnId?: string
   messageId?: string
   ledgerSeq?: number
+  requestId?: string
+  responseId?: string
 }
 
 export interface ApprovalPreview {

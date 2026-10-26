@@ -1,6 +1,8 @@
 from functools import lru_cache
 import asyncio
 import copy
+import hashlib
+import json
 import re
 import uuid
 from contextlib import contextmanager
@@ -17,6 +19,7 @@ from app.agent.hooks import AGENT_NODE_END, AGENT_NODE_START, TOOL_NODE_END, TOO
 from app.agent.state import AgentState, merge_runtime_updates, to_runtime_view, new_agent_state, utc_now, TERMINAL_TURN_STATUSES
 from app.agent.audit import RuntimeLedgerAudit, bind_runtime_audit
 from app.storage.conversation_files import SessionConversationFiles
+from app.storage.model_window import ModelWindowStore
 from app.core.settings import get_settings
 from app.core.model_request import bind_model_request_scope
 from app.storage.checkpoint import get_checkpointer
@@ -127,19 +130,21 @@ def build_graph():
         value["state_revision"] = int(state.get("state_revision", 0)) + 1
         value["checkpoint_uid"] = f"cp_{uuid.uuid4().hex}"
         value.pop("checkpoint_id", None)
-        audit = RuntimeLedgerAudit(files, value["scope"], step_id=step_id, task_id=value.get("current_task"))
+        branch_id = value.get("ledger_pointer", {}).get("event_cursor", {}).get("branch_id", "main")
+        audit = RuntimeLedgerAudit(files, value["scope"], step_id=step_id, task_id=value.get("current_task"), branch_id=branch_id)
         if not resuming:
             audit.node("running", name=name)
         return value, audit
 
     def finish_node(previous, value, updates, audit, name):
         session_id = value["scope"]["session_id"]
+        branch_id = value.get("ledger_pointer", {}).get("event_cursor", {}).get("branch_id", "main")
         updates = dict(updates)
         updates["messages"] = [audit.settle_tool(message) if isinstance(message, ToolMessage) else message for message in updates.get("messages") or []]
         messages = _messages_for_ledger_persist(updates)
         if messages:
             # Tools already have their one immutable settlement row.
-            files.append_messages(session_id, value["scope"]["turn_id"], [message for message in messages if not isinstance(message, ToolMessage)], scope=value["scope"])
+            files.append_messages(session_id, value["scope"]["turn_id"], [message for message in messages if not isinstance(message, ToolMessage)], scope=value["scope"], branch_id=branch_id)
         result = merge_runtime_updates(value, updates)
         count = int(updates.get("compression_count") or 0)
         summary = str(updates.get("context_summary") or "")
@@ -147,19 +152,46 @@ def build_graph():
             summary_id = f"summary_{uuid.uuid4().hex}"
             pointer = files.write_summary(session_id, summary_id, {"summary_id": summary_id, "turn_id": value["scope"]["turn_id"], "content": summary})
             result["context"]["summary_pointer"] = pointer
-            audit.lifecycle("context", "completed", extensions={"context": {"summary_ref": pointer, "covered_seq": [1, files.latest_seq(session_id)], "compression_count": count}})
         pointer = result["context"].get("summary_pointer")
         if pointer:
             for index, message in enumerate(result["context"].get("working_message") or []):
                 if (message.additional_kwargs or {}).get("context_summary"):
                     result["context"]["working_message"][index] = message.model_copy(update={"content": f"[summary reference: {pointer}]"})
-        rows = files.read_tail(session_id, after_seq=int(previous.get("ledger_pointer", {}).get("applied_seq", 0)))
+        rows = files.read_tail(session_id, after_seq=int(previous.get("ledger_pointer", {}).get("applied_seq", 0)), branch_id=branch_id)
         from app.agent.recovery import bounded_model_message
         by_identity = {row["message_id"]: row for row in rows}
         for index, message in enumerate(result["context"]["working_message"]):
             row = by_identity.get((message.additional_kwargs or {}).get("ledger_message_id"))
             if row:
                 result["context"]["working_message"][index] = bounded_model_message(message, row)
+        if messages or updates.get("working_messages") is not None or summary:
+            from app.storage.message_codec import encode_message
+            window_messages = result["context"].get("working_message") or []
+            encoded = [encode_message(message) for message in window_messages]
+            references = [block for message in encoded for block in (message.get("message", {}).get("content") or [])
+                          if isinstance(block, dict) and block.get("type") == "reference"]
+            reference_bytes = json.dumps(references, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            source_events = files.visible_events(session_id, branch_id=branch_id)
+            source_event = next((event for event in reversed(source_events) if event["event_type"] in {
+                "message.accepted", "model.response.completed", "tool.attempt.settled",
+            }), None)
+            source_cursor = {"branch_id": branch_id, "event_seq": source_event["event_seq"] if source_event else 0,
+                             "event_id": source_event["event_id"] if source_event else "origin"}
+            bootstrap_fingerprint = result["context"].get("bootstrap_fingerprint") or hashlib.sha256(b"").hexdigest()
+            reference_fingerprint = hashlib.sha256(reference_bytes).hexdigest()
+            window = ModelWindowStore(files).save(
+                session_id, window_messages, source_event_cursor=source_cursor,
+                window_schema_version="working-window-v1", compression_version="four-layer-v1",
+                bootstrap_fingerprint=bootstrap_fingerprint, reference_fingerprint=reference_fingerprint,
+            )
+            result["context"]["window_pointer"] = window.reference
+            audit.lifecycle("context", "completed", extensions={"context": {
+                "summary_ref": pointer, "covered_seq": [1, source_cursor["event_seq"]],
+                "compression_count": result["context"].get("compression_count", 0),
+                "window_schema_version": "working-window-v1", "compression_version": "four-layer-v1",
+                "window_ref": window.reference, "content_sha256": window.content_sha256, "source_event_cursor": source_cursor,
+                "bootstrap_fingerprint": bootstrap_fingerprint, "reference_fingerprint": reference_fingerprint,
+            }})
         definitions = {}
         outcomes = {}
         attempts = {}
@@ -222,8 +254,10 @@ def build_graph():
             result["memory"]["last_synced_turn"] = value["scope"]["turn_id"]
         bootstraps = get_settings().workspace_path / "bootstraps"
         result["memory"]["source_files"] = [str(path.relative_to(get_settings().workspace_path)).replace("\\", "/") for path in (bootstraps / "MEMORY.md", bootstraps / "USER.md") if path.is_file()]
-        applied_seq = files.latest_seq(session_id)
-        result["ledger_pointer"] = {"applied_seq": applied_seq, "applied_offset": files.offset_after(session_id, applied_seq)}
+        if result["memory"].get("last_synced_turn") and result["memory"] != previous.get("memory"):
+            files.append_event(session_id, "memory.sync.recorded", result["memory"],
+                               turn_id=value["scope"]["turn_id"], branch_id=branch_id)
+        result["ledger_pointer"] = files.ledger_pointer(session_id, branch_id=branch_id)
         result["state_revision"] = int(previous.get("state_revision", 0)) + 2
         result["checkpoint_uid"] = f"cp_{uuid.uuid4().hex}"
         result.pop("checkpoint_id", None)
@@ -283,8 +317,13 @@ def get_graph():
     return build_graph()
 
 
-def make_thread_config(session_id: str) -> dict:
-    return {"configurable": {"thread_id": session_id}}
+def make_thread_config(session_id: str, branch_id: str = "main") -> dict:
+    if not isinstance(branch_id, str) or not branch_id:
+        raise ValueError("branch_id must be a non-empty string")
+    thread_id = session_id if branch_id == "main" else (
+        session_id + ":branch:" + hashlib.sha256(branch_id.encode("utf-8")).hexdigest()
+    )
+    return {"configurable": {"thread_id": thread_id}}
 
 
 def make_initial_state(message: str, max_steps: int, *, session_id: str = "", workspace_id: str = "", turn_id: str | None = None) -> dict:

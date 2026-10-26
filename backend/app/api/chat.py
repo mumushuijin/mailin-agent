@@ -42,7 +42,9 @@ def _http_run_scope(session_id: str | None, turn_id: str | None = None):
 @router.post("/send", response_model=ChatResponse)
 async def send_message(body: ChatRequest):
     with _http_run_scope(body.session_id, body.turn_id) as turn_id:
-        return await chat_service.send_sync(body.message, body.session_id, turn_id=turn_id)
+        return await chat_service.send_sync(body.message, body.session_id, turn_id=turn_id,
+                                            submission_id=body.submission_id, branch_id=body.branch_id,
+                                            fork_cursor=body.fork_cursor.model_dump() if body.fork_cursor else None)
 
 
 @router.post("/send/stream")
@@ -57,7 +59,9 @@ async def send_message_stream(body: ChatRequest):
             log.info("run.started")
             try:
                 async for event in chat_service.send_stream(
-                    body.message, body.session_id, turn_id=turn_id
+                    body.message, body.session_id, turn_id=turn_id, submission_id=body.submission_id,
+                    branch_id=body.branch_id,
+                    fork_cursor=body.fork_cursor.model_dump() if body.fork_cursor else None,
                 ):
                     yield event
             except Exception as e:

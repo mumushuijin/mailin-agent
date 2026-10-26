@@ -1,6 +1,7 @@
 """Exercise a new session through the graph and the shared stream contract."""
 
 import json
+import hashlib
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -59,7 +60,7 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     sid = chat.session_store.create(str(project))
     events = [event async for event in chat.iter_chat_events("question", sid, turn_id="run-1")]
 
-    assert calls == (["agent", "tools"] if tool_status == "unknown" else ["agent", "tools", "agent"])
+    assert calls == (["agent", "tools"] if tool_status == "unknown" else ["agent", "tools", "agent"]), [(event.type, event.data) for event in events if event.type == "error"]
     assert any(event.type == "step_start" for event in events)
     assert any(event.type == "step_finish" for event in events)
     assert any(event.type == "tool_start" for event in events)
@@ -69,7 +70,11 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     for event in events:
         ws = to_ws(event)
         sse = to_sse(event)
-        assert json.loads(sse.split("data: ", 1)[1])["event_id"] == ws["event_id"]
+        assert json.loads(sse.split("data: ", 1)[1]).get("event_id") == ws.get("event_id")
+        if event.event_id:
+            assert json.loads(sse.split("data: ", 1)[1])["event_seq"] == ws["event_seq"]
+        else:
+            assert "event_seq" not in ws
         assert json.loads(sse.split("data: ", 1)[1]).get("state") == ws.get("state")
 
     snapshot = await graph.aget_state(make_thread_config(sid))
@@ -94,7 +99,7 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     assert rows[-1]["execution"]["status"] == expected_turn_status
     assert not any("scope" in row or "origin" in row for row in rows)
     old_fingerprint = state["context"].get("bootstrap_fingerprint")
-    monkeypatch.setattr(chat, "_bootstrap_fingerprint", lambda _session: "new-bootstrap-version")
+    monkeypatch.setattr(chat, "_bootstrap_fingerprint", lambda _session: hashlib.sha256(b"new-bootstrap-version").hexdigest())
     refreshed = chat._refresh_stale_context(sid, state)
     assert refreshed["context"]["bootstrap_fingerprint"] != old_fingerprint
     assert refreshed["ledger_pointer"]["applied_seq"] == rows[-1]["seq"]
@@ -108,7 +113,7 @@ async def test_new_session_tool_stream_recovery_and_transports(monkeypatch, tmp_
     recovered = chat._recover_ledger_tail(sid, state)
     assert recovered["ledger_pointer"]["applied_seq"] == rows[-1]["seq"] + 1
     events2 = [event async for event in chat.iter_chat_events("hello again", sid, turn_id="turn-2")]
-    assert any(event.type == "done" for event in events2)
+    assert any(event.type == "done" for event in events2), [(event.type, event.data) for event in events2 if event.type == "error"]
     next_state = dict((await graph.aget_state(make_thread_config(sid))).values)
     assert next_state["scope"]["turn_id"] == "turn-2"
     assert next_state["turn_status"] == "completed"

@@ -46,13 +46,30 @@ class SessionService:
         return buffer.getvalue()
 
     async def delete(self, session_id: str) -> None:
+        thread_ids = self._checkpoint_thread_ids(session_id)
         self.store.delete(session_id)
         self.conversation_files.delete_session(session_id)
-        await delete_thread(session_id)
+        for thread_id in thread_ids:
+            await delete_thread(thread_id)
+
+    def _checkpoint_thread_ids(self, session_id: str) -> list[str]:
+        from app.agent.graph import make_thread_config
+
+        branches = ["main"]
+        try:
+            branches.extend(event["branch_id"] for event in self.conversation_files.read_events(session_id)
+                            if event["event_type"] == "branch.forked")
+        except (OSError, ValueError):
+            # Legacy or unreadable ledgers can still be explicitly deleted.
+            pass
+        return [make_thread_config(session_id, branch)["configurable"]["thread_id"]
+                for branch in dict.fromkeys(branches)]
 
     async def clear_all(self) -> None:
         for session in self.store.list():
+            thread_ids = self._checkpoint_thread_ids(session["id"])
             self.conversation_files.delete_session(session["id"])
-            await delete_thread(session["id"])
+            for thread_id in thread_ids:
+                await delete_thread(thread_id)
         self.store.clear_all()
         await reset_checkpointer()

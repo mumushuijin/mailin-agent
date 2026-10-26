@@ -24,21 +24,21 @@ class MockWebSocket {
   send(raw: string) { this.frames.push(JSON.parse(raw)) }
   close() { this.readyState = 3; this.onclose?.() }
   receive(type: string, data: Record<string, unknown>, state?: AgentCheckpointState, turnId = TURN) {
-    this.onmessage?.({ data: JSON.stringify({ type, data, state, turn_id: turnId }) })
+    this.onmessage?.({ data: JSON.stringify({ stream_schema_version: 3, type, data, state, turn_id: turnId }) })
   }
 }
 
 const SESSION = '00000000-0000-4000-8000-000000000001'
 const TURN = 'turn_restored'
 const checkpoint = (status: string, revision = 5): AgentCheckpointState => ({
-  schema_version: 2, checkpoint_id: `cp_${'d'.repeat(32)}`, state_revision: revision,
+  schema_version: 3, checkpoint_id: `cp_${'d'.repeat(32)}`, state_revision: revision,
   scope: { workspace_id: 'ws_1', session_id: SESSION, turn_id: TURN },
   context: { working_message: [] }, max_step_every_turn: 48, tasks: [], current_task: null,
   current_step: { step_id: 'step_waiting', step_name: 'tools',
     step_status: status === 'waiting_user' ? 'waiting_user' : status === 'running' ? 'running' : status,
     tool_calls: [{ call_id: 'call_write', definition_seq: 2, status: status === 'waiting_user' ? 'pending' : 'succeeded' }] },
   memory: { recorded_count: 0, last_synced_turn: null, source_files: [] },
-  ledger_pointer: { applied_seq: 9 }, turn_status: status,
+  ledger_pointer: { applied_seq: 9, event_cursor: { branch_id: 'main', event_seq: 9, event_id: 'event-9' } }, turn_status: status,
   pending_interaction: status === 'waiting_user'
     ? { id: 'interaction_1', kind: 'approval', call_id: 'call_write', definition_seq: 7 } : null,
 })
@@ -72,7 +72,7 @@ describe('WebSocket subscription recovery', () => {
     subscriptions.push(chatWs.onSessionStream(event => events.push(event)))
     await chatWs.connect()
     chatWs.subscribeSession(SESSION)
-    expect(socket().frames).toContainEqual({ op: 'session.subscribe', session_id: SESSION })
+    expect(socket().frames).toContainEqual({ op: 'session.subscribe', session_id: SESSION, branch_id: 'main' })
     socket().receive('state_sync', { session_id: SESSION }, checkpoint('waiting_user'))
     socket().receive('interrupt', { session_id: SESSION, kind: 'approval', interrupt_id: 'interaction_1',
       tool_call_id: 'call_write', step_id: 'step_waiting', tool: 'write_file' }, checkpoint('waiting_user'))
@@ -98,8 +98,8 @@ describe('WebSocket subscription recovery', () => {
     expect(reconnected).not.toBe(first)
     expect(MockWebSocket.sockets).toHaveLength(2)
     expect(chatWs.isConnected).toBe(true)
-    expect(reconnected.frames).toContainEqual({ op: 'session.subscribe', session_id: SESSION })
-    expect(reconnected.frames).toContainEqual({ op: 'state.sync', turn_id: TURN, session_id: SESSION })
+    expect(reconnected.frames).toContainEqual({ op: 'session.subscribe', session_id: SESSION, branch_id: 'main' })
+    expect(reconnected.frames).toContainEqual({ op: 'state.sync', turn_id: TURN, session_id: SESSION, branch_id: 'main' })
     reconnected.receive('interrupt', { session_id: SESSION, kind: 'approval', interrupt_id: 'interaction_1', tool_call_id: 'call_write' }, checkpoint('waiting_user', 6))
     expect(events[events.length - 1]?.type).toBe('interrupt')
   })
@@ -114,7 +114,7 @@ describe('WebSocket subscription recovery', () => {
     socket().receive('session', { session_id: SESSION })
     socket().close()
     await vi.advanceTimersByTimeAsync(1000)
-    expect(socket().frames).toContainEqual({ op: 'state.sync', turn_id: TURN, session_id: SESSION })
+    expect(socket().frames).toContainEqual({ op: 'state.sync', turn_id: TURN, session_id: SESSION, branch_id: 'main' })
     expect(settled).toBe(false)
     socket().receive('state_sync', { session_id: SESSION }, checkpoint('completed', 8))
     expect(await promise).toMatchObject({ session_id: SESSION, turn_id: TURN })

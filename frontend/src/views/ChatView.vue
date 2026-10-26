@@ -33,6 +33,15 @@ import {
   finalizeAgentState,
   isTerminalAgentStatus,
 } from '@/utils/agentStateStream'
+import {
+  applyTransientOverlay,
+  createAgentTimelineState,
+  type AgentTimelineState,
+  type TimelineEventEnvelope,
+  type PersistentTimelineState,
+} from '@/utils/eventTimelineReducer'
+import { readTimelineCache, restoreTimeline, syncTimelineFromServer, writeTimelineCache, needsTimelineCatchUp } from '@/utils/timelineSync'
+import { buildTimelineAgentStates, reconcileTimelineMessages } from '@/utils/timelineView'
 import type {
   AgentStateStream,
   AgentStatus,
@@ -79,6 +88,10 @@ const hasMoreHistory = ref(false)
 const wsConnectionState = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('idle')
 const runStartedAt = ref<number | null>(null)
 const runClockNow = ref(Date.now())
+const timelineProjection = ref<PersistentTimelineState | null>(null)
+const timelineCursor = ref<string | null>(null)
+const timelineBranchId = ref('main')
+const timelineState = ref<AgentTimelineState | null>(null)
 /**
  * 轮次键 = 触发本轮的用户消息 id。
  * 挂载位置：该用户消息所在 user 组之后的第一个 assistant 组顶部。
@@ -388,6 +401,112 @@ const clearTurnProgressState = () => {
   runStartedAt.value = null
 }
 
+let timelineSyncChain: Promise<void> = Promise.resolve()
+let lastTimelineTransport: { transport_id?: string; transport_seq?: number } | null = null
+let timelineRestoreSeq = 0
+
+const applyTimelineProjection = (projection: PersistentTimelineState) => {
+  timelineProjection.value = projection
+  messages.value = reconcileTimelineMessages(messages.value, projection)
+  turnAgentStates.value = buildTimelineAgentStates(projection, messages.value)
+  const activeProjection = activeTurnKey.value ? turnAgentStates.value[activeTurnKey.value] : undefined
+  if (activeProjection && (!isTerminalAgentStatus(agentState.value?.status) || isTerminalAgentStatus(activeProjection.status))) {
+    const prior = agentState.value
+    agentState.value = { ...cloneAgentState(activeProjection), requestId: prior?.requestId, confirmedRevision: prior?.confirmedRevision }
+    if (isTerminalAgentStatus(activeProjection.status)) {
+      markRunTerminal(activeProjection.status === 'completed' ? 'done' : activeProjection.status as TerminalRunStatus)
+      stopRunClock()
+    }
+  }
+  if (timelineState.value) {
+    const overlay = timelineState.value.transient
+    const turn = overlay ? projection.turns[overlay.turn_id] : undefined
+    const responseCommitted = overlay && projection.message_order.some((key) => {
+      const item = projection.messages[key]
+      return item?.turn_id === overlay.turn_id && item.role === 'assistant' &&
+        (overlay.request_id ? item.request_id === overlay.request_id : overlay.after_event_seq !== undefined
+          ? item.event_seq > overlay.after_event_seq : item.response_id === overlay.response_id)
+    })
+    const turnSettled = Boolean(overlay && turn && turn.status !== 'running')
+    timelineState.value = {
+      persistent: projection,
+      transient: responseCommitted || turnSettled ? null : overlay,
+    }
+  }
+  if (currentSessionId.value && timelineCursor.value) {
+    writeTimelineCache({
+      version: 1,
+      session_id: currentSessionId.value,
+      branch_id: timelineBranchId.value,
+      cursor: timelineCursor.value,
+      projection,
+    })
+  }
+}
+
+const restoreSessionTimeline = async (sessionId: string, loadSeq: number) => {
+  const restoreSeq = ++timelineRestoreSeq
+  const requestedBranch = route.query.branch_id ?? route.query.branch
+  const branchId = typeof requestedBranch === 'string' ? requestedBranch : 'main'
+  timelineBranchId.value = branchId
+  chatWs.subscribeSession(sessionId, branchId)
+  timelineProjection.value = null
+  timelineCursor.value = null
+  timelineState.value = null
+  lastTimelineTransport = null
+  const cached = readTimelineCache(sessionId, branchId)
+  if (cached) {
+    timelineProjection.value = cached.projection
+    timelineCursor.value = cached.cursor
+    timelineState.value = { persistent: cached.projection, transient: null }
+  }
+  const result = await restoreTimeline(sessionApi, sessionId, branchId, cached)
+  if (loadSeq !== historyLoadSeq || restoreSeq !== timelineRestoreSeq || currentSessionId.value !== sessionId) return false
+  timelineCursor.value = result.cursor
+  timelineProjection.value = result.projection
+  timelineState.value = { persistent: result.projection, transient: null }
+  return true
+}
+
+const catchUpSessionTimeline = (): Promise<void> => {
+  const sessionId = currentSessionId.value
+  if (!sessionId || !timelineCursor.value || !timelineProjection.value) return timelineSyncChain
+  timelineSyncChain = timelineSyncChain.catch(() => {}).then(async () => {
+    const cursor = timelineCursor.value
+    const projection = timelineProjection.value
+    if (!cursor || !projection || currentSessionId.value !== sessionId) return
+    const result = await syncTimelineFromServer(sessionApi, sessionId, timelineBranchId.value, cursor, projection)
+    if (currentSessionId.value !== sessionId || timelineCursor.value !== cursor) return
+    timelineCursor.value = result.cursor
+    applyTimelineProjection(result.projection)
+  }).catch((error) => {
+    if (currentSessionId.value === sessionId) console.warn('时间轴补拉失败:', error)
+  })
+  return timelineSyncChain
+}
+
+const appendTransientTimelineChunk = (event: StreamEvent) => {
+  if (event.type !== 'chunk' || !event.content) return
+  const turnId = event.turn_id || activeTurnId.value
+  if (!turnId) return
+  if (!timelineState.value) {
+    timelineState.value = createAgentTimelineState(currentSessionId.value || '', {
+      branch_id: timelineBranchId.value,
+      visible_branches: [{ branch_id: timelineBranchId.value, through_event_seq: null }],
+    })
+  }
+  timelineState.value = applyTransientOverlay(timelineState.value, {
+    turn_id: turnId,
+    response_id: event.state?.current_step.model?.request_id || agentState.value?.requestId ||
+      event.state?.current_step.step_id || agentState.value?.currentStepId || turnId,
+    request_id: event.state?.current_step.model?.request_id || agentState.value?.requestId || undefined,
+    after_event_seq: event.state?.ledger_pointer?.applied_seq ?? timelineProjection.value?.cursor?.event_seq,
+    text: event.content,
+    mode: 'append',
+    status: 'streaming',
+  })
+}
+
 const finalizeRunSummary = (fallbackStatus: 'done' | 'cancelled' | 'error' | 'handoff' = 'done') => {
   const status = terminalRunStatus.value || fallbackStatus
   const elapsedMs = runStartedAt.value
@@ -486,6 +605,10 @@ const loadSessionHistory = async (sessionId: string) => {
   historyNextCursor.value = null
   hasMoreHistory.value = false
   renderLimit.value = RENDER_WINDOW
+  const timelineRestore = restoreSessionTimeline(sessionId, seq).catch((error) => {
+    if (seq === historyLoadSeq) console.warn('时间轴恢复失败:', error)
+    return false
+  })
   try {
     const historyRes = await sessionApi.getHistoryPage(sessionId, { limit: RENDER_WINDOW })
     const sessionRes = historyRes.session
@@ -500,6 +623,13 @@ const loadSessionHistory = async (sessionId: string) => {
     restoreHistoryTimelines()
     historyNextCursor.value = historyRes.next_cursor || null
     hasMoreHistory.value = historyRes.has_more
+    await timelineRestore
+    if (seq !== historyLoadSeq) return
+    if (timelineProjection.value) {
+      applyTimelineProjection(timelineProjection.value)
+      historyNextCursor.value = null
+      hasMoreHistory.value = false
+    }
     if (historyRes.context_usage) {
       contextUsage.value = historyRes.context_usage
     }
@@ -631,6 +761,7 @@ onMounted(async () => {
   unsubSessionStream = chatWs.onSessionStream(handleSubscribedEvent)
   unsubConnection = chatWs.onConnectionState((state) => {
     wsConnectionState.value = state
+    if (state === 'connected') void catchUpSessionTimeline()
   })
   chatWs.connect().catch(() => {})
   unsubConfig = chatWs.onConfigUpdated(() => {
@@ -651,7 +782,8 @@ onUnmounted(() => {
 watch(currentSessionId, (sid) => {
   subscribedBatcher = null; subscribedTurnId = null
   pendingSubscribedEvents.splice(0)
-  if (sid) chatWs.subscribeSession(sid)
+  lastTimelineTransport = null
+  if (sid) chatWs.subscribeSession(sid, timelineBranchId.value)
 }, { immediate: true })
 
 const isNearBottom = (threshold = 120): boolean => {
@@ -940,10 +1072,19 @@ const createStreamContext = () => ({ messages, currentSessionId, contextUsage, a
   scrollToBottom: () => { void scrollToBottom() } })
 
 function handleSubscribedEvent(event: StreamEvent) {
-  const sessionId = event.session_id || event.state?.scope.session_id
+  const timelineEnvelope = event.type === 'timeline_event' ? event.timeline_event as TimelineEventEnvelope | undefined : undefined
+  const sessionId = event.session_id || event.state?.scope.session_id || timelineEnvelope?.session_id
   const turnId = event.turn_id || event.state?.scope.turn_id
-  if (!turnId || !sessionId || sessionId !== currentSessionId.value) return
+  if (!sessionId || sessionId !== currentSessionId.value) return
   if (historyLoading.value) { pendingSubscribedEvents.push(event); return }
+  if (event.type === 'timeline_event') {
+    const transport = { transport_id: event.transport_id, transport_seq: event.transport_seq }
+    const transportGap = needsTimelineCatchUp(lastTimelineTransport, transport)
+    lastTimelineTransport = transport
+    if (transportGap || timelineEnvelope) void catchUpSessionTimeline()
+    return
+  }
+  if (!turnId) return
     if (activeTurnId.value && activeTurnId.value !== turnId) return
   if (!subscribedBatcher || subscribedTurnId !== turnId) {
     if (event.type !== 'state_sync' && event.type !== 'interrupt') return
@@ -1032,9 +1173,15 @@ const sendMessage = async () => {
           if (activeTurnId.value && activeTurnId.value !== event.turn_id) return
           activeTurnId.value = event.turn_id
         }
+        if (event.type === 'timeline_event') {
+          void catchUpSessionTimeline()
+          return
+        }
+        appendTransientTimelineChunk(event)
         batcher.handle(event)
       },
-      abortController.value.signal
+      abortController.value.signal,
+      { branch_id: timelineBranchId.value },
     )
 
     batcher.flush()

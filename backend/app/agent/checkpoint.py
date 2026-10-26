@@ -60,16 +60,18 @@ class RuntimeCheckpointSaver(BaseCheckpointSaver):
             return None
         checkpoint = copy.deepcopy(saved.checkpoint)
         channels = checkpoint["channel_values"]
-        if channels.get("schema_version") != 2:
+        from app.agent.state import CHECKPOINT_SCHEMA_VERSION
+
+        if channels.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("unsupported runtime checkpoint schema")
         scope = channels["scope"]
-        seq = self.files.latest_seq(scope["session_id"])
+        branch_id = (channels.get("ledger_pointer") or {}).get("event_cursor", {}).get("branch_id", "main")
         current = channels.get("current_step") or {}
         channels["current_step"] = {
             "step_id": interrupt_value["step_id"], "step_name": "tools",
             "step_status": "waiting_user", "tool_calls": current.get("tool_calls") or [],
         }
-        for row in self.files.read_tail(scope["session_id"], after_seq=int((channels.get("ledger_pointer") or {}).get("applied_seq", 0))):
+        for row in self.files.read_tail(scope["session_id"], after_seq=int((channels.get("ledger_pointer") or {}).get("applied_seq", 0)), branch_id=branch_id):
             runtime = (row.get("extensions") or {}).get("runtime") or {}
             if runtime.get("step_id") == interrupt_value["step_id"] and (row.get("execution") or {}).get("started_at") is not None:
                 channels["current_step"]["started_at"] = row["execution"]["started_at"]
@@ -79,7 +81,7 @@ class RuntimeCheckpointSaver(BaseCheckpointSaver):
             **({"mode": interrupt_value["mode"]} if interrupt_value.get("mode") else {}),
         }
         channels["turn_status"] = "waiting_user"
-        channels["ledger_pointer"] = {"applied_seq": seq, "applied_offset": self.files.offset_after(scope["session_id"], seq)}
+        channels["ledger_pointer"] = self.files.ledger_pointer(scope["session_id"], branch_id=branch_id)
         channels["state_revision"] = int(channels.get("state_revision", 0)) + 1
         channels["checkpoint_uid"] = f"cp_{uuid.uuid4().hex}"
         channels.pop("checkpoint_id", None)

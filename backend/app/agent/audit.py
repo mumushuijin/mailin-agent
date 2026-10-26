@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 import threading
 import hashlib
+import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -17,13 +18,15 @@ class RuntimeLedgerAudit:
     # One durable final result per call, shared by active workers and recovery.
     _settlement_lock = threading.RLock()
 
-    def __init__(self, files, scope: dict, *, step_id: str | None = None, task_id: str | None = None):
+    def __init__(self, files, scope: dict, *, step_id: str | None = None, task_id: str | None = None,
+                 branch_id: str = "main"):
         self.files = files
         self.scope = dict(scope)
         self.session_id = str(scope.get("session_id") or "")
         self.turn_id = str(scope.get("turn_id") or "")
         self.step_id = step_id
         self.task_id = task_id
+        self.branch_id = branch_id
         self.last_request_id: str | None = None
         self.started_attempts: dict[str, int] = {}
         self._lock = threading.RLock()
@@ -42,7 +45,7 @@ class RuntimeLedgerAudit:
             self.session_id, message_id or f"msg_{uuid.uuid4().hex}", message,
             turn_id=self.turn_id or None, timestamp=utc_now(), model=model,
             execution={"status": status, **(execution or {})},
-            interaction=interaction, extensions=extensions,
+            interaction=interaction, extensions=extensions, branch_id=self.branch_id,
         )
         return seq
 
@@ -64,8 +67,25 @@ class RuntimeLedgerAudit:
 
     def tool_started(self, call_id: str, attempt: int) -> int:
         with self._lock:
+            runtime = {}
+            if self.step_id:
+                runtime["step_id"] = self.step_id
+            if self.task_id:
+                runtime["task_id"] = self.task_id
+            for row in reversed(self.files.read(self.session_id, branch_id=self.branch_id)):
+                if row.get("turn_id") != self.turn_id or row["message"]["role"] != "assistant":
+                    continue
+                definition = next((item for item in row["message"].get("tool_calls", [])
+                                   if item["id"] == call_id), None)
+                if definition:
+                    runtime["tool_name"] = safe_error(definition["name"])
+                    runtime["input_summary"] = safe_error(json.dumps(
+                        definition.get("arguments") or {}, ensure_ascii=False, default=str,
+                    ))
+                    break
             seq = self.lifecycle("tool", "running", call_id=call_id,
-                                 execution={"attempt": attempt, "started_at": utc_now()})
+                                 execution={"attempt": attempt, "started_at": utc_now()},
+                                 extensions={"runtime": runtime} if runtime else None)
             self.started_attempts[call_id] = attempt
             return seq
 
@@ -105,7 +125,9 @@ class RuntimeLedgerAudit:
             if message.additional_kwargs.get("reason_code") not in (None, "ok"):
                 execution["error"] = {"code": message.additional_kwargs["reason_code"]}
             message.additional_kwargs["ledger_execution"] = execution
-            message.additional_kwargs["ledger_seq"] = self.files.append_messages(self.session_id, self.turn_id, [message], scope=self.scope)
+            message.additional_kwargs["ledger_seq"] = self.files.append_messages(
+                self.session_id, self.turn_id, [message], scope=self.scope, branch_id=self.branch_id,
+            )
             return message
 
     def tool_result(self, message) -> int:
@@ -127,10 +149,28 @@ class RuntimeLedgerAudit:
             existing = self.files.message_by_id(self.session_id, f"msg_terminal_{self.turn_id}")
             if existing:
                 return existing["seq"]
+            runtime = {"reason": reason}
+            events = [event for event in self.files.read_events(self.session_id, branch_id=self.branch_id)
+                      if event.get("turn_id") == self.turn_id
+                      and not ((event.get("payload", {}).get("extensions") or {}).get("runtime") or {}).get("auxiliary")]
+            response = next((event for event in reversed(events) if event["event_type"] == "model.response.completed"
+                             and not (event.get("payload", {}).get("message") or {}).get("tool_calls")), None)
+            if response is not None and status in {"completed", "handoff"}:
+                runtime["final_response_event_id"] = response["event_id"]
+                if response["payload"].get("message_id"):
+                    runtime["final_message_id"] = response["payload"]["message_id"]
+            elif status in {"failed", "cancelled"}:
+                cause = next((event for event in reversed(events) if event["event_type"] in {
+                    "model.request.failed", "model.request.interrupted", "tool.attempt.settled",
+                } and ((event.get("payload") or {}).get("status")
+                       or ((event.get("payload") or {}).get("execution") or {}).get("status"))
+                    in {"failed", "cancelled", "unknown", "denied"}), None)
+                if cause is not None:
+                    runtime["reason_event_id"] = cause["event_id"]
             return self.lifecycle("turn", status,
                                   message_id=f"msg_terminal_{self.turn_id}",
                                   execution={"finished_at": utc_now()},
-                                  extensions={"runtime": {"reason": reason}})
+                                  extensions={"runtime": runtime})
 
 
 def safe_error(value: Any) -> str:

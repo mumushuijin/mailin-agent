@@ -92,21 +92,25 @@ async def test_cancelling_real_active_task_still_cleans_its_session_processes():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", ["session1", None])
-async def test_immediate_cancel_before_coroutine_starts_still_settles_turn(session_id):
+@pytest.mark.parametrize("branch_id", ["main", "child"])
+async def test_immediate_cancel_before_coroutine_starts_still_settles_turn(session_id, branch_id):
     chat = SimpleNamespace(repair_cancelled_checkpoint=AsyncMock(), mark_terminal_checkpoint=AsyncMock())
     service = WsChatService(SimpleNamespace(send_event=AsyncMock()), chat)
     started = []
-    async def active(*_args):
+    async def active(*_args, **_kwargs):
         started.append(True)
         await asyncio.Future()
     service._execute_run = active
     with patch("app.tools.packages.shell.process_registry.kill_session_processes"):
-        await service.handle_message(1, {"op": "chat.send", "turn_id": "t", "session_id": session_id, "message": "hello"})
-        await service.handle_message(1, {"op": "chat.cancel", "turn_id": "t", "session_id": session_id})
-    assert not started and not service._active_runs and not service._run_sessions
+        await service.handle_message(1, {"op": "chat.send", "turn_id": "t", "session_id": session_id,
+                                         "submission_id": "submission-t", "message": "hello", "branch_id": branch_id})
+        await service.handle_message(1, {"op": "chat.cancel", "turn_id": "t", "session_id": session_id, "branch_id": branch_id})
+    assert not started and not service._active_runs and not service._run_sessions and not service._run_branches
     if session_id:
-        chat.mark_terminal_checkpoint.assert_awaited_once_with(session_id, "t", "cancelled", "cancelled")
+        chat.mark_terminal_checkpoint.assert_awaited_once_with(session_id, "t", "cancelled", "cancelled",
+                                                               **({"branch_id": branch_id} if branch_id != "main" else {}))
     else:
         chat.mark_terminal_checkpoint.assert_not_awaited()
     assert service.manager.send_event.await_args.args[1].type == "done"
+    assert service.manager.send_event.await_args.args[1].branch_id == branch_id
     assert not service._dispatch_conn

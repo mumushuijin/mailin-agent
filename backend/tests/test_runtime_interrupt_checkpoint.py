@@ -39,7 +39,7 @@ async def run_interrupt_lifecycle(monkeypatch, tmp_path, saver):
     files = SessionConversationFiles(tmp_path)
     state = graph_module.make_initial_state("write", 4, session_id=SESSION, turn_id="turn_1")
     seq = files.append_messages(SESSION, "turn_1", state["context"]["working_message"], scope=state["scope"])
-    state["ledger_pointer"]["applied_seq"] = seq
+    state["ledger_pointer"] = files.ledger_pointer(SESSION, seq)
     config = graph_module.make_thread_config(SESSION)
     graph = graph_module.build_graph()
     await graph.ainvoke(to_graph_state(state), config)

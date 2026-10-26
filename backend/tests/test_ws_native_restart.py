@@ -23,7 +23,8 @@ SID = "00000000-0000-4000-8000-000000000001"
 
 
 @pytest.mark.asyncio
-async def test_sqlite_restart_and_ws_reconnect_resume_one_original_tool_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("branch_id", ["main", "child"])
+async def test_sqlite_restart_and_ws_reconnect_resume_one_original_tool_once(tmp_path, monkeypatch, branch_id):
     files = SessionConversationFiles(tmp_path)
     monkeypatch.setattr(graph_module, "get_settings", lambda: SimpleNamespace(workspace_path=tmp_path))
     monkeypatch.setattr(graph_module, "get_tools", lambda: [object()])
@@ -40,9 +41,12 @@ async def test_sqlite_restart_and_ws_reconnect_resume_one_original_tool_once(tmp
         return {"messages": [ToolMessage(content="ok", tool_call_id="call1", additional_kwargs={"tool_status": "succeeded", "attempt": 1})]}
     monkeypatch.setattr(graph_module, "call_agent", agent)
     monkeypatch.setattr(graph_module, "call_tools", tools)
-    config = graph_module.make_thread_config(SID)
+    config = graph_module.make_thread_config(SID, branch_id)
+    if branch_id != "main":
+        files.fork_branch(SID, branch_id, parent_cursor={"branch_id": "main", "event_seq": 0, "event_id": "origin"})
     state = graph_module.make_initial_state("write file", 4, session_id=SID, turn_id="turn1")
-    state["ledger_pointer"]["applied_seq"] = files.append_messages(SID, "turn1", state["context"]["working_message"], scope=state["scope"])
+    seq = files.append_messages(SID, "turn1", state["context"]["working_message"], scope=state["scope"], branch_id=branch_id)
+    state["ledger_pointer"] = files.ledger_pointer(SID, seq, branch_id=branch_id)
     database = str(tmp_path / "checkpoint.sqlite")
     # Close the first sqlite connection and graph before creating the WS service.
     async with aiosqlite.connect(database) as connection:
@@ -65,21 +69,30 @@ async def test_sqlite_restart_and_ws_reconnect_resume_one_original_tool_once(tmp
         chat._schedule_background = MagicMock()
         manager = SimpleNamespace(send_event=AsyncMock(), subscribe_session=MagicMock())
         websocket = WsChatService(manager, chat)
-        await websocket.handle_message(7, {"op": "session.subscribe", "session_id": SID})
+        await websocket.handle_message(7, {"op": "session.subscribe", "session_id": SID, "branch_id": branch_id})
         task = websocket._reattach_tasks["turn1"]
-        await websocket.handle_message(7, {"op": "approve", "session_id": SID, "turn_id": "turn1", "step_id": saved_step, "tool_call_id": "call1", "interrupt_id": pending["id"], "decision": "allow"})
+        await websocket.handle_message(7, {"op": "approve", "session_id": SID, "branch_id": branch_id, "turn_id": "turn1", "step_id": saved_step, "tool_call_id": "call1", "interrupt_id": pending["id"], "decision": "allow"})
         await asyncio.wait_for(task, timeout=5)
-        await websocket.handle_message(7, {"op": "approve", "session_id": SID, "turn_id": "turn1", "step_id": saved_step, "tool_call_id": "call1", "interrupt_id": pending["id"], "decision": "allow"})
+        await websocket.handle_message(7, {"op": "approve", "session_id": SID, "branch_id": branch_id, "turn_id": "turn1", "step_id": saved_step, "tool_call_id": "call1", "interrupt_id": pending["id"], "decision": "allow"})
         assert manager.send_event.await_args.args[1].data["reason_code"] == "stale_interrupt"
         completed = dict((await graph.aget_state(config)).values)
+        if branch_id != "main":
+            assert not (await graph.aget_state(graph_module.make_thread_config(SID))).values
     assert tool_executions == ["call1"]
     assert completed["turn_status"] == "completed" and completed["scope"]["turn_id"] == "turn1"
-    rows = files.read(SID)
+    rows = files.read(SID, branch_id=branch_id)
+    assert completed["ledger_pointer"]["event_cursor"]["branch_id"] == branch_id
+    assert all(event["branch_id"] == branch_id for event in files.read_events(SID))
     assert len([r for r in rows if r["message"]["role"] == "user" and not r.get("interaction")]) == 1
     assert len([r for r in rows if r.get("interaction", {}).get("decision") is not None]) == 1
     assert len([r for r in rows if r["message"]["role"] == "tool"]) == 1
     assert {r["message"]["id"] for r in rows if r["message"].get("id")} == {"run--definition", "run--final"}
     assert any(call.args[1].type == "done" for call in manager.send_event.await_args_list)
+    durable = [call.args[1] for call in manager.send_event.await_args_list if call.args[1].type == "timeline_event"]
+    assert {frame.data["event"]["event_type"] for frame in durable} >= {
+        "interaction.resolved", "tool.attempt.started", "tool.attempt.settled", "turn.settled",
+    }
+    assert all(frame.branch_id == branch_id for frame in durable)
 
 
 @pytest.mark.asyncio

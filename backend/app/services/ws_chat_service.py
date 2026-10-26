@@ -14,6 +14,8 @@ from app.agent.streaming.interrupts import get_pending_interrupts, has_pending_i
 from app.core.logging import get_logger, log_scope, new_trace_id
 from app.services.chat_service import ChatService
 from app.services.ws_manager import ConnectionManager
+from app.schemas.chat import ChatRequest
+from pydantic import ValidationError
 
 log = get_logger(__name__)
 
@@ -25,12 +27,14 @@ class WsChatService:
         self._active_runs: dict[str, asyncio.Task] = {}
         self._approval_futures: dict[str, asyncio.Future] = {}
         self._run_sessions: dict[str, str] = {}
+        self._run_branches: dict[str, str] = {}
         self._pending_interrupt_meta: dict[str, dict[str, Any]] = {}
         self._reattach_tasks: dict[str, asyncio.Task] = {}
         self._dispatchers: dict[str, RunEventDispatcher] = {}
         self._dispatch_conn: dict[str, int] = {}
 
     async def _send_run_event(self, turn_id: str, event: AgentEvent) -> bool:
+        event.branch_id = event.branch_id or self._run_branches.get(turn_id)
         dispatcher = self._dispatchers.get(turn_id)
         if dispatcher is None:
             conn_id = self._dispatch_conn.get(turn_id)
@@ -71,7 +75,8 @@ class WsChatService:
             # A websocket can reconnect after the process persisted an interrupt.
             # Reattach the native waiting turn without creating a new user turn.
             if isinstance(session_id, str):
-                await self._attach_waiting_turn(conn_id, session_id, payload.get("turn_id"))
+                await self._attach_waiting_turn(conn_id, session_id, payload.get("turn_id"),
+                                                branch_id=payload.get("branch_id", "main"))
             return
 
         if op == "chat.send":
@@ -81,34 +86,54 @@ class WsChatService:
                 return
             message = payload.get("message", "")
             session_id = payload.get("session_id")
-            await self._start_run(conn_id, turn_id, message, session_id)
+            submission_id = payload.get("submission_id")
+            if not isinstance(submission_id, str) or not submission_id.strip():
+                await self.manager.send_event(conn_id, AgentEvent("error", {"error": "submission_id 必须为非空字符串", "reason_code": "invalid_submission_id"}, turn_id))
+                return
+            try:
+                request = ChatRequest(message=message, session_id=session_id, turn_id=turn_id,
+                                      submission_id=submission_id, branch_id=payload.get("branch_id", "main"),
+                                      fork_cursor=payload.get("fork_cursor"))
+            except ValidationError as exc:
+                await self.manager.send_event(conn_id, AgentEvent("error", {
+                    "error": str(exc), "reason_code": "invalid_branch_cursor",
+                }, turn_id))
+                return
+            await self._start_run(conn_id, turn_id, message, session_id, submission_id,
+                                  branch_id=request.branch_id,
+                                  fork_cursor=request.fork_cursor.model_dump() if request.fork_cursor else None)
             return
 
         if op == "chat.cancel":
             turn_id = payload.get("turn_id")
-            if turn_id and self._run_sessions.get(turn_id) == payload.get("session_id"):
+            if (turn_id and self._run_sessions.get(turn_id) == payload.get("session_id")
+                    and payload.get("branch_id", self._run_branches.get(turn_id, "main"))
+                    == self._run_branches.get(turn_id, "main")):
                 await self.cancel_run(turn_id)
             return
 
         if op == "state.sync":
             turn_id = payload.get("turn_id")
             session_id = payload.get("session_id")
+            branch_id = payload.get("branch_id") or self._run_branches.get(turn_id, "main")
             if not turn_id or not session_id:
                 return
             if self._run_sessions.get(turn_id) != session_id:
-                await self._attach_waiting_turn(conn_id, session_id, turn_id)
+                await self._attach_waiting_turn(conn_id, session_id, turn_id, branch_id=branch_id)
             graph = await asyncio.to_thread(get_graph)
-            snapshot = await graph.aget_state(make_thread_config(session_id))
+            snapshot = await graph.aget_state(make_thread_config(session_id, branch_id))
             canonical = dict(snapshot.values or {}) if snapshot else {}
             if canonical and (canonical.get("scope") or {}).get("turn_id") == turn_id and (canonical.get("scope") or {}).get("session_id") == session_id:
                 validate_agent_state(canonical)
                 active = self._active_runs.get(turn_id)
                 if (active is None or active.done()) and hasattr(self.chat_service, "_recover_ledger_tail"):
-                    canonical = self.chat_service._recover_ledger_tail(session_id, canonical)
+                    canonical = self.chat_service._recover_ledger_tail(
+                        session_id, canonical, **({"branch_id": branch_id} if branch_id != "main" else {}),
+                    )
                 if not isinstance(canonical, dict) or (canonical.get("scope") or {}).get("turn_id") != turn_id:
                     return
                 event = AgentEvent(
-                        "state_sync", {"session_id": session_id}, turn_id,
+                        "state_sync", {"session_id": session_id, "branch_id": branch_id}, turn_id,
                         state=public_state_projection(canonical),
                     )
                 if turn_id in self._dispatchers:
@@ -121,7 +146,8 @@ class WsChatService:
             turn_id = payload.get("turn_id")
             if not turn_id or turn_id not in self._approval_futures:
                 if turn_id and payload.get("session_id"):
-                    await self._attach_waiting_turn(conn_id, payload["session_id"], turn_id)
+                    await self._attach_waiting_turn(conn_id, payload["session_id"], turn_id,
+                                                    branch_id=payload.get("branch_id", "main"))
                 if turn_id and turn_id not in self._approval_futures:
                     await self.manager.send_event(
                         conn_id,
@@ -138,6 +164,12 @@ class WsChatService:
                 if turn_id not in self._approval_futures:
                     return
             expected_session = self._run_sessions.get(turn_id)
+            expected_branch = self._run_branches.get(turn_id, "main")
+            if payload.get("branch_id", expected_branch) != expected_branch:
+                await self.manager.send_event(conn_id, AgentEvent("error", {
+                    "error": "响应与当前分支不匹配", "fail_closed": True, "reason_code": "stale_branch",
+                }, turn_id))
+                return
             payload_session = payload.get("session_id")
             if expected_session and payload_session != expected_session:
                 log.warning(
@@ -301,6 +333,10 @@ class WsChatService:
         turn_id: str,
         message: str,
         session_id: str | None,
+        submission_id: str,
+        *,
+        branch_id: str = "main",
+        fork_cursor: dict[str, Any] | None = None,
     ) -> None:
         existing = self._active_runs.get(turn_id)
         if existing and not existing.done():
@@ -314,8 +350,10 @@ class WsChatService:
         # an immediately following cancellation can address this turn.
         if session_id:
             self._run_sessions[turn_id] = session_id
+        self._run_branches[turn_id] = branch_id
         self._dispatch_conn[turn_id] = conn_id
-        task = asyncio.create_task(self._execute_run(conn_id, turn_id, message, session_id))
+        task = asyncio.create_task(self._execute_run(conn_id, turn_id, message, session_id, submission_id,
+                                                      branch_id=branch_id, fork_cursor=fork_cursor))
         self._active_runs[turn_id] = task
 
     async def _attach_waiting_turn(
@@ -325,6 +363,7 @@ class WsChatService:
         turn_id: str | None = None,
         *,
         start_wait: bool = True,
+        branch_id: str = "main",
     ) -> bool:
         """Attach a websocket to a persisted native interrupt after reconnect.
 
@@ -333,7 +372,7 @@ class WsChatService:
         """
         try:
             graph = await asyncio.to_thread(get_graph)
-            config = make_thread_config(session_id)
+            config = make_thread_config(session_id, branch_id)
             snapshot = await graph.aget_state(config)
             canonical = dict(snapshot.values or {}) if snapshot else {}
             if not canonical:
@@ -341,7 +380,9 @@ class WsChatService:
             validate_agent_state(canonical)
             active = self._active_runs.get((canonical.get("scope") or {}).get("turn_id"))
             if (active is None or active.done()) and hasattr(self.chat_service, "_recover_ledger_tail"):
-                canonical = self.chat_service._recover_ledger_tail(session_id, canonical)
+                canonical = self.chat_service._recover_ledger_tail(
+                    session_id, canonical, **({"branch_id": branch_id} if branch_id != "main" else {}),
+                )
             scope = canonical.get("scope") or {}
             checkpoint_turn = scope.get("turn_id")
             if scope.get("session_id") != session_id or not checkpoint_turn or (turn_id and checkpoint_turn != turn_id):
@@ -360,11 +401,13 @@ class WsChatService:
             pending = {**value, **pending, "options": value.get("options") or [], "allow_multiple": bool(value.get("allow_multiple"))}
             actual_turn = str(checkpoint_turn)
             self._run_sessions[actual_turn] = session_id
+            self._run_branches[actual_turn] = branch_id
             self._dispatch_conn[actual_turn] = conn_id
             self._pending_interrupt_meta[actual_turn] = {
                 **pending,
                 "session_id": session_id,
                 "turn_id": actual_turn,
+                "branch_id": branch_id,
                 "step_id": (canonical.get("current_step") or {}).get("step_id"),
                 "tool_call_id": pending.get("call_id") or pending.get("tool_call_id"),
                 "interrupt_id": pending.get("id"),
@@ -379,7 +422,7 @@ class WsChatService:
             from app.storage.message_codec import safe_business_value
             if pending.get("decision") is None:
                 await self.manager.send_event(conn_id, AgentEvent(
-                    "interrupt", safe_business_value({**value, "session_id": session_id, "turn_id": actual_turn}), actual_turn,
+                    "interrupt", safe_business_value({**value, "session_id": session_id, "turn_id": actual_turn, "branch_id": branch_id}), actual_turn,
                     state=public_state_projection(canonical),
                 ))
             active = self._active_runs.get(actual_turn)
@@ -397,23 +440,25 @@ class WsChatService:
             return False
 
     async def _execute_waiting_turn(self, conn_id: int, turn_id: str, session_id: str) -> None:
+        branch_id = self._run_branches.get(turn_id, "main")
         token = approval_enabled.set(True)
         try:
             await self._handle_interrupts(conn_id, turn_id, session_id, already_notified=True)
         except asyncio.CancelledError:
-            await self.chat_service.repair_cancelled_checkpoint(session_id)
-            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "cancelled", "cancelled")
-            await self._emit_cancelled(conn_id, turn_id, session_id)
+            await self.chat_service.repair_cancelled_checkpoint(session_id, **({"branch_id": branch_id} if branch_id != "main" else {}))
+            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "cancelled", "cancelled", **({"branch_id": branch_id} if branch_id != "main" else {}))
+            await self._emit_cancelled(conn_id, turn_id, session_id, branch_id=branch_id)
             raise
         except Exception:
             log.warning("persisted waiting turn resume failed", exc_info=True)
-            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "failed", "resume_error")
+            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "failed", "resume_error", **({"branch_id": branch_id} if branch_id != "main" else {}))
             await self._send_run_event(turn_id, AgentEvent("error", {"error": "恢复执行失败", "reason_code": "resume_error"}, turn_id))
         finally:
             approval_enabled.reset(token)
             self._active_runs.pop(turn_id, None)
             self._approval_futures.pop(turn_id, None)
             self._run_sessions.pop(turn_id, None)
+            self._run_branches.pop(turn_id, None)
             self._pending_interrupt_meta.pop(turn_id, None)
             self._dispatch_conn.pop(turn_id, None)
 
@@ -423,10 +468,15 @@ class WsChatService:
         turn_id: str,
         message: str,
         session_id: str | None,
+        submission_id: str | None = None,
+        *,
+        branch_id: str = "main",
+        fork_cursor: dict[str, Any] | None = None,
     ) -> None:
         start = time.monotonic()
         status = "success"
         sid: str | None = session_id
+        self._run_branches[turn_id] = branch_id
         token = approval_enabled.set(True)
         cancel_notified = False
         interrupt_delivered = False
@@ -444,7 +494,8 @@ class WsChatService:
             log.info("run.started")
             try:
                 async for event in self.chat_service.iter_chat_events(
-                    message, session_id, turn_id=turn_id
+                    message, session_id, turn_id=turn_id, submission_id=submission_id,
+                    branch_id=branch_id, fork_cursor=fork_cursor,
                 ):
                     if event.type == "session" and event.data.get("session_id"):
                         sid = event.data["session_id"]
@@ -462,15 +513,15 @@ class WsChatService:
             except asyncio.CancelledError:
                 status = "cancelled"
                 if sid:
-                    await self.chat_service.repair_cancelled_checkpoint(sid)
-                    await self.chat_service.mark_terminal_checkpoint(sid, turn_id, "cancelled", "cancelled")
+                    await self.chat_service.repair_cancelled_checkpoint(sid, **({"branch_id": branch_id} if branch_id != "main" else {}))
+                    await self.chat_service.mark_terminal_checkpoint(sid, turn_id, "cancelled", "cancelled", **({"branch_id": branch_id} if branch_id != "main" else {}))
                 if not cancel_notified:
-                    await self._emit_cancelled(conn_id, turn_id, sid)
+                    await self._emit_cancelled(conn_id, turn_id, sid, branch_id=branch_id)
             except Exception as e:
                 status = "failed"
                 log.error("run.failed", error=str(e), exc_info=True)
                 if sid:
-                    await self.chat_service.mark_terminal_checkpoint(sid, turn_id, "failed", "error")
+                    await self.chat_service.mark_terminal_checkpoint(sid, turn_id, "failed", "error", **({"branch_id": branch_id} if branch_id != "main" else {}))
                 await self._send_run_event(turn_id, AgentEvent("error", {"error": str(e)}, turn_id))
             finally:
                 duration_ms = (time.monotonic() - start) * 1000
@@ -485,6 +536,7 @@ class WsChatService:
                 self._active_runs.pop(turn_id, None)
                 self._approval_futures.pop(turn_id, None)
                 self._run_sessions.pop(turn_id, None)
+                self._run_branches.pop(turn_id, None)
                 self._pending_interrupt_meta.pop(turn_id, None)
                 dispatcher.close()
                 try:
@@ -498,7 +550,8 @@ class WsChatService:
         self, conn_id: int, turn_id: str, session_id: str, *, already_notified: bool = False
     ) -> None:
         graph = await asyncio.to_thread(get_graph)
-        config = make_thread_config(session_id)
+        branch_id = self._run_branches.get(turn_id, "main")
+        config = make_thread_config(session_id, branch_id)
 
         while await has_pending_interrupt(graph, config):
             interrupts = await get_pending_interrupts(graph, config)
@@ -516,7 +569,9 @@ class WsChatService:
             snapshot = await graph.aget_state(config)
             canonical = dict(snapshot.values or {}) if snapshot else {}
             if canonical and hasattr(self.chat_service, "_recover_ledger_tail"):
-                canonical = self.chat_service._recover_ledger_tail(session_id, canonical)
+                canonical = self.chat_service._recover_ledger_tail(
+                    session_id, canonical, **({"branch_id": branch_id} if branch_id != "main" else {}),
+                )
             if canonical and ((canonical.get("scope") or {}).get("turn_id") != turn_id or canonical.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}):
                 return
             scope = canonical.get("scope") or {}
@@ -532,10 +587,11 @@ class WsChatService:
                     "allow_multiple": pending.get("allow_multiple", value.get("allow_multiple")),
                     "session_id": session_id,
                     "turn_id": turn_id,
+                    "branch_id": branch_id,
                     "step_id": step_id,
                 }
                 # 展平 value 便于前端直接读 kind/prompt
-                event_data = {**value, "turn_id": turn_id, "session_id": session_id, "step_id": step_id,
+                event_data = {**value, "turn_id": turn_id, "session_id": session_id, "branch_id": branch_id, "step_id": step_id,
                               "interrupt_id": pending.get("id") or value.get("interrupt_id")}
             else:
                 self._pending_interrupt_meta[turn_id] = {
@@ -543,7 +599,7 @@ class WsChatService:
                     "turn_id": turn_id,
                     "step_id": step_id,
                 }
-                event_data = {**interrupt_data, "turn_id": turn_id, "session_id": session_id}
+                event_data = {**interrupt_data, "turn_id": turn_id, "session_id": session_id, "branch_id": branch_id}
 
             if not already_notified:
                 from app.storage.message_codec import safe_business_value
@@ -608,7 +664,8 @@ class WsChatService:
             self._approval_futures.pop(turn_id, None)
 
             async for event in self.chat_service.resume_chat_events(
-                session_id, decision, turn_id=turn_id
+                session_id, decision, turn_id=turn_id,
+                **({"branch_id": branch_id} if branch_id != "main" else {}),
             ):
                 await self._send_run_event(turn_id, event)
 
@@ -616,6 +673,7 @@ class WsChatService:
 
     async def cancel_run(self, turn_id: str) -> None:
         session_id = self._run_sessions.get(turn_id)
+        branch_id = self._run_branches.get(turn_id, "main")
         future = self._approval_futures.pop(turn_id, None)
         if future and not future.done():
             future.cancel()
@@ -632,15 +690,16 @@ class WsChatService:
             from app.tools.packages.shell.process_registry import kill_session_processes
 
             kill_session_processes(session_id)
-            await self.chat_service.repair_cancelled_checkpoint(session_id)
-            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "cancelled", "cancelled")
+            await self.chat_service.repair_cancelled_checkpoint(session_id, **({"branch_id": branch_id} if branch_id != "main" else {}))
+            await self.chat_service.mark_terminal_checkpoint(session_id, turn_id, "cancelled", "cancelled", **({"branch_id": branch_id} if branch_id != "main" else {}))
         # Cancellation may happen before a newly created coroutine runs its
         # own finally block, including before a new session has been created.
         if turn_id in self._dispatch_conn:
-            await self._emit_cancelled(self._dispatch_conn[turn_id], turn_id, session_id)
+            await self._emit_cancelled(self._dispatch_conn[turn_id], turn_id, session_id, branch_id=branch_id)
             self._dispatch_conn.pop(turn_id, None)
         self._active_runs.pop(turn_id, None)
         self._run_sessions.pop(turn_id, None)
+        self._run_branches.pop(turn_id, None)
         self._pending_interrupt_meta.pop(turn_id, None)
 
     async def _emit_cancelled(
@@ -648,9 +707,12 @@ class WsChatService:
         conn_id: int,
         turn_id: str,
         session_id: str | None,
+        *,
+        branch_id: str = "main",
     ) -> None:
         """取消时推送成对终态事件，便于前端清理工具/loading 状态。"""
-        await self._send_run_event(turn_id, AgentEvent("error", {"error": "已取消", "cancelled": True}, turn_id))
+        await self._send_run_event(turn_id, AgentEvent("error", {"error": "已取消", "cancelled": True}, turn_id,
+                                                     branch_id=branch_id))
         await self._send_run_event(
             turn_id,
             AgentEvent(
@@ -658,9 +720,11 @@ class WsChatService:
                 {
                     "content": "",
                     "session_id": session_id,
+                    "branch_id": branch_id,
                     "partial": True,
                     "cancelled": True,
                 },
                 turn_id,
+                branch_id=branch_id,
             ),
         )

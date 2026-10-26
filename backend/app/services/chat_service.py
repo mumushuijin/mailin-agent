@@ -47,6 +47,7 @@ from app.schemas.session import (
 )
 from app.core.exceptions import AppError
 from app.storage.history_projection import HistoryProjectionStore, project_ledger
+from app.storage.ledger_contract import PROJECTION_VERSION
 from app.storage.conversation_files import SessionConversationFiles
 from app.storage.project import require_bound_session, session_project_path
 from app.storage.workspace import SessionStore
@@ -81,22 +82,27 @@ def _exclusive_turn(*, stream: bool = False):
     def decorate(method):
         if stream:
             @wraps(method)
-            async def events(self, message, session_id, *, turn_id=None):
+            async def events(self, message, session_id, *, turn_id=None, submission_id=None,
+                             branch_id="main", fork_cursor=None):
                 try:
                     sid = self._require_bound_session(session_id)
                     with _session_execution(self.settings.workspace_path, sid):
-                        async for event in method(self, message, sid, turn_id=turn_id):
+                        async for event in method(self, message, sid, turn_id=turn_id, submission_id=submission_id,
+                                                  branch_id=branch_id, fork_cursor=fork_cursor):
+                            event.branch_id = event.branch_id or branch_id
                             yield event
                 except AppError as exc:
-                    yield AgentEvent("error", {"error": exc.message, "reason_code": "session_busy" if exc.status_code == 409 else "invalid_session"}, turn_id)
+                    yield AgentEvent("error", {"error": exc.message, "reason_code": exc.code or ("session_busy" if exc.status_code == 409 else "invalid_session")}, turn_id, branch_id=branch_id)
                 except ValueError as exc:
                     yield AgentEvent("error", {"error": str(exc), "reason_code": "unsupported_ledger"}, turn_id)
             return events
         @wraps(method)
-        async def invoke(self, message, session_id, *, turn_id=None):
+        async def invoke(self, message, session_id, *, turn_id=None, submission_id=None,
+                         branch_id="main", fork_cursor=None):
             sid = self._require_bound_session(session_id)
             with _session_execution(self.settings.workspace_path, sid):
-                return await method(self, message, sid, turn_id=turn_id)
+                return await method(self, message, sid, turn_id=turn_id, submission_id=submission_id,
+                                    branch_id=branch_id, fork_cursor=fork_cursor)
         return invoke
     return decorate
 
@@ -111,6 +117,7 @@ class ChatService:
     def _new_run_state(
         self, session_id: str, message: str, max_steps: int, turn_id: str | None,
         previous: dict[str, Any] | None = None,
+        *, submission_id: str | None = None, branch_id: str = "main",
     ):
         if previous and previous.get("turn_status") in {"running", "waiting_user"}:
             raise AppError("上一 turn 尚未结束，请先恢复或取消", status_code=409)
@@ -119,7 +126,11 @@ class ChatService:
             workspace_id=str(self.settings.workspace_path), turn_id=turn_id,
         )
         self.conversation_files.ensure_metadata(session_id)
-        if self.conversation_files.message_by_id(session_id, f"msg_user_{state['scope']['turn_id']}"):
+        accepted_message_id = (
+            "msg_submission_" + hashlib.sha256(submission_id.encode("utf-8")).hexdigest()[:32]
+            if submission_id else f"msg_user_{state['scope']['turn_id']}"
+        )
+        if self.conversation_files.message_by_id(session_id, accepted_message_id):
             raise AppError("该 turn 已提交，不能重复执行；请加载会话历史查看结果", status_code=409)
         if previous and REQUIRED_TOP_LEVEL.issubset(set(previous) | {"checkpoint_id"}):
             previous_context = dict(previous.get("context") or {})
@@ -136,16 +147,125 @@ class ChatService:
                 state["task_details"]["_runtime"] = {"todos": list(previous_todos)}
         state["context"]["bootstrap_fingerprint"] = self._bootstrap_fingerprint(session_id)
         user_message = state["context"]["working_message"][-1]
-        user_message.additional_kwargs["ledger_message_id"] = f"msg_user_{state['scope']['turn_id']}"
+        user_message.additional_kwargs["ledger_message_id"] = accepted_message_id
         seq = self.conversation_files.append_messages(
             session_id,
             str(state["scope"]["turn_id"]),
             [state["context"]["working_message"][-1]],
             scope=state["scope"],
+            submission_id=submission_id, branch_id=branch_id,
         )
-        state["ledger_pointer"]["applied_seq"] = seq
-        state["ledger_pointer"]["applied_offset"] = self.conversation_files.offset_after(session_id, seq)
+        state["ledger_pointer"] = self.conversation_files.ledger_pointer(session_id, seq, branch_id=branch_id)
         return state
+
+    def _existing_submission(self, session_id: str, submission_id: str | None, message: str,
+                             *, branch_id: str | None = None):
+        if not submission_id:
+            return None
+        self.conversation_files.ensure_metadata(session_id)
+        event = self.conversation_files.find_submission(session_id, submission_id)
+        if not event:
+            return None
+        stored = self.conversation_files.resolve_message(session_id, event["payload"].get("message") or {})
+        if stored.get("content") != message:
+            raise AppError("submission_id 已绑定不同内容", status_code=409, code="submission_conflict")
+        if branch_id is not None and event["branch_id"] != branch_id:
+            raise AppError("submission_id 已绑定不同分支", status_code=409, code="submission_conflict")
+        branch_id = event["branch_id"]
+        events = self.conversation_files.read_events(session_id)
+        from app.storage.event_projection import project_events
+        projection = project_events(events, branch_id=branch_id, session_id=session_id)
+        turn_id = event.get("turn_id") or ""
+        turn = projection["turns"].get(turn_id) or {}
+        final_message_id = turn.get("final_message_id")
+        content = ""
+        if final_message_id:
+            row = self.conversation_files.message_by_id(session_id, final_message_id)
+            if row is not None:
+                value = self.conversation_files.resolve_message(session_id, row["message"]).get("content")
+            else:
+                final = next((projection["messages"][key] for key in projection["message_order"]
+                              if projection["messages"][key].get("message_id") == final_message_id), None)
+                value = (final or {}).get("content")
+            content = value if isinstance(value, str) else "".join(
+                str(block.get("text") or "") for block in (value or [])
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        return {"event": event, "turn_id": turn_id, "status": turn.get("status", "running"),
+                "content": content, "cursor": projection.get("cursor")}
+
+    def _durable_event_frames(self, session_id: str, after_seq: int, *, state_revision: int | None = None,
+                              turn_id: str | None = None, branch_id: str | None = None) -> list[AgentEvent]:
+        frames = []
+        from app.services.timeline_service import normalize_timeline_event
+
+        for event in self.conversation_files.read_events(session_id, after_seq=after_seq, branch_id=branch_id):
+            if turn_id is not None and event.get("turn_id") != turn_id:
+                continue
+            frames.append(AgentEvent(
+                "timeline_event",
+                {"session_id": session_id, "event": normalize_timeline_event(event, self.conversation_files), "cursor": {
+                    "branch_id": event["branch_id"],
+                    "event_seq": event["event_seq"],
+                    "event_id": event["event_id"],
+                }},
+                event.get("turn_id"), event_id=event["event_id"],
+                event_seq=event["event_seq"], branch_id=event["branch_id"],
+                state_revision=state_revision,
+            ))
+        return frames
+
+    def _branch_history_state(self, session_id: str, branch_id: str, *,
+                              as_of_event_seq: int | None = None) -> dict[str, Any]:
+        """Build a new-turn window from recorded facts without resuming old work."""
+        from app.agent.recovery import decode_window_row, is_audit_row
+        from app.storage.event_projection import project_events
+
+        events = self.conversation_files.read_events(session_id)
+        known = {"main"} | {event["branch_id"] for event in events if event["event_type"] == "branch.forked"}
+        if branch_id not in known:
+            raise AppError("未知的历史分支", status_code=409, code="invalid_branch")
+        projection = project_events(events, branch_id=branch_id, session_id=session_id,
+                                    as_of_event_seq=as_of_event_seq)
+        visible_ids = set(projection["applied_events"])
+        rows = [self.conversation_files._event_to_projection(event) for event in events if event["event_id"] in visible_ids]
+        rows = [row for row in rows if row is not None and not is_audit_row(row)]
+        unresolved_calls: set[str] = set()
+        for row in rows:
+            unresolved_calls.update(call["id"] for call in row["message"].get("tool_calls") or [])
+            if row["message"].get("role") == "tool":
+                unresolved_calls.discard(row["message"].get("tool_call_id"))
+        if unresolved_calls:
+            raise AppError("历史位置包含未结算的工具调用，请选择工具结果之后的位置继续", status_code=409,
+                           code="historical_tool_state_incomplete")
+        previous = make_initial_state("", self._max_steps(), session_id=session_id,
+                                      workspace_id=str(self.settings.workspace_path))
+        previous["context"]["working_message"] = [decode_window_row(self.conversation_files, session_id, row) for row in rows]
+        previous["context"]["bootstrap_fingerprint"] = self._bootstrap_fingerprint(session_id)
+        previous["turn_status"] = "completed"
+        cursor = projection.get("cursor")
+        previous["ledger_pointer"] = self.conversation_files.ledger_pointer(
+            session_id, cursor["event_seq"] if cursor else 0, branch_id=branch_id,
+        )
+        return previous
+
+    async def _previous_for_branch(self, graph, config: dict, session_id: str, branch_id: str,
+                                   fork_cursor: dict[str, Any] | None) -> dict[str, Any]:
+        self.conversation_files.ensure_metadata(session_id)
+        if fork_cursor is not None:
+            # Validate the historical window before creating a branch, so an
+            # unusable tool prefix leaves no misleading child execution.
+            self._branch_history_state(session_id, fork_cursor["branch_id"],
+                                       as_of_event_seq=fork_cursor["event_seq"])
+            self.conversation_files.fork_branch(session_id, branch_id, parent_cursor=fork_cursor)
+            return self._branch_history_state(session_id, branch_id)
+        await self._reject_legacy_checkpoint(graph, config)
+        values = await self._checkpoint_values(graph, config)
+        if not values and branch_id != "main":
+            return self._branch_history_state(session_id, branch_id)
+        return self._refresh_stale_context(
+            session_id, self._recover_ledger_tail(session_id, values, stop_incomplete=True, branch_id=branch_id)
+        )
 
     def _bootstrap_fingerprint(self, session_id: str) -> str:
         from app.context.bootstrap import load_bootstrap
@@ -154,9 +274,11 @@ class ChatService:
         text, _tokens = load_bootstrap(self.settings.workspace_path, Path(project) if project else None)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def _recover_ledger_tail(self, session_id: str, previous: dict[str, Any], *, stop_incomplete: bool = False) -> dict[str, Any]:
+    def _recover_ledger_tail(self, session_id: str, previous: dict[str, Any], *, stop_incomplete: bool = False,
+                              branch_id: str | None = None) -> dict[str, Any]:
         from app.agent.recovery import recover_ledger_tail
-        return recover_ledger_tail(previous, self.conversation_files, session_id=session_id, stop_incomplete=stop_incomplete)
+        return recover_ledger_tail(previous, self.conversation_files, session_id=session_id,
+                                   stop_incomplete=stop_incomplete, branch_id=branch_id)
 
     def _refresh_stale_context(self, session_id: str, previous: dict[str, Any]) -> dict[str, Any]:
         if not previous:
@@ -168,7 +290,8 @@ class ChatService:
         # Bootstrap/reference changes invalidate the prepared window. Rebuild it
         # from the durable ledger once, then let the existing compression pipeline
         # establish a fresh token-bounded working window before the next model call.
-        rows = self.conversation_files.read(session_id)
+        branch_id = ((previous.get("ledger_pointer") or {}).get("event_cursor") or {}).get("branch_id", "main")
+        rows = self.conversation_files.read(session_id, branch_id=branch_id)
         from app.agent.recovery import decode_window_row, is_audit_row
         rebuilt = dict(previous)
         context["working_message"] = [
@@ -176,13 +299,14 @@ class ChatService:
             for row in rows if not is_audit_row(row)
         ]
         context["bootstrap_fingerprint"] = fingerprint
+        context["window_pointer"] = None
         context["last_built_at"] = None
         rebuilt["context"] = context
         if rows:
             pointer = dict(previous.get("ledger_pointer") or {})
             pointer["applied_seq"] = int(rows[-1]["seq"])
             pointer["applied_offset"] = self.conversation_files.offset_after(session_id, int(rows[-1]["seq"]))
-            rebuilt["ledger_pointer"] = pointer
+            rebuilt["ledger_pointer"] = self.conversation_files.ledger_pointer(session_id, int(rows[-1]["seq"]), branch_id=branch_id)
         return rebuilt
 
     async def _checkpoint_values(self, graph, config: dict) -> dict[str, Any]:
@@ -265,14 +389,18 @@ class ChatService:
         compact_tools: bool,
     ) -> SessionHistory:
         projected = to_runtime_view(values) if "context" in values else values
-        ledger_rows = self.conversation_files.read(session_id)
-        messages = self.conversation_files.messages(session_id, include_audit=False)
+        # The legacy history API and its single session cache represent main.
+        # Branch timelines use the explicit branch-aware timeline API.
+        from app.storage.ledger_contract import is_audit_row
+        ledger_rows = self.conversation_files.read(session_id, branch_id="main")
+        messages = [self.conversation_files.decode_row(row, session_id=session_id, resolve_references=True)
+                    for row in ledger_rows if not is_audit_row(row)]
         projection = project_ledger(ledger_rows)
         session_token_stats = projected.get("session_token_stats") or {}
         api_usage = projection.get("api_usage") or projected.get("api_usage") or {}
         context_usage = resolve_context_usage({**projected, "messages": messages}, session_id)
         return SessionHistory(
-            projection_version=3,
+            projection_version=PROJECTION_VERSION,
             session_id=session_id,
             workspace_id=self.conversation_files.workspace_id,
             messages=[ChatMessage(**row) for row in projection["messages"]],
@@ -306,7 +434,7 @@ class ChatService:
     ) -> None:
         try:
             graph = graph or await self._get_graph_bounded()
-            config = config or make_thread_config(session_id)
+            config = make_thread_config(session_id, "main")
             state = await graph.aget_state(config)
             values = dict(state.values) if state and state.values else {}
             await self._reject_legacy_checkpoint(graph, config)
@@ -337,12 +465,13 @@ class ChatService:
         limit = max(1, min(MAX_HISTORY_LIMIT, int(limit or DEFAULT_HISTORY_LIMIT)))
 
         payload = self.history_projection.read(session_id)
-        if payload is None or int(payload.get("ledger_seq", -1)) < self.conversation_files.latest_seq(session_id):
-            ledger_rows = self.conversation_files.read(session_id)
+        if (payload is None or payload.get("branch_id") != "main"
+                or int(payload.get("ledger_seq", -1)) < self.conversation_files.latest_seq(session_id)):
+            ledger_rows = self.conversation_files.read(session_id, branch_id="main")
             if ledger_rows:
                 projection = project_ledger(ledger_rows)
                 history = SessionHistory(
-                    projection_version=3,
+                    projection_version=PROJECTION_VERSION,
                     session_id=session_id,
                     workspace_id=self.conversation_files.workspace_id,
                     messages=[ChatMessage(**row) for row in projection["messages"]],
@@ -385,7 +514,7 @@ class ChatService:
             ),
         )
         return SessionHistoryPage(
-            projection_version=3,
+            projection_version=PROJECTION_VERSION,
             session_id=session_id,
             workspace_id=self.conversation_files.workspace_id,
             session=Session(**meta),
@@ -444,7 +573,8 @@ class ChatService:
         safe["message"].pop("id", None)
         return {"session_id": session_id, "workspace_id": self.conversation_files.workspace_id, "message": safe}
 
-    async def _llm_short_title(self, user_message: str, assistant_content: str, *, session_id: str, turn_id: str) -> str | None:
+    async def _llm_short_title(self, user_message: str, assistant_content: str, *, session_id: str, turn_id: str,
+                               branch_id: str = "main") -> str | None:
         if not self.settings.has_llm:
             return None
         prompt = (
@@ -458,7 +588,7 @@ class ChatService:
             from app.agent.audit import RuntimeLedgerAudit, bind_runtime_audit
             from app.core.model_request import bind_model_request_scope, invoke_auxiliary_model_async
             scope = {"workspace_id": self.conversation_files.workspace_id, "session_id": session_id, "turn_id": turn_id}
-            with bind_model_request_scope(scope), bind_runtime_audit(RuntimeLedgerAudit(self.conversation_files, scope)):
+            with bind_model_request_scope(scope), bind_runtime_audit(RuntimeLedgerAudit(self.conversation_files, scope, branch_id=branch_id)):
                 result = await asyncio.wait_for(
                     invoke_auxiliary_model_async(model, [HumanMessage(content=prompt)]), timeout=8,
                 )
@@ -476,6 +606,7 @@ class ChatService:
         user_message: str,
         assistant_content: str,
         turn_id: str,
+        branch_id: str = "main",
     ) -> None:
         try:
             meta = self.session_store.get(session_id)
@@ -483,7 +614,8 @@ class ChatService:
                 return
             if not (assistant_content or "").strip():
                 return
-            summary = await self._llm_short_title(user_message, assistant_content, session_id=session_id, turn_id=turn_id)
+            summary = await self._llm_short_title(user_message, assistant_content, session_id=session_id, turn_id=turn_id,
+                                                  branch_id=branch_id)
             if summary:
                 self.session_store.apply_auto_title(session_id, summary)
         except Exception:
@@ -496,6 +628,9 @@ class ChatService:
         session_id: str | None,
         *,
         turn_id: str | None = None,
+        submission_id: str | None = None,
+        branch_id: str = "main",
+        fork_cursor: dict[str, Any] | None = None,
     ) -> ChatResponse:
         from app.core.settings import get_settings
 
@@ -504,19 +639,20 @@ class ChatService:
         sid = self._require_bound_session(session_id)
         latency.bind_session(sid)
 
+        existing = self._existing_submission(sid, submission_id, message, branch_id=branch_id)
+        if existing:
+            return ChatResponse(content=existing["content"], session_id=sid, turn_id=existing["turn_id"], branch_id=branch_id)
+
         if not get_settings().has_llm:
             raise RuntimeError("未配置 LLM API Key")
         self.session_store.maybe_set_title_from_message(sid, message)
         latency.start(LATENCY_STAGE_CONTEXT_PREPARE)
         await self._prepare_memory_bounded(message, latency)
         graph = await self._get_graph_bounded()
-        config = make_thread_config(sid)
-        await self._reject_legacy_checkpoint(graph, config)
-        previous = self._refresh_stale_context(
-            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config), stop_incomplete=True)
-        )
+        config = make_thread_config(sid, branch_id)
+        previous = await self._previous_for_branch(graph, config, sid, branch_id, fork_cursor)
         max_steps = self._max_steps()
-        state = self._new_run_state(sid, message, max_steps, turn_id, previous)
+        state = self._new_run_state(sid, message, max_steps, turn_id, previous, submission_id=submission_id, branch_id=branch_id)
         turn_id = str(state["scope"]["turn_id"])
         latency.finish(LATENCY_STAGE_CONTEXT_PREPARE)
 
@@ -529,14 +665,14 @@ class ChatService:
             latency.finish(LATENCY_STAGE_MODEL_STREAM)
         except TimeoutError as exc:
             latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed")
-            await self.repair_cancelled_checkpoint(sid)
-            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "request_timeout")
+            await self.repair_cancelled_checkpoint(sid, branch_id=branch_id)
+            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "request_timeout", branch_id=branch_id)
             raise RuntimeError(
                 f"请求超时（{int(GRAPH_REQUEST_TIMEOUT_SECONDS)}s），请稍后重试"
             ) from exc
         except Exception:
-            await self.repair_cancelled_checkpoint(sid)
-            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "runtime_error")
+            await self.repair_cancelled_checkpoint(sid, branch_id=branch_id)
+            await self.mark_terminal_checkpoint(sid, turn_id, "failed", "runtime_error", branch_id=branch_id)
             raise
         projected_result = to_runtime_view(result)
         from app.agent.streaming.interrupts import has_pending_interrupt
@@ -547,7 +683,7 @@ class ChatService:
         await self._refresh_history_projection(sid, graph=graph, config=config)
         self._schedule_background(
             "auto-title refinement",
-            lambda: self._refine_auto_title_after_turn(sid, message, content, turn_id),
+            lambda: self._refine_auto_title_after_turn(sid, message, content, turn_id, branch_id),
         )
         dispatch_post_llm_call(
             session_id=sid,
@@ -561,7 +697,7 @@ class ChatService:
                 lambda: get_maintenance_runner().run_memory_nudge_for_session(sid),
             )
         log.info("chat.run.completed", extra=latency.summary(status="success"))
-        return ChatResponse(content=content, session_id=sid, turn_id=turn_id)
+        return ChatResponse(content=content, session_id=sid, turn_id=turn_id, branch_id=branch_id)
 
     @_exclusive_turn(stream=True)
     async def iter_chat_events(
@@ -570,6 +706,9 @@ class ChatService:
         session_id: str | None,
         *,
         turn_id: str | None = None,
+        submission_id: str | None = None,
+        branch_id: str = "main",
+        fork_cursor: dict[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """聊天主流程：产出统一 AgentEvent 流（SSE / WS 共用）。"""
         turn_id = turn_id or "turn_" + uuid.uuid4().hex
@@ -581,10 +720,34 @@ class ChatService:
             return
         latency.bind_session(sid)
 
+        try:
+            existing = self._existing_submission(sid, submission_id, message, branch_id=branch_id)
+        except AppError as exc:
+            yield AgentEvent("error", {"error": exc.message, "reason_code": "submission_conflict"}, turn_id)
+            return
+        if existing:
+            event = existing["event"]
+            original_turn = existing["turn_id"]
+            delivery_turn = turn_id
+            yield AgentEvent("session", {"session_id": sid, "turn_id": original_turn, "branch_id": branch_id}, delivery_turn,
+                             branch_id=branch_id)
+            for frame in self._durable_event_frames(sid, event["event_seq"] - 1, turn_id=original_turn, branch_id=branch_id):
+                yield frame.with_turn_id(delivery_turn)
+            settled = existing["status"] in {"completed", "failed", "cancelled", "handoff"}
+            yield AgentEvent(
+                "done",
+                {"content": existing["content"], "session_id": sid, "partial": not settled,
+                 "turn_id": original_turn, "duplicate_submission": True,
+                 "cursor": existing["cursor"], "branch_id": branch_id},
+                delivery_turn,
+                branch_id=branch_id,
+            )
+            return
+
         if not self.settings.has_llm:
             yield AgentEvent("error", {"error": "未配置 LLM API Key，请在 backend/.env 设置 OPENAI_API_KEY"}, turn_id)
             return
-        yield AgentEvent("session", {"session_id": sid}, turn_id)
+        yield AgentEvent("session", {"session_id": sid, "branch_id": branch_id}, turn_id, branch_id=branch_id)
         yield AgentEvent("stage", latency.instant(LATENCY_STAGE_ACCEPTED), turn_id)
         self.session_store.maybe_set_title_from_message(sid, message)
 
@@ -601,18 +764,27 @@ class ChatService:
             yield AgentEvent("error", {"error": str(exc)}, turn_id)
             log.info("chat.run.completed", extra=latency.summary(status="failed", failed_stage=LATENCY_STAGE_CONTEXT_PREPARE))
             return
-        config = make_thread_config(sid)
+        config = make_thread_config(sid, branch_id)
         try:
-            await self._reject_legacy_checkpoint(graph, config)
-        except RuntimeError as exc:
+            previous = await self._previous_for_branch(graph, config, sid, branch_id, fork_cursor)
+        except AppError as exc:
+            yield AgentEvent("error", {"error": exc.message, "reason_code": exc.code or "invalid_branch_cursor"}, turn_id)
+            return
+        except (RuntimeError, ValueError) as exc:
             yield AgentEvent("error", {"error": str(exc), "reason_code": "unsupported_checkpoint"}, turn_id)
             return
-        previous = self._refresh_stale_context(
-            sid, self._recover_ledger_tail(sid, await self._checkpoint_values(graph, config), stop_incomplete=True)
-        )
         max_steps = self._max_steps()
-        state = self._new_run_state(sid, message, max_steps, turn_id, previous)
+        state = self._new_run_state(sid, message, max_steps, turn_id, previous, submission_id=submission_id, branch_id=branch_id)
         turn_id = str(state["scope"]["turn_id"])
+        durable_seq = int(state["ledger_pointer"]["applied_seq"]) - 1
+        if fork_cursor is not None:
+            fork_event = next(event for event in self.conversation_files.read_events(sid, branch_id=branch_id)
+                              if event["event_type"] == "branch.forked")
+            durable_seq = min(durable_seq, fork_event["event_seq"] - 1)
+        state_revision = int(state.get("state_revision", 0))
+        for frame in self._durable_event_frames(sid, durable_seq, state_revision=state_revision, branch_id=branch_id):
+            durable_seq = max(durable_seq, frame.event_seq or durable_seq)
+            yield frame
         yield AgentEvent(
             "stage",
             latency.finish(LATENCY_STAGE_CONTEXT_PREPARE, memory_status),
@@ -624,7 +796,13 @@ class ChatService:
         final_content = ""
         completed = False
         async for event in stream_graph_events(graph, state, config, max_steps, turn_id=turn_id):
+            current_revision = int(event.state.get("state_revision", state_revision)) if event.state else state_revision
+            for frame in self._durable_event_frames(sid, durable_seq, state_revision=current_revision, branch_id=branch_id):
+                durable_seq = max(durable_seq, frame.event_seq or durable_seq)
+                yield frame
             if event.type == "done":
+                event.branch_id = branch_id
+                event.data["branch_id"] = branch_id
                 self.session_store.touch(sid)
                 final_content = event.data.get("content", "") or ""
                 completed = not event.data.get("partial", False)
@@ -645,10 +823,13 @@ class ChatService:
                 )
             yield event
 
+        for frame in self._durable_event_frames(sid, durable_seq, state_revision=state_revision, branch_id=branch_id):
+            yield frame
+
         if completed:
             self._schedule_background(
                 "auto-title refinement",
-                lambda: self._refine_auto_title_after_turn(sid, message, final_content, turn_id),
+                lambda: self._refine_auto_title_after_turn(sid, message, final_content, turn_id, branch_id),
             )
             self._schedule_background(
                 "history projection refresh",
@@ -684,19 +865,27 @@ class ChatService:
         session_id: str | None,
         *,
         turn_id: str | None = None,
+        submission_id: str | None = None,
+        branch_id: str = "main",
+        fork_cursor: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         from app.agent.streaming.interrupts import has_pending_interrupt
 
         sid: str | None = session_id
-        async for event in self.iter_chat_events(message, session_id, turn_id=turn_id):
+        transport_id = "sse_" + uuid.uuid4().hex
+        transport_seq = 0
+        async for event in self.iter_chat_events(message, session_id, turn_id=turn_id, submission_id=submission_id,
+                                                branch_id=branch_id, fork_cursor=fork_cursor):
             if event.type == "session" and event.data.get("session_id"):
                 sid = event.data["session_id"]
-            yield to_sse(event)
+            transport_seq += 1
+            yield to_sse(event, transport_id=transport_id, transport_seq=transport_seq)
 
         if not sid:
             return
         graph = await self._get_graph_bounded()
-        if await has_pending_interrupt(graph, make_thread_config(sid)):
+        if await has_pending_interrupt(graph, make_thread_config(sid, branch_id)):
+            transport_seq += 1
             yield to_sse(
                 AgentEvent(
                     "error",
@@ -706,7 +895,9 @@ class ChatService:
                         "reason_code": "sse_no_answer_channel",
                     },
                     turn_id,
-                )
+                ),
+                transport_id=transport_id,
+                transport_seq=transport_seq,
             )
 
     async def resume_chat_events(
@@ -715,14 +906,17 @@ class ChatService:
         decision: Any,
         *,
         turn_id: str | None = None,
+        branch_id: str = "main",
     ) -> AsyncIterator[AgentEvent]:
         """恢复 interrupt 后继续产出事件流。"""
         from langgraph.types import Command
 
         graph = await self._get_graph_bounded()
-        config = make_thread_config(session_id)
+        config = make_thread_config(session_id, branch_id)
         await self._reject_legacy_checkpoint(graph, config)
-        values = self._recover_ledger_tail(session_id, await self._checkpoint_values(graph, config))
+        values = self._recover_ledger_tail(session_id, await self._checkpoint_values(graph, config), branch_id=branch_id)
+        durable_seq = int((values.get("ledger_pointer") or {}).get("applied_seq") or 0)
+        state_revision = int(values.get("state_revision", 0))
         if values.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}:
             raise RuntimeError("该 turn 已结束，不能恢复过期交互")
         checkpoint_turn_id = (values.get("scope") or {}).get("turn_id")
@@ -766,11 +960,9 @@ class ChatService:
                     session_id, f"msg_decision_{pending['id']}", message_payload,
                     turn_id=turn_id, interaction=interaction,
                     execution={"status": interaction_status, "finished_at": utc_now()},
+                    branch_id=branch_id,
                 )
-                values["ledger_pointer"] = {
-                    "applied_seq": seq,
-                    "applied_offset": self.conversation_files.offset_after(session_id, seq),
-                }
+                values["ledger_pointer"] = self.conversation_files.ledger_pointer(session_id, seq, branch_id=branch_id)
             # Commit the durable decision together with the native resume. A
             # separate update here would clear LangGraph's pending interrupt.
             values["state_revision"] = int(values.get("state_revision", 0)) + 1
@@ -781,7 +973,10 @@ class ChatService:
         if isinstance(decision, dict) and decision.get("kind") == "tool_approval":
             decision = decision["decision"]
         latency = RunLatency(turn_id=turn_id, session_id=session_id)
-        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), turn_id)
+        for frame in self._durable_event_frames(session_id, durable_seq, state_revision=state_revision, branch_id=branch_id):
+            durable_seq = max(durable_seq, frame.event_seq or durable_seq)
+            yield frame
+        yield AgentEvent("stage", latency.start(LATENCY_STAGE_MODEL_STREAM), turn_id, branch_id=branch_id)
 
         async for event in stream_graph_events(
             graph,
@@ -791,27 +986,35 @@ class ChatService:
             turn_id=turn_id,
             input_override=Command(resume=decision, update=to_graph_state(values)),
         ):
+            current_revision = int(event.state.get("state_revision", state_revision)) if event.state else state_revision
+            for frame in self._durable_event_frames(session_id, durable_seq, state_revision=current_revision, branch_id=branch_id):
+                durable_seq = max(durable_seq, frame.event_seq or durable_seq)
+                yield frame
+            event.branch_id = branch_id
+            event.data["branch_id"] = branch_id
             if event.type == "done":
                 self.session_store.touch(session_id)
-                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM), turn_id)
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM), turn_id, branch_id=branch_id)
                 self._schedule_background(
                     "history projection refresh",
                     lambda: self._refresh_history_projection(session_id, graph=graph, config=config),
                 )
             elif event.type == "error":
-                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"), turn_id)
+                yield AgentEvent("stage", latency.finish(LATENCY_STAGE_MODEL_STREAM, "failed"), turn_id, branch_id=branch_id)
             yield event
+        for frame in self._durable_event_frames(session_id, durable_seq, state_revision=state_revision, branch_id=branch_id):
+            yield frame
 
-    async def repair_cancelled_checkpoint(self, session_id: str) -> None:
+    async def repair_cancelled_checkpoint(self, session_id: str, *, branch_id: str = "main") -> None:
         """取消时修复未完成的 tool_calls。"""
         graph = await self._get_graph_bounded()
-        config = make_thread_config(session_id)
+        config = make_thread_config(session_id, branch_id)
         snapshot = await graph.aget_state(config)
         if not snapshot or not snapshot.values:
             return
         values = dict(snapshot.values or {})
-        recovered = self._recover_ledger_tail(session_id, values)
-        rows = self.conversation_files.read(session_id)
+        recovered = self._recover_ledger_tail(session_id, values, branch_id=branch_id)
+        rows = self.conversation_files.read(session_id, branch_id=branch_id)
         settled = {row["message"].get("tool_call_id") for row in rows
                    if row.get("turn_id") == values["scope"]["turn_id"] and row["message"].get("role") == "tool"}
         pending_messages = []
@@ -827,33 +1030,35 @@ class ChatService:
                 break
         if pending_messages:
             from app.agent.audit import RuntimeLedgerAudit
-            audit = RuntimeLedgerAudit(self.conversation_files, values["scope"])
+            audit = RuntimeLedgerAudit(self.conversation_files, values["scope"], branch_id=branch_id)
             pending_messages = [audit.settle_tool(message) for message in pending_messages]
-            seq = self.conversation_files.latest_seq(session_id)
+            seq = max(int(recovered["ledger_pointer"]["applied_seq"]),
+                      *(int(message.additional_kwargs["ledger_seq"]) for message in pending_messages))
             recovered = merge_runtime_updates(recovered, {"messages": pending_messages})
-            recovered["ledger_pointer"] = {"applied_seq": seq, "applied_offset": self.conversation_files.offset_after(session_id, seq)}
+            recovered["ledger_pointer"] = self.conversation_files.ledger_pointer(session_id, seq, branch_id=branch_id)
         await graph.aupdate_state(config, to_graph_state(recovered))
 
-    async def mark_terminal_checkpoint(self, session_id: str, turn_id: str, status: str, reason: str) -> None:
+    async def mark_terminal_checkpoint(self, session_id: str, turn_id: str, status: str, reason: str, *,
+                                        branch_id: str = "main") -> None:
         graph = await self._get_graph_bounded()
-        config = make_thread_config(session_id)
+        config = make_thread_config(session_id, branch_id)
         if not hasattr(graph, "aget_state") or not hasattr(graph, "aupdate_state"):
             return
         snapshot = await graph.aget_state(config)
         values = dict(snapshot.values or {}) if snapshot else {}
         if "context" not in values or (values.get("scope") or {}).get("turn_id") not in {None, turn_id}:
             return
-        values = self._recover_ledger_tail(session_id, values)
+        values = self._recover_ledger_tail(session_id, values, branch_id=branch_id)
         if values.get("turn_status") in {"completed", "failed", "cancelled", "handoff"}:
             await graph.aupdate_state(config, to_graph_state(values))
             return
         from app.agent.audit import RuntimeLedgerAudit
-        seq = RuntimeLedgerAudit(self.conversation_files, values["scope"]).turn_terminal(status, reason)
+        seq = RuntimeLedgerAudit(self.conversation_files, values["scope"], branch_id=branch_id).turn_terminal(status, reason)
         await graph.aupdate_state(
             config,
             {
                 **terminal_patch(values, status, reason),
-                "ledger_pointer": {"applied_seq": seq, "applied_offset": self.conversation_files.offset_after(session_id, seq)},
+                "ledger_pointer": self.conversation_files.ledger_pointer(session_id, seq, branch_id=branch_id),
                 "current_step": {
                     **values.get("current_step", {}),
                     "step_status": "skipped" if status == "handoff" else status,

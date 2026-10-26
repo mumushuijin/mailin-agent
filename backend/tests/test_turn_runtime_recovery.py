@@ -17,7 +17,7 @@ def fixture_state(tmp_path):
     state = new_agent_state(workspace_id=str(tmp_path), session_id=SESSION, turn_id="turn_test", message=HumanMessage(content="hello"))
     user = state["context"]["working_message"][0]
     files.append_messages(SESSION, "turn_test", [user], scope=state["scope"])
-    state["ledger_pointer"] = {"applied_seq": 1}
+    state["ledger_pointer"] = files.ledger_pointer(SESSION, 1)
     return state, files
 
 
@@ -43,7 +43,7 @@ def test_checkpoint_rejects_old_or_conflicting_fields(tmp_path, mutate):
 def test_greeting_has_no_synthetic_task_and_snapshot_id_has_no_identity(tmp_path):
     state, _ = fixture_state(tmp_path)
     validate_agent_state(state)
-    assert state["schema_version"] == 2
+    assert state["schema_version"] == 3
     assert state["tasks"] == [] and state["current_task"] is None
     assert "turn_test" not in state["checkpoint_id"] and SESSION not in state["checkpoint_id"]
     assert type(state["context"]["last_built_at"]) is int
@@ -66,7 +66,7 @@ def call_fixture(tmp_path):
     state["context"]["working_message"].append(assistant)
     state["current_step"] = {"step_id": "step_tool", "step_name": "tools", "step_status": "running", "tool_calls": [{"call_id": "call_1", "definition_seq": seq, "status": "pending"}]}
     state["turn_status"] = "running"
-    state["ledger_pointer"] = {"applied_seq": seq}
+    state["ledger_pointer"] = files.ledger_pointer(SESSION, seq)
     audit = RuntimeLedgerAudit(files, state["scope"], step_id="step_tool")
     return state, files, audit
 
@@ -113,7 +113,7 @@ def test_recovery_restores_durable_decision_to_existing_interaction_without_new_
     state, files, audit = call_fixture(tmp_path)
     seq = audit.lifecycle("interaction", "waiting", call_id="call_1", interaction={"id": "int_1", "kind": "approval"})
     state["pending_interaction"] = {"id": "int_1", "kind": "approval", "call_id": "call_1", "definition_seq": seq}
-    state["ledger_pointer"]["applied_seq"] = seq
+    state["ledger_pointer"] = files.ledger_pointer(SESSION, seq)
     state["turn_status"] = "waiting_user"
     files.append(SESSION, "decision_1", {"role": "user", "content": "allow", "tool_call_id": "call_1"}, turn_id="turn_test", timestamp=utc_now(), interaction={"id": "int_1", "kind": "approval", "decision": "allow"})
     recovered = recover_ledger_tail(state, files)
@@ -231,7 +231,7 @@ def test_actual_parallel_tool_completion_is_durable_before_batch_returns(tmp_pat
     state["context"]["working_message"].append(definition)
     state["current_step"] = {"step_id": "step_parallel", "step_name": "tools", "step_status": "running", "tool_calls": [{"call_id": call_id, "definition_seq": seq, "status": "pending"} for call_id in ("fast", "slow")]}
     state["turn_status"] = "running"
-    state["ledger_pointer"] = {"applied_seq": seq}
+    state["ledger_pointer"] = files.ledger_pointer(SESSION, seq)
     release = threading.Event()
     slow_started = threading.Event()
     fast_settled = threading.Event()
@@ -279,7 +279,7 @@ def test_unsettled_actual_model_request_fails_restored_turn_once(tmp_path, start
     if start_already_applied:
         state["current_step"] = {"step_id": "step_model", "step_name": "agent", "step_status": "running", "model": {"request_id": "req_unfinished"}, "tool_calls": []}
         state["turn_status"] = "running"
-        state["ledger_pointer"] = {"applied_seq": seq}
+        state["ledger_pointer"] = files.ledger_pointer(SESSION, seq)
     stopped = recover_ledger_tail(state, files)
     assert stopped["turn_status"] == "failed"
     assert stopped["terminal_reason"] == "model_request_outcome_unknown"

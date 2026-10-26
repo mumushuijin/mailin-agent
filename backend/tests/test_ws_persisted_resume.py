@@ -110,7 +110,7 @@ async def test_subscribe_and_state_sync_do_not_recover_an_actively_running_tool(
     definition_seq = files.append_messages(session_id, "turn1", [definition], scope=state["scope"])
     state["current_step"] = {"step_id": "step1", "step_name": "tools", "step_status": "running", "tool_calls": [{"call_id": "call1", "definition_seq": definition_seq, "status": "pending"}]}
     state["turn_status"] = "running"
-    state["ledger_pointer"] = {"applied_seq": definition_seq}
+    state["ledger_pointer"] = files.ledger_pointer(session_id, definition_seq)
     audit = RuntimeLedgerAudit(files, state["scope"], step_id="step1")
     audit.tool_started("call1", 1)
     original_seq = files.latest_seq(session_id)

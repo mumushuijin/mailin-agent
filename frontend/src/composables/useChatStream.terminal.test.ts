@@ -49,7 +49,7 @@ function makeCtx(withAgentState = false): ChatStreamState {
 
 describe('useChatStream terminal cleanup', () => {
   const canonicalState = (turnId: string, revision: number, todos: unknown[] = []) => ({
-    schema_version: 2, checkpoint_id: `cp_${'a'.repeat(32)}`, state_revision: revision, turn_status: 'running', ledger_pointer: { applied_seq: 99 },
+    schema_version: 3, checkpoint_id: `cp_${'a'.repeat(32)}`, state_revision: revision, turn_status: 'running', ledger_pointer: { applied_seq: 99, event_cursor: { branch_id: 'main', event_seq: 99, event_id: 'event-99' } },
     scope: { workspace_id: 'w1', session_id: 's1', turn_id: turnId },
     context: { working_message: [] }, max_step_every_turn: 4, tasks: ['t1'], current_task: 't1',
     current_step: { step_id: 'step1', step_name: 'agent', step_status: 'running', tool_calls: [], model: { request_id: 'q1' } },

@@ -362,6 +362,6 @@ def test_http_unbound_chat_fails_closed(client):
     test_client, spaces, svc = client
     sid = "old"
     svc.store._save({sid: {"created_at": 1, "updated_at": 1}})
-    r = test_client.post("/api/chat/send", json={"message": "hi", "session_id": sid})
+    r = test_client.post("/api/chat/send", json={"message": "hi", "session_id": sid, "submission_id": "submission_1"})
     assert r.status_code == 400
     assert "绑定" in r.json()["detail"] or "文件夹" in r.json()["detail"]
